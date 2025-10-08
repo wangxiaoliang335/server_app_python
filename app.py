@@ -9,6 +9,7 @@ import datetime
 import random
 import string
 import logging
+import time
 from logging.handlers import TimedRotatingFileHandler
 
 from aliyunsdkcore.client import AcsClient
@@ -129,7 +130,8 @@ def verify_code_from_session(input_phone, input_code):
         app_logger.warning(f"Verification failed for {input_phone}: Phone number mismatch.")
         return False, "手机号不匹配"
 
-    if datetime.datetime.now() > stored_data['expires_at']:
+    #if datetime.datetime.now() > stored_data['expires_at']:
+    if time.time() > stored_data['expires_at']:
         session.pop('verification_code', None)
         app_logger.info(f"Verification code expired for {input_phone}.")
         return False, "验证码已过期"
@@ -1045,7 +1047,8 @@ def send_verification_code():
     session['verification_code'] = {
         'code': code,
         'phone': phone,
-        'expires_at': datetime.datetime.now() + datetime.timedelta(seconds=VERIFICATION_CODE_EXPIRY)
+        #'expires_at': datetime.datetime.now() + datetime.timedelta(seconds=VERIFICATION_CODE_EXPIRY)
+        'expires_at': time.time() + VERIFICATION_CODE_EXPIRY   # 例如 VERIFICATION_CODE_EXPIRY = 300
     }
 
     if send_sms_verification_code(phone, code):
