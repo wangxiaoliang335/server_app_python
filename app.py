@@ -230,6 +230,95 @@ def list_schools():
             connection.close()
             app_logger.info("Database connection closed after fetching schools.")
 
+@app.route('/userInfo', methods=['GET'])
+def list_userInfo():
+    """
+    获取用户信息 (支持手机号码精确查询)
+    Query Parameters:
+        - phone (str, optional): 手机号码，用于模糊搜索
+    Returns:
+        JSON: 包含状态信息和用户数据的响应
+             { "data": { "message": "...", "code": ..., "userinfo": [...] } }
+    """
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("Get User Info failed: Database connection error.")
+        return jsonify({
+            'data': {
+                'message': '数据库连接失败',
+                'code': 500,
+                'schools': []
+            }
+        }), 500
+
+    cursor = None
+    try:
+        # 1. 获取并解析查询参数
+        phone_filter = request.args.get('phone', type=str)
+
+        print(" 111111\n");
+        print(phone_filter);
+        print(" 222222\n");
+
+        # 2. 构建 SQL 查询
+        #base_columns = "id, name, address"
+        base_query = f"SELECT * FROM ta_user_details WHERE "
+        filters = []
+        params = []
+
+        filters.append("phone = %s")
+        params.append(phone_filter)
+
+        # # 优先根据 ID 查询
+        # if school_id is not None:
+        #     filters.append("AND id = %s")
+        #     params.append(school_id)
+        # # 如果没有 ID，则根据名称模糊搜索
+        # elif name_filter:
+        #     filters.append("AND name LIKE %s")
+        #     params.append(f"%{name_filter}%")
+
+        # 3. 执行查询
+        final_query = base_query + " " + " ".join(filters)
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(final_query, tuple(params))
+        userinfo = cursor.fetchall()
+
+        # 4. 返回 JSON 响应 (包裹在 data 对象中)
+        app_logger.info(f"Fetched {len(userinfo)} userinfo.")
+        return jsonify({
+            'data': {
+                'message': '获取用户信息成功',
+                'code': 200,
+                'userinfo': userinfo
+            }
+        }), 200
+
+    except Error as e:
+        app_logger.error(f"Database error during fetching userinfo: {e}")
+        return jsonify({
+            'data': {
+                'message': '获取用户信息失败',
+                'code': 500,
+                'userinfo': []
+            }
+        }), 500
+    except Exception as e:
+        app_logger.error(f"Unexpected error during fetching userinfo: {e}")
+        return jsonify({
+            'data': {
+                'message': '内部服务器错误',
+                'code': 500,
+                'userinfo': []
+            }
+        }), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info("Database connection closed after fetching userinfo.")
+
 @app.route('/teachers', methods=['GET'])
 def list_teachers():
     """
