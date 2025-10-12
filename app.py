@@ -10,10 +10,13 @@ import random
 import string
 import logging
 import time
+import base64
 from logging.handlers import TimedRotatingFileHandler
 
 from aliyunsdkcore.client import AcsClient
 from aliyunsdkcore.request import CommonRequest
+
+IMAGE_DIR = "/var/www/images"  # 存头像的目录
 
 if not os.path.exists('logs'):
     os.makedirs('logs')
@@ -229,6 +232,71 @@ def list_schools():
         if connection and connection.is_connected():
             connection.close()
             app_logger.info("Database connection closed after fetching schools.")
+
+@app.route('/updateUserInfo', methods=['POST'])
+def updateUserInfo():
+    data = request.get_json()
+    phone = data.get('phone')
+    id_number = data.get('id_number')
+    avatar = data.get('avatar')
+
+    if not id_number or (not avatar):
+        app_logger.warning("Login failed: Missing phone and either password or verification code.")
+        return jsonify({
+            'data': {
+                'message': '身份证号码和头像必须提供',
+                'code': 400
+            }
+        }), 400
+
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("Login failed: Database connection error.")
+        return jsonify({
+            'data': {
+                'message': '数据库连接失败',
+                'code': 500
+            }
+        }), 500
+		
+		# 解码成二进制
+    avatar_bytes = base64.b64decode(avatar)
+	
+	# 生成文件名，例如 Alice_时间戳.jpg
+    filename = f"{id_number}_.png"
+    file_path = os.path.join(IMAGE_DIR, filename)
+
+    # 保存到文件系统
+    with open(file_path, "wb") as f:
+        f.write(avatar_bytes)
+
+    cursor = None
+    try:
+        update_query = "UPDATE ta_user_details SET avatar = %s WHERE id_number = %s"
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(update_query, (file_path, id_number))
+        connection.commit()
+        cursor.close()
+        return jsonify({
+            'data': {
+                'message': '更新成功',
+                'code': 200,
+                #'user_id': user['id'] # 返回用户ID
+            }
+        }), 200
+
+    except Error as e:
+        app_logger.error(f"Database error during login for {phone}: {e}")
+        return jsonify({
+            'data': {
+                'message': '更新失败',
+                'code': 500
+            }
+        }), 500
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+            # app_logger.info("Database connection closed after login attempt.")
 
 @app.route('/userInfo', methods=['GET'])
 def list_userInfo():
