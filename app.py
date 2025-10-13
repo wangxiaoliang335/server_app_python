@@ -11,10 +11,16 @@ import string
 import logging
 import time
 import base64
+import os
 from logging.handlers import TimedRotatingFileHandler
 
 from aliyunsdkcore.client import AcsClient
 from aliyunsdkcore.request import CommonRequest
+
+from dotenv import load_dotenv
+
+# 加载 .env 文件
+load_dotenv()
 
 IMAGE_DIR = "/var/www/images"  # 存头像的目录
 
@@ -23,7 +29,8 @@ if not os.path.exists('logs'):
 
 app = Flask(__name__)
 # 设置 Flask Session 密钥
-app.secret_key = 'a1b2c3d4e5f67890123456789012345678901234567890123456789012345678'
+#app.secret_key = 'a1b2c3d4e5f67890123456789012345678901234567890123456789012345678'
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "default_key")
 
 # 创建一个 TimedRotatingFileHandler，每天 (midnight) 轮转，保留 30 天的日志
 file_handler = TimedRotatingFileHandler(
@@ -52,11 +59,18 @@ DB_CONFIG = {
 }
 
 # 短信服务配置 (模拟)
+# SMS_CONFIG = {
+#     'access_key_id': 'LTAI5tHt3ejFCgp5Qi4gjg2w',
+#     'access_key_secret': 'itqsnPgUti737u0JdQ7WJTHHFeJyHv',
+#     'sign_name': '临沂师悦数字科技有限公司',
+#     'template_code': 'SMS_325560474'
+# }
+
 SMS_CONFIG = {
-    'access_key_id': 'LTAI5tHt3ejFCgp5Qi4gjg2w',
-    'access_key_secret': 'itqsnPgUti737u0JdQ7WJTHHFeJyHv',
-    'sign_name': '临沂师悦数字科技有限公司',
-    'template_code': 'SMS_325560474'
+    'access_key_id': os.getenv("ALIYUN_AK_ID"),
+    'access_key_secret': os.getenv("ALIYUN_AK_SECRET"),
+    'sign_name': os.getenv("ALIYUN_SMS_SIGN"),
+    'template_code': os.getenv("ALIYUN_SMS_TEMPLATE")
 }
 
 # 验证码有效期 (秒)
