@@ -12,6 +12,7 @@ import logging
 import time
 import base64
 import os
+import redis
 from logging.handlers import TimedRotatingFileHandler
 
 from aliyunsdkcore.client import AcsClient
@@ -161,6 +162,80 @@ def verify_code_from_session(input_phone, input_code):
     app_logger.info(f"Verification successful for {input_phone}.")
     return True, "验证成功"
 
+# Redis 连接
+r = redis.Redis(host='127.0.0.1', port=6379, decode_responses=True)
+
+def get_max_code_from_mysql(connection):
+    #"""从 MySQL 找最大号码"""
+    print(" get_max_code_from_mysql 111\n");
+    with connection.cursor(dictionary=True) as cursor:
+        cursor.execute("SELECT MAX(id) AS max_id FROM ta_school")
+        print(" get_max_code_from_mysql 222\n");
+        row = cursor.fetchone()
+        #row = cursor.fetchone()[0]
+        print(" get_max_code_from_mysql 333\n", row);
+        if row and row['max_id'] is not None:
+            return int(row['max_id'])
+        return 0
+
+def generate_unique_code():
+    #"""生成唯一 6 位数字"""
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("List schools failed: Database connection error.")
+        print(" 数据库连接失败\n");
+        return jsonify({
+            'data': {
+                'message': '数据库连接失败',
+                'code': 500,
+                'schools': []
+            }
+        }), 500
+
+    print(" generate_unique_code 111\n");
+
+    # 先从 Redis 缓存取
+    max_code = r.get("unique_max_code")
+    if max_code:
+        new_code = int(max_code) + 1
+    else:
+        # Redis 没缓存，从 MySQL 查
+        new_code = get_max_code_from_mysql(connection) + 1
+
+    print(" get_max_code_from_mysql leave");
+    if new_code >= 1000000:
+        raise ValueError("6位数字已用完")
+
+    code_str = f"{new_code:06d}"
+
+    print(" INSERT INTO ta_school\n");
+
+    cursor = None
+    # 写入 MySQL
+    try:
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute("INSERT INTO ta_school (id) VALUES (%s)", (new_code,))
+        connection.commit()
+        cursor.close()
+    except mysql.connector.errors.IntegrityError:
+        # 如果主键冲突，递归重试
+            return generate_unique_code()
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+
+        # 更新 Redis 缓存
+    r.set("unique_max_code", new_code)
+    print(" INSERT INTO code_str:", code_str, "\n");
+    return code_str
+
+@app.route('/unique6digit', methods=['GET'])
+def unique_code_api():
+    try:
+        code = generate_unique_code()
+        return jsonify({"code": code, "status": "ok"})
+    except Exception as e:
+        return jsonify({"error": str(e), "status": "fail"}), 500
 
 @app.route('/schools', methods=['GET'])
 def list_schools():
