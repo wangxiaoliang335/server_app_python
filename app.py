@@ -352,6 +352,24 @@ def list_userInfo():
         cursor.execute(final_query, tuple(params))
         userinfo = cursor.fetchall()
 
+         # 遍历每一条记录，读取 PNG 转 Base64
+        for user in userinfo:
+            avatar_path = user.get("avatar")  # 数据库里的文件名
+            if avatar_path:
+                full_path = os.path.join(IMAGE_DIR, avatar_path)
+                if os.path.exists(full_path):
+                    try:
+                        with open(full_path, "rb") as img_file:
+                            b64_str = base64.b64encode(img_file.read()).decode('utf-8')
+                            user["avatar_base64"] = b64_str  # 新字段
+                    except Exception as e:
+                        app_logger.error(f"读取图片失败 {full_path}: {e}")
+                        user["avatar_base64"] = None
+                else:
+                    user["avatar_base64"] = None
+            else:
+                user["avatar_base64"] = None
+
         # 4. 返回 JSON 响应 (包裹在 data 对象中)
         app_logger.info(f"Fetched {len(userinfo)} userinfo.")
         return jsonify({
