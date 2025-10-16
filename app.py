@@ -494,6 +494,530 @@ def list_userInfo():
             connection.close()
             app_logger.info("Database connection closed after fetching userinfo.")
 
+
+@app.route('/updateClasses', methods=['POST'])
+def updateClasses():
+    data_list = request.get_json()  # 接收到的 JSON 数组
+
+    if not isinstance(data_list, list) or len(data_list) == 0:
+        return jsonify({
+            'data': {
+                'message': '必须提供班级数组数据',
+                'code': 400
+            }
+        }), 400
+
+    connection = get_db_connection()
+    if connection is None:
+        return jsonify({
+            'data': {
+                'message': '数据库连接失败',
+                'code': 500
+            }
+        }), 500
+
+    try:
+        cursor = connection.cursor()
+
+        # MySQL Upsert语句
+        sql = """
+        INSERT INTO ta_classes (
+            class_code,
+            school_stage,
+            grade,
+            class_name,
+            remark,
+            created_at
+        ) VALUES (%s, %s, %s, %s, %s, NOW())
+        ON DUPLICATE KEY UPDATE
+            school_stage = VALUES(school_stage),
+            grade        = VALUES(grade),
+            class_name   = VALUES(class_name),
+            remark       = VALUES(remark),
+            created_at   = VALUES(created_at);
+        """
+
+        # 批量执行
+        values = []
+        for item in data_list:
+            class_code   = item.get('class_code')
+            school_stage = item.get('school_stage')
+            grade        = item.get('grade')
+            class_name   = item.get('class_name')
+            remark       = item.get('remark')
+
+            if not class_code:
+                continue  # 没有主键跳过
+
+            values.append((
+                class_code,
+                school_stage,
+                grade,
+                class_name,
+                remark
+            ))
+
+        if values:
+            cursor.executemany(sql, values)
+            connection.commit()
+
+        cursor.close()
+        connection.close()
+
+        return jsonify({
+            'data': {
+                'message': '批量插入/更新完成',
+                'code': 200,
+                'count': len(values)
+            }
+        }), 200
+
+    except Error as e:
+        return jsonify({
+            'data': {
+                'message': f'数据库操作失败: {e}',
+                'code': 500
+            }
+        }), 500
+
+@app.route('/getClassesByPrefix', methods=['POST'])
+def get_classes_by_prefix():
+    data = request.get_json()
+    prefix = data.get("prefix")
+
+    # 参数校验
+    if not prefix or len(prefix) != 6 or not prefix.isdigit():
+        return jsonify({
+            "data": {
+                "message": "必须提供6位数字前缀",
+                "code": 400
+            }
+        }), 400
+
+    connection = get_db_connection()
+    if connection is None:
+        return jsonify({
+            "data": {
+                "message": "数据库连接失败",
+                "code": 500
+            }
+        }), 500
+
+    try:
+        cursor = connection.cursor(dictionary=True)  # 返回字典型结果
+        sql = """
+        SELECT class_code, school_stage, grade, class_name, remark, created_at
+        FROM ta_classes
+        WHERE LEFT(class_code, 6) = %s
+        """
+        cursor.execute(sql, (prefix,))
+        results = cursor.fetchall()
+
+        cursor.close()
+        connection.close()
+
+        return jsonify({
+            "data": {
+                "message": "查询成功",
+                "code": 200,
+                "count": len(results),
+                "classes": results
+            }
+        }), 200
+
+    except Error as e:
+        app.logger.error(f"查询失败: {e}")
+        return jsonify({
+            "data": {
+                "message": "查询失败",
+                "code": 500
+            }
+        }), 500
+
+
+@app.route('/updateSchoolInfo', methods=['POST'])
+def updateSchoolInfo():
+    data = request.get_json()
+    id = data.get('id')
+    name = data.get('name')
+    address = data.get('address')
+
+    if not id:
+        app_logger.warning("Login failed: Missing id.")
+        return jsonify({
+            'data': {
+                'message': 'id值必须提供',
+                'code': 400
+            }
+        }), 400
+
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("Login failed: Database connection error.")
+        return jsonify({
+            'data': {
+                'message': '数据库连接失败',
+                'code': 500
+            }
+        }), 500
+
+    cursor = None
+    try:
+        update_query = "UPDATE ta_school SET name = %s, address = %s WHERE id = %s"
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(update_query, (name, address, id))
+        connection.commit()
+        cursor.close()
+        return jsonify({
+            'data': {
+                'message': '更新成功',
+                'code': 200,
+                #'user_id': user['id'] # 返回用户ID
+            }
+        }), 200
+
+    except Error as e:
+        app_logger.error(f"Database error during login for {name}: {e}")
+        return jsonify({
+            'data': {
+                'message': '更新失败',
+                'code': 500
+            }
+        }), 500
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+            # app_logger.info("Database connection closed after login attempt.")
+
+# # 生成教师唯一编号
+# def generate_teacher_unique_id(school_id):
+#     connection = get_db_connection()
+#     if connection is None:
+#         return None
+#     cursor = None
+#     try:
+#         print(" generate_teacher_unique_id 00\n");
+#         cursor = connection.cursor()
+
+#         print(" generate_teacher_unique_id 01:", school_id, "\n");
+#         cursor.execute("""
+#             SELECT MAX(teacher_unique_id) 
+#             FROM ta_teacher 
+#             WHERE schoolId = %s
+#         """, (school_id,))
+#         print(" generate_teacher_unique_id 10\n");
+#         result = cursor.fetchone()
+#         print(" generate_teacher_unique_id 11", result, "\n");
+#         if result and result[0]:
+#             last_num = int(str(result[0])[6:])
+#             new_num = last_num + 1
+#         else:
+#             new_num = 1
+
+#         return int(f"{school_id}{str(new_num).zfill(4)}")
+#     except Error as e:
+#         app_logger.error(f"Error generating teacher_unique_id: {e}")
+#         return None
+#     finally:
+#         if cursor:
+#             cursor.close()
+#         if connection and connection.is_connected():
+#             connection.close()
+
+def generate_teacher_unique_id(school_id):
+    """
+    并发安全生成 teacher_unique_id
+    格式：前6位为schoolId（左补零），后4位为流水号（左补零），总长度10位
+    """
+    connection = get_db_connection()
+    if connection is None:
+        return None
+    cursor = None
+
+    try:
+        cursor = connection.cursor()
+
+        # 开启事务，锁定当前学校ID的记录，防并发冲突
+        connection.start_transaction()
+
+        cursor.execute("""
+            SELECT MAX(teacher_unique_id)
+            FROM ta_teacher
+            WHERE schoolId = %s
+            FOR UPDATE
+        """, (school_id,))
+        result = cursor.fetchone()
+
+        if result and result[0]:
+            # 补零到长度10位
+            max_id_str = str(result[0]).zfill(10)
+            # 取后4位流水号部分
+            last_num = int(max_id_str[6:])
+            new_num = last_num + 1
+        else:
+            new_num = 1
+
+        # 拼接最终教师唯一编号
+        teacher_unique_id_str = f"{str(school_id).zfill(6)}{str(new_num).zfill(4)}"
+        return int(teacher_unique_id_str)
+
+    except Error as e:
+        app_logger.error(f"Error generating teacher_unique_id: {e}")
+        return None
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+
+
+# 📌 新增教师接口
+@app.route("/add_teacher", methods=["POST"])
+def add_teacher():
+    data = request.json
+    if not data or 'schoolId' not in data:
+        return jsonify({
+            'data': {
+                'message': '缺少 schoolId',
+                'code': 400
+            }
+        }), 400
+
+    print("  000000000\n");
+    school_id = data['schoolId']
+    print("  0000000001111\n");
+    teacher_unique_id = generate_teacher_unique_id(school_id)
+    if teacher_unique_id is None:
+        return jsonify({
+            'data': {
+                'message': '生成教师唯一编号失败',
+                'code': 500
+            }
+        }), 500
+
+    print("  11111111", teacher_unique_id, "\n");
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("Add teacher failed: Database connection error.")
+        return jsonify({
+            'data': {
+                'message': '数据库连接失败',
+                'code': 500
+            }
+        }), 500
+
+    print("  22222222\n");
+
+    is_admin_flag = data.get('is_Administarator')
+    try:
+        # 如果是布尔值 True/False，转成 1/0
+        if isinstance(is_admin_flag, bool):
+            is_admin_flag = int(is_admin_flag)
+        else:
+            # 如果是字符串，比如 "1" 或 "0"，也转成 int
+            is_admin_flag = int(is_admin_flag) if is_admin_flag is not None else 0
+    except ValueError:
+        is_admin_flag = 0  # 不能转换就给默认值
+
+    print("  22222222:", is_admin_flag);
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+        # 插入记录
+        sql_insert = """
+        INSERT INTO ta_teacher 
+        (name, icon, subject, gradeId, schoolId, is_Administarator, phone, id_card, sex, 
+         teaching_tenure, education, graduation_institution, major, 
+         teacher_certification_level, subjects_of_teacher_qualification_examination, 
+         educational_stage, teacher_unique_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s,
+                %s, %s, %s)
+        """
+        cursor.execute(sql_insert, (
+            data.get('name'),
+            data.get('icon'),
+            data.get('subject'),
+            data.get('gradeId'),
+            school_id,
+            is_admin_flag,
+            data.get('phone'),
+            data.get('id_card'),
+            data.get('sex'),
+            data.get('teaching_tenure'),
+            data.get('education'),
+            data.get('graduation_institution'),
+            data.get('major'),
+            data.get('teacher_certification_level'),
+            data.get('subjects_of_teacher_qualification_examination'),
+            data.get('educational_stage'),
+            teacher_unique_id
+        ))
+
+        print("  33333333333\n");
+        connection.commit()
+
+        # 查询刚插入的记录
+        teacher_id = cursor.lastrowid
+        cursor.execute("SELECT * FROM ta_teacher WHERE id = %s", (teacher_id,))
+        teacher_info = cursor.fetchone()
+        print("  444444444444\n");
+        return jsonify({
+            'data': {
+                'message': '新增教师成功',
+                'code': 200,
+                'teacher': teacher_info
+            }
+        }), 200
+
+    except Error as e:
+        print(" 5555555:", e);
+        connection.rollback()
+        app_logger.error(f"Database error during adding teacher: {e}")
+        return jsonify({
+            'data': {
+                'message': '新增教师失败',
+                'code': 500
+            }
+        }), 500
+    except Exception as e:
+        print("  666666666\n");
+        app_logger.error(f"Unexpected error during adding teacher: {e}")
+        return jsonify({
+            'data': {
+                'message': '内部服务器错误',
+                'code': 500
+            }
+        }), 500
+    finally:
+        print("  777777777\n");
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info("Database connection closed after adding teacher.")
+
+@app.route("/delete_teacher", methods=["POST"])
+def delete_teacher():
+    data = request.get_json()
+    if not data or "teacher_unique_id" not in data:
+        return jsonify({
+            "data": {
+                "message": "缺少 teacher_unique_id",
+                "code": 400
+            }
+        }), 400
+
+    teacher_unique_id = str(data["teacher_unique_id"])
+
+    connection = get_db_connection()
+    if connection is None:
+        return jsonify({
+            "data": {
+                "message": "数据库连接失败",
+                "code": 500
+            }
+        }), 500
+
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            "DELETE FROM ta_teacher WHERE teacher_unique_id = %s",
+            (teacher_unique_id,)
+        )
+        connection.commit()
+
+        if cursor.rowcount > 0:
+            return jsonify({
+                "data": {
+                    "message": "删除教师成功",
+                    "code": 200
+                }
+            }), 200
+        else:
+            return jsonify({
+                "data": {
+                    "message": "未找到对应教师",
+                    "code": 404
+                }
+            }), 404
+    except Exception as e:
+        connection.rollback()
+        app_logger.error(f"删除教师时数据库异常: {e}")
+        return jsonify({
+            "data": {
+                "message": "删除教师失败",
+                "code": 500
+            }
+        }), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+
+
+# 📌 查询教师列表接口
+@app.route("/get_list_teachers", methods=["GET"])
+def get_list_teachers():
+    school_id = request.args.get("schoolId")
+    final_query = "SELECT * FROM ta_teacher WHERE (%s IS NULL OR schoolId = %s)"
+    params = (school_id, school_id)
+
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("List teachers failed: Database connection error.")
+        return jsonify({
+            'data': {
+                'message': '数据库连接失败',
+                'code': 500,
+                'teachers': []
+            }
+        }), 500
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(final_query, params)
+        teachers = cursor.fetchall()
+        app_logger.info(f"Fetched {len(teachers)} teachers.")
+
+        return jsonify({
+            'data': {
+                'message': '获取老师列表成功',
+                'code': 200,
+                'teachers': teachers
+            }
+        }), 200
+
+    except Error as e:
+        app_logger.error(f"Database error during fetching teachers: {e}")
+        return jsonify({
+            'data': {
+                'message': '获取老师列表失败',
+                'code': 500,
+                'teachers': []
+            }
+        }), 500
+    except Exception as e:
+        app_logger.error(f"Unexpected error during fetching teachers: {e}")
+        return jsonify({
+            'data': {
+                'message': '内部服务器错误',
+                'code': 500,
+                'teachers': []
+            }
+        }), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info("Database connection closed after fetching teachers.")
+
+
 @app.route('/teachers', methods=['GET'])
 def list_teachers():
     """
