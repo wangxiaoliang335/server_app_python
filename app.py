@@ -1,6 +1,6 @@
 # app.py
 import os
-from flask import Flask, request, jsonify, session
+#from flask import Flask, request, jsonify, session
 import mysql.connector
 from mysql.connector import Error
 import hashlib
@@ -13,22 +13,57 @@ import time
 import base64
 import os
 import redis
+import json
+import uuid
+from fastapi import FastAPI, Query
+from typing import List, Dict, Optional
+#import session
 from logging.handlers import TimedRotatingFileHandler
-
+from typing import Dict
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, File, UploadFile, Form
+from fastapi.responses import JSONResponse
 from aliyunsdkcore.client import AcsClient
 from aliyunsdkcore.request import CommonRequest
-
+from fastapi import Request
+from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi.encoders import jsonable_encoder
 from dotenv import load_dotenv
+#from datetime import datetime
+import jwt
+
+import time
+import secrets
+import hashlib
+from typing import Dict
+#from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+#from fastapi.responses import JSONResponse
+import mysql.connector
+from mysql.connector import Error
 
 # 加载 .env 文件
 load_dotenv()
 
 IMAGE_DIR = "/var/www/images"  # 存头像的目录
 
+from contextlib import asynccontextmanager
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 🚀 启动时执行
+    import asyncio
+    asyncio.create_task(heartbeat_checker())
+    yield
+    # 🔴 关闭时执行
+    print("应用关闭")
+
+app = FastAPI(lifespan=lifespan)
+
+# 本机维护的客户端连接表
+connections: Dict[str, Dict] = {}  # {user_id: {"ws": WebSocket, "last_heartbeat": timestamp}}
+
 if not os.path.exists('logs'):
     os.makedirs('logs')
 
-app = Flask(__name__)
+#app = Flask(__name__)
 # 设置 Flask Session 密钥
 #app.secret_key = 'a1b2c3d4e5f67890123456789012345678901234567890123456789012345678'
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "default_key")
@@ -96,6 +131,9 @@ def get_daily_upload_folder():
     os.makedirs(daily_folder, exist_ok=True)
     return daily_folder
 
+def safe_json_response(data: dict, status_code: int = 200):
+    return JSONResponse(jsonable_encoder(data), status_code=status_code)
+
 def get_db_connection():
     """获取数据库连接"""
     try:
@@ -134,9 +172,22 @@ def send_sms_verification_code(phone, code):
     app_logger.info(f"手机号: {phone}, 验证码: {code}")
     return True
 
-@app.before_request
-def log_request_info():
-    app_logger.info(f"Incoming request: {request.method} {request.url} from {request.remote_addr}")
+verification_memory = {}
+
+# @app.before_request
+# def log_request_info():
+#     app_logger.info(f"Incoming request: {request.method} {request.url} from {request.remote_addr}")
+
+async def log_request_info(request: Request, call_next):
+    client_host = request.client.host  # 等于 Flask 的 request.remote_addr
+    app_logger.info(
+        f"Incoming request: {request.method} {request.url} from {client_host}"
+    )
+    response = await call_next(request)
+    return response
+
+# 添加中间件
+app.add_middleware(BaseHTTPMiddleware, dispatch=log_request_info)
 
 def verify_code_from_session(input_phone, input_code):
     stored_data = session.get('verification_code')
@@ -161,6 +212,48 @@ def verify_code_from_session(input_phone, input_code):
     session.pop('verification_code', None)
     app_logger.info(f"Verification successful for {input_phone}.")
     return True, "验证成功"
+
+def verify_code_from_memory(input_phone, input_code):
+    # 验证验证码
+    valid_info = verification_memory.get(input_phone)
+    if not valid_info:
+        app_logger.warning(f"Verification failed for {input_phone}: No code sent or expired.")
+        return False, "未发送验证码或验证码已过期"
+    elif time.time() > valid_info['expires_at']:
+        verification_memory.pop(input_phone, None)
+        app_logger.info(f"Verification code expired for {input_phone}.")
+        return False, "验证码已过期"
+    elif str(input_code) != str(valid_info['code']):
+        app_logger.warning(f"Verification failed for {input_phone}: Incorrect code entered.")
+        return False, "验证码错误"
+    else:
+        verification_memory.pop(input_phone, None)
+        app_logger.info(f"Verification successful for {input_phone}.")
+        return True, "验证成功"
+
+    # stored_data = session.get('verification_code')
+    # if not stored_data:
+    #     app_logger.warning(f"Verification failed for {input_phone}: No code sent or expired.")
+    #     return False, "未发送验证码或验证码已过期"
+
+    # if stored_data['phone'] != input_phone:
+    #     app_logger.warning(f"Verification failed for {input_phone}: Phone number mismatch.")
+    #     return False, "手机号不匹配"
+
+    # #if datetime.datetime.now() > stored_data['expires_at']:
+    # if time.time() > stored_data['expires_at']:
+    #     session.pop('verification_code', None)
+    #     app_logger.info(f"Verification code expired for {input_phone}.")
+    #     return False, "验证码已过期"
+
+    # if stored_data['code'] != input_code:
+    #     app_logger.warning(f"Verification failed for {input_phone}: Incorrect code entered.")
+    #     return False, "验证码错误"
+
+    # session.pop('verification_code', None)
+    # app_logger.info(f"Verification successful for {input_phone}.")
+    # return True, "验证成功"
+
 
 # Redis 连接
 r = redis.Redis(host='127.0.0.1', port=6379, decode_responses=True)
@@ -229,133 +322,81 @@ def generate_unique_code():
     print(" INSERT INTO code_str:", code_str, "\n");
     return code_str
 
-@app.route('/unique6digit', methods=['GET'])
-def unique_code_api():
+#from fastapi import Request
+#from fastapi.responses import JSONResponse
+#import base64, os, datetime
+
+@app.get("/unique6digit")
+async def unique_code_api():
     try:
         code = generate_unique_code()
-        return jsonify({"code": code, "status": "ok"})
+        return JSONResponse({"code": code, "status": "ok"})
     except Exception as e:
-        return jsonify({"error": str(e), "status": "fail"}), 500
+        return JSONResponse({"error": str(e), "status": "fail"}, status_code=500)
 
-@app.route('/schools', methods=['GET'])
-def list_schools():
-    """
-    获取学校列表 (支持根据学校名称进行模糊搜索 或 根据学校ID精确查询)
-    Query Parameters:
-        - name (str, optional): 学校名称，用于模糊搜索
-        - id (int, optional): 学校ID，用于精确查询
-    Returns:
-        JSON: 包含状态信息和学校列表数据的响应
-             { "data": { "message": "...", "code": ..., "schools": [...] } }
-    注意: 如果同时提供了 name 和 id, id 优先。
-    """
+
+@app.get("/schools")
+async def list_schools(request: Request):
     connection = get_db_connection()
     if connection is None:
         app_logger.error("List schools failed: Database connection error.")
-        return jsonify({
-            'data': {
-                'message': '数据库连接失败',
-                'code': 500,
-                'schools': []
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500, 'schools': []}}, status_code=500)
 
     cursor = None
     try:
-        # 1. 获取并解析查询参数
-        school_id = request.args.get('id', type=int)
-        name_filter = request.args.get('name', type=str)
+        school_id = request.query_params.get('id')
+        name_filter = request.query_params.get('name')
 
-        # 2. 构建 SQL 查询
         base_columns = "id, name, address"
         base_query = f"SELECT {base_columns} FROM ta_school WHERE 1=1"
-        filters = []
-        params = []
+        filters, params = [], []
 
-        # 优先根据 ID 查询
         if school_id is not None:
             filters.append("AND id = %s")
-            params.append(school_id)
-        # 如果没有 ID，则根据名称模糊搜索
+            params.append(int(school_id))
         elif name_filter:
             filters.append("AND name LIKE %s")
             params.append(f"%{name_filter}%")
 
-        # 3. 执行查询
         final_query = base_query + " " + " ".join(filters)
         cursor = connection.cursor(dictionary=True)
         cursor.execute(final_query, tuple(params))
         schools = cursor.fetchall()
 
-        # 4. 返回 JSON 响应 (包裹在 data 对象中)
         app_logger.info(f"Fetched {len(schools)} schools.")
-        return jsonify({
-            'data': {
-                'message': '获取学校列表成功',
-                'code': 200,
-                'schools': schools
-            }
-        }), 200
-
+        return safe_json_response({'data': {'message': '获取学校列表成功', 'code': 200, 'schools': schools}})
     except Error as e:
         app_logger.error(f"Database error during fetching schools: {e}")
-        return jsonify({
-            'data': {
-                'message': '获取学校列表失败',
-                'code': 500,
-                'schools': []
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '获取学校列表失败', 'code': 500, 'schools': []}}, status_code=500)
     except Exception as e:
         app_logger.error(f"Unexpected error during fetching schools: {e}")
-        return jsonify({
-            'data': {
-                'message': '内部服务器错误',
-                'code': 500,
-                'schools': []
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '内部服务器错误', 'code': 500, 'schools': []}}, status_code=500)
     finally:
-        if cursor:
-            cursor.close()
+        if cursor: cursor.close()
         if connection and connection.is_connected():
             connection.close()
             app_logger.info("Database connection closed after fetching schools.")
 
-@app.route('/updateUserInfo', methods=['POST'])
-def updateUserInfo():
-    data = request.get_json()
+
+@app.post("/updateUserInfo")
+async def updateUserInfo(request: Request):
+    data = await request.json()
     phone = data.get('phone')
     id_number = data.get('id_number')
     avatar = data.get('avatar')
 
-    if not id_number or (not avatar):
-        app_logger.warning("Login failed: Missing phone and either password or verification code.")
-        return jsonify({
-            'data': {
-                'message': '身份证号码和头像必须提供',
-                'code': 400
-            }
-        }), 400
+    if not id_number or not avatar:
+        app_logger.warning("UpdateUserInfo failed: Missing id_number or avatar.")
+        return JSONResponse({'data': {'message': '身份证号码和头像必须提供', 'code': 400}}, status_code=400)
 
     connection = get_db_connection()
     if connection is None:
-        app_logger.error("Login failed: Database connection error.")
-        return jsonify({
-            'data': {
-                'message': '数据库连接失败',
-                'code': 500
-            }
-        }), 500
-		
-		# 解码成二进制
+        app_logger.error("UpdateUserInfo failed: Database connection error.")
+        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500}}, status_code=500)
+
     avatar_bytes = base64.b64decode(avatar)
-	
-	# 生成文件名，例如 Alice_时间戳.jpg
     filename = f"{id_number}_.png"
     file_path = os.path.join(IMAGE_DIR, filename)
-
-    # 保存到文件系统
     with open(file_path, "wb") as f:
         f.write(avatar_bytes)
 
@@ -366,91 +407,45 @@ def updateUserInfo():
         cursor.execute(update_query, (file_path, id_number))
         connection.commit()
         cursor.close()
-        return jsonify({
-            'data': {
-                'message': '更新成功',
-                'code': 200,
-                #'user_id': user['id'] # 返回用户ID
-            }
-        }), 200
-
+        return JSONResponse({'data': {'message': '更新成功', 'code': 200}})
     except Error as e:
-        app_logger.error(f"Database error during login for {phone}: {e}")
-        return jsonify({
-            'data': {
-                'message': '更新失败',
-                'code': 500
-            }
-        }), 500
+        app_logger.error(f"Database error during updateUserInfo for {phone}: {e}")
+        return JSONResponse({'data': {'message': '更新失败', 'code': 500}}, status_code=500)
     finally:
         if connection and connection.is_connected():
             connection.close()
-            # app_logger.info("Database connection closed after login attempt.")
+            app_logger.info(f"Database connection closed after updating user info for {phone}.")
 
-@app.route('/userInfo', methods=['GET'])
-def list_userInfo():
-    """
-    获取用户信息 (支持手机号码精确查询)
-    Query Parameters:
-        - phone (str, optional): 手机号码，用于模糊搜索
-    Returns:
-        JSON: 包含状态信息和用户数据的响应
-             { "data": { "message": "...", "code": ..., "userinfo": [...] } }
-    """
+
+@app.get("/userInfo")
+async def list_userInfo(request: Request):
     connection = get_db_connection()
     if connection is None:
         app_logger.error("Get User Info failed: Database connection error.")
-        return jsonify({
-            'data': {
-                'message': '数据库连接失败',
-                'code': 500,
-                'schools': []
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500, 'userinfo': []}}, status_code=500)
 
     cursor = None
     try:
-        # 1. 获取并解析查询参数
-        phone_filter = request.args.get('phone', type=str)
+        phone_filter = request.query_params.get('phone')
+        #base_query = "SELECT * FROM ta_user_details WHERE phone = %s"
+        base_query = "SELECT u.*, t.teacher_unique_id FROM ta_user_details AS u LEFT JOIN ta_teacher AS t ON u.id_number = t.id_card WHERE u.phone = %s"
 
-        print(" 111111\n");
-        print(phone_filter);
-        print(" 222222\n");
-
-        # 2. 构建 SQL 查询
-        #base_columns = "id, name, address"
-        base_query = f"SELECT * FROM ta_user_details WHERE "
-        filters = []
-        params = []
-
-        filters.append("phone = %s")
-        params.append(phone_filter)
-
-        # # 优先根据 ID 查询
-        # if school_id is not None:
-        #     filters.append("AND id = %s")
-        #     params.append(school_id)
-        # # 如果没有 ID，则根据名称模糊搜索
-        # elif name_filter:
-        #     filters.append("AND name LIKE %s")
-        #     params.append(f"%{name_filter}%")
-
-        # 3. 执行查询
-        final_query = base_query + " " + " ".join(filters)
+        print(" userInfo 1111111\n")
         cursor = connection.cursor(dictionary=True)
-        cursor.execute(final_query, tuple(params))
+        cursor.execute(base_query, (phone_filter,))
         userinfo = cursor.fetchall()
 
-         # 遍历每一条记录，读取 PNG 转 Base64
+        print(" userInfo 222222\n")
+
+        # 附加头像Base64字段
         for user in userinfo:
-            avatar_path = user.get("avatar")  # 数据库里的文件名
+            avatar_path = user.get("avatar")
             if avatar_path:
                 full_path = os.path.join(IMAGE_DIR, avatar_path)
                 if os.path.exists(full_path):
                     try:
-                        with open(full_path, "rb") as img_file:
-                            b64_str = base64.b64encode(img_file.read()).decode('utf-8')
-                            user["avatar_base64"] = b64_str  # 新字段
+                        with open(full_path, "rb") as img:
+                            user["avatar_base64"] = base64.b64encode(img.read()).decode("utf-8")
                     except Exception as e:
                         app_logger.error(f"读取图片失败 {full_path}: {e}")
                         user["avatar_base64"] = None
@@ -459,75 +454,37 @@ def list_userInfo():
             else:
                 user["avatar_base64"] = None
 
-        # 4. 返回 JSON 响应 (包裹在 data 对象中)
         app_logger.info(f"Fetched {len(userinfo)} userinfo.")
-        return jsonify({
-            'data': {
-                'message': '获取用户信息成功',
-                'code': 200,
-                'userinfo': userinfo
-            }
-        }), 200
-
+        return safe_json_response({'data': {'message': '获取用户信息成功', 'code': 200, 'userinfo': userinfo}})
     except Error as e:
+        print("Database error during fetching userinfo:", e)
         app_logger.error(f"Database error during fetching userinfo: {e}")
-        return jsonify({
-            'data': {
-                'message': '获取用户信息失败',
-                'code': 500,
-                'userinfo': []
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '获取用户信息失败', 'code': 500, 'userinfo': []}}, status_code=500)
     except Exception as e:
+        print("Unexpected error during fetching userinfo:", e)
         app_logger.error(f"Unexpected error during fetching userinfo: {e}")
-        return jsonify({
-            'data': {
-                'message': '内部服务器错误',
-                'code': 500,
-                'userinfo': []
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '内部服务器错误', 'code': 500, 'userinfo': []}}, status_code=500)
     finally:
-        if cursor:
-            cursor.close()
+        if cursor: cursor.close()
         if connection and connection.is_connected():
             connection.close()
             app_logger.info("Database connection closed after fetching userinfo.")
 
-
-@app.route('/updateClasses', methods=['POST'])
-def updateClasses():
-    data_list = request.get_json()  # 接收到的 JSON 数组
-
-    if not isinstance(data_list, list) or len(data_list) == 0:
-        return jsonify({
-            'data': {
-                'message': '必须提供班级数组数据',
-                'code': 400
-            }
-        }), 400
+@app.post("/updateClasses")
+async def updateClasses(request: Request):
+    data_list = await request.json()
+    if not isinstance(data_list, list) or not data_list:
+        return JSONResponse({'data': {'message': '必须提供班级数组数据', 'code': 400}}, status_code=400)
 
     connection = get_db_connection()
     if connection is None:
-        return jsonify({
-            'data': {
-                'message': '数据库连接失败',
-                'code': 500
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500}}, status_code=500)
 
     try:
         cursor = connection.cursor()
-
-        # MySQL Upsert语句
         sql = """
         INSERT INTO ta_classes (
-            class_code,
-            school_stage,
-            grade,
-            class_name,
-            remark,
-            created_at
+            class_code, school_stage, grade, class_name, remark, created_at
         ) VALUES (%s, %s, %s, %s, %s, NOW())
         ON DUPLICATE KEY UPDATE
             school_stage = VALUES(school_stage),
@@ -536,75 +493,40 @@ def updateClasses():
             remark       = VALUES(remark),
             created_at   = VALUES(created_at);
         """
-
-        # 批量执行
         values = []
         for item in data_list:
-            class_code   = item.get('class_code')
-            school_stage = item.get('school_stage')
-            grade        = item.get('grade')
-            class_name   = item.get('class_name')
-            remark       = item.get('remark')
-
-            if not class_code:
-                continue  # 没有主键跳过
-
+            if not item.get('class_code'):
+                continue
             values.append((
-                class_code,
-                school_stage,
-                grade,
-                class_name,
-                remark
+                item.get('class_code'),
+                item.get('school_stage'),
+                item.get('grade'),
+                item.get('class_name'),
+                item.get('remark')
             ))
-
         if values:
             cursor.executemany(sql, values)
             connection.commit()
-
         cursor.close()
         connection.close()
-
-        return jsonify({
-            'data': {
-                'message': '批量插入/更新完成',
-                'code': 200,
-                'count': len(values)
-            }
-        }), 200
-
+        return safe_json_response({'data': {'message': '批量插入/更新完成', 'code': 200, 'count': len(values)}})
     except Error as e:
-        return jsonify({
-            'data': {
-                'message': f'数据库操作失败: {e}',
-                'code': 500
-            }
-        }), 500
+        return JSONResponse({'data': {'message': f'数据库操作失败: {e}', 'code': 500}}, status_code=500)
 
-@app.route('/getClassesByPrefix', methods=['POST'])
-def get_classes_by_prefix():
-    data = request.get_json()
+
+@app.post("/getClassesByPrefix")
+async def get_classes_by_prefix(request: Request):
+    data = await request.json()
     prefix = data.get("prefix")
-
-    # 参数校验
     if not prefix or len(prefix) != 6 or not prefix.isdigit():
-        return jsonify({
-            "data": {
-                "message": "必须提供6位数字前缀",
-                "code": 400
-            }
-        }), 400
+        return JSONResponse({'data': {'message': '必须提供6位数字前缀', 'code': 400}}, status_code=400)
 
     connection = get_db_connection()
     if connection is None:
-        return jsonify({
-            "data": {
-                "message": "数据库连接失败",
-                "code": 500
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500}}, status_code=500)
 
     try:
-        cursor = connection.cursor(dictionary=True)  # 返回字典型结果
+        cursor = connection.cursor(dictionary=True)
         sql = """
         SELECT class_code, school_stage, grade, class_name, remark, created_at
         FROM ta_classes
@@ -612,54 +534,30 @@ def get_classes_by_prefix():
         """
         cursor.execute(sql, (prefix,))
         results = cursor.fetchall()
-
+        #results = jsonable_encoder(results)
         cursor.close()
         connection.close()
-
-        return jsonify({
-            "data": {
-                "message": "查询成功",
-                "code": 200,
-                "count": len(results),
-                "classes": results
-            }
-        }), 200
-
+        return safe_json_response({'data': {'message': '查询成功', 'code': 200, 'count': len(results), 'classes': results}})
     except Error as e:
-        app.logger.error(f"查询失败: {e}")
-        return jsonify({
-            "data": {
-                "message": "查询失败",
-                "code": 500
-            }
-        }), 500
+        app_logger.error(f"查询失败: {e}")
+        return JSONResponse({'data': {'message': '查询失败', 'code': 500}}, status_code=500)
 
 
-@app.route('/updateSchoolInfo', methods=['POST'])
-def updateSchoolInfo():
-    data = request.get_json()
+@app.post("/updateSchoolInfo")
+async def updateSchoolInfo(request: Request):
+    data = await request.json()
     id = data.get('id')
     name = data.get('name')
     address = data.get('address')
 
     if not id:
-        app_logger.warning("Login failed: Missing id.")
-        return jsonify({
-            'data': {
-                'message': 'id值必须提供',
-                'code': 400
-            }
-        }), 400
+        app_logger.warning("UpdateSchoolInfo failed: Missing id.")
+        return JSONResponse({'data': {'message': 'id值必须提供', 'code': 400}}, status_code=400)
 
     connection = get_db_connection()
     if connection is None:
-        app_logger.error("Login failed: Database connection error.")
-        return jsonify({
-            'data': {
-                'message': '数据库连接失败',
-                'code': 500
-            }
-        }), 500
+        app_logger.error("UpdateSchoolInfo failed: Database connection error.")
+        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500}}, status_code=500)
 
     cursor = None
     try:
@@ -668,26 +566,15 @@ def updateSchoolInfo():
         cursor.execute(update_query, (name, address, id))
         connection.commit()
         cursor.close()
-        return jsonify({
-            'data': {
-                'message': '更新成功',
-                'code': 200,
-                #'user_id': user['id'] # 返回用户ID
-            }
-        }), 200
-
+        return JSONResponse({'data': {'message': '更新成功', 'code': 200}})
     except Error as e:
-        app_logger.error(f"Database error during login for {name}: {e}")
-        return jsonify({
-            'data': {
-                'message': '更新失败',
-                'code': 500
-            }
-        }), 500
+        app_logger.error(f"Database error during updateSchoolInfo for {name}: {e}")
+        return JSONResponse({'data': {'message': '更新失败', 'code': 500}}, status_code=500)
     finally:
         if connection and connection.is_connected():
             connection.close()
-            # app_logger.info("Database connection closed after login attempt.")
+            app_logger.info(f"Database connection closed after updating school info for {name}.")
+
 
 # # 生成教师唯一编号
 # def generate_teacher_unique_id(school_id):
@@ -724,6 +611,10 @@ def updateSchoolInfo():
 #         if connection and connection.is_connected():
 #             connection.close()
 
+from fastapi import Request
+from fastapi.responses import JSONResponse
+import datetime
+
 def generate_teacher_unique_id(school_id):
     """
     并发安全生成 teacher_unique_id
@@ -733,13 +624,9 @@ def generate_teacher_unique_id(school_id):
     if connection is None:
         return None
     cursor = None
-
     try:
         cursor = connection.cursor()
-
-        # 开启事务，锁定当前学校ID的记录，防并发冲突
         connection.start_transaction()
-
         cursor.execute("""
             SELECT MAX(teacher_unique_id)
             FROM ta_teacher
@@ -747,83 +634,50 @@ def generate_teacher_unique_id(school_id):
             FOR UPDATE
         """, (school_id,))
         result = cursor.fetchone()
-
         if result and result[0]:
-            # 补零到长度10位
             max_id_str = str(result[0]).zfill(10)
-            # 取后4位流水号部分
             last_num = int(max_id_str[6:])
             new_num = last_num + 1
         else:
             new_num = 1
-
-        # 拼接最终教师唯一编号
         teacher_unique_id_str = f"{str(school_id).zfill(6)}{str(new_num).zfill(4)}"
         return int(teacher_unique_id_str)
-
     except Error as e:
         app_logger.error(f"Error generating teacher_unique_id: {e}")
         return None
     finally:
-        if cursor:
-            cursor.close()
-        if connection and connection.is_connected():
-            connection.close()
+        if cursor: cursor.close()
+        if connection and connection.is_connected(): connection.close()
 
 
-# 📌 新增教师接口
-@app.route("/add_teacher", methods=["POST"])
-def add_teacher():
-    data = request.json
+@app.post("/add_teacher")
+async def add_teacher(request: Request):
+    data = await request.json()
     if not data or 'schoolId' not in data:
-        return jsonify({
-            'data': {
-                'message': '缺少 schoolId',
-                'code': 400
-            }
-        }), 400
+        return JSONResponse({'data': {'message': '缺少 schoolId', 'code': 400}}, status_code=400)
 
-    print("  000000000\n");
     school_id = data['schoolId']
-    print("  0000000001111\n");
     teacher_unique_id = generate_teacher_unique_id(school_id)
     if teacher_unique_id is None:
-        return jsonify({
-            'data': {
-                'message': '生成教师唯一编号失败',
-                'code': 500
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '生成教师唯一编号失败', 'code': 500}}, status_code=500)
 
-    print("  11111111", teacher_unique_id, "\n");
     connection = get_db_connection()
     if connection is None:
         app_logger.error("Add teacher failed: Database connection error.")
-        return jsonify({
-            'data': {
-                'message': '数据库连接失败',
-                'code': 500
-            }
-        }), 500
-
-    print("  22222222\n");
+        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500}}, status_code=500)
 
     is_admin_flag = data.get('is_Administarator')
     try:
-        # 如果是布尔值 True/False，转成 1/0
         if isinstance(is_admin_flag, bool):
             is_admin_flag = int(is_admin_flag)
         else:
-            # 如果是字符串，比如 "1" 或 "0"，也转成 int
             is_admin_flag = int(is_admin_flag) if is_admin_flag is not None else 0
     except ValueError:
-        is_admin_flag = 0  # 不能转换就给默认值
+        is_admin_flag = 0
 
-    print("  22222222:", is_admin_flag);
     cursor = None
     try:
         cursor = connection.cursor(dictionary=True)
-        # 插入记录
         sql_insert = """
         INSERT INTO ta_teacher 
         (name, icon, subject, gradeId, schoolId, is_Administarator, phone, id_card, sex, 
@@ -836,146 +690,71 @@ def add_teacher():
                 %s, %s, %s)
         """
         cursor.execute(sql_insert, (
-            data.get('name'),
-            data.get('icon'),
-            data.get('subject'),
-            data.get('gradeId'),
-            school_id,
-            is_admin_flag,
-            data.get('phone'),
-            data.get('id_card'),
-            data.get('sex'),
-            data.get('teaching_tenure'),
-            data.get('education'),
-            data.get('graduation_institution'),
-            data.get('major'),
+            data.get('name'), data.get('icon'), data.get('subject'), data.get('gradeId'),
+            school_id, is_admin_flag, data.get('phone'), data.get('id_card'),
+            data.get('sex'), data.get('teaching_tenure'), data.get('education'),
+            data.get('graduation_institution'), data.get('major'),
             data.get('teacher_certification_level'),
             data.get('subjects_of_teacher_qualification_examination'),
-            data.get('educational_stage'),
-            teacher_unique_id
+            data.get('educational_stage'), teacher_unique_id
         ))
-
-        print("  33333333333\n");
         connection.commit()
-
-        # 查询刚插入的记录
         teacher_id = cursor.lastrowid
         cursor.execute("SELECT * FROM ta_teacher WHERE id = %s", (teacher_id,))
         teacher_info = cursor.fetchone()
-        print("  444444444444\n");
-        return jsonify({
-            'data': {
-                'message': '新增教师成功',
-                'code': 200,
-                'teacher': teacher_info
-            }
-        }), 200
-
+        return safe_json_response({'data': {'message': '新增教师成功', 'code': 200, 'teacher': teacher_info}})
     except Error as e:
-        print(" 5555555:", e);
         connection.rollback()
         app_logger.error(f"Database error during adding teacher: {e}")
-        return jsonify({
-            'data': {
-                'message': '新增教师失败',
-                'code': 500
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '新增教师失败', 'code': 500}}, status_code=500)
     except Exception as e:
-        print("  666666666\n");
         app_logger.error(f"Unexpected error during adding teacher: {e}")
-        return jsonify({
-            'data': {
-                'message': '内部服务器错误',
-                'code': 500
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '内部服务器错误', 'code': 500}}, status_code=500)
     finally:
-        print("  777777777\n");
-        if cursor:
-            cursor.close()
+        if cursor: cursor.close()
         if connection and connection.is_connected():
             connection.close()
             app_logger.info("Database connection closed after adding teacher.")
 
-@app.route("/delete_teacher", methods=["POST"])
-def delete_teacher():
-    data = request.get_json()
+
+@app.post("/delete_teacher")
+async def delete_teacher(request: Request):
+    data = await request.json()
     if not data or "teacher_unique_id" not in data:
-        return jsonify({
-            "data": {
-                "message": "缺少 teacher_unique_id",
-                "code": 400
-            }
-        }), 400
+        return JSONResponse({'data': {'message': '缺少 teacher_unique_id', 'code': 400}}, status_code=400)
 
     teacher_unique_id = str(data["teacher_unique_id"])
-
     connection = get_db_connection()
     if connection is None:
-        return jsonify({
-            "data": {
-                "message": "数据库连接失败",
-                "code": 500
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500}}, status_code=500)
 
     cursor = None
     try:
         cursor = connection.cursor()
-        cursor.execute(
-            "DELETE FROM ta_teacher WHERE teacher_unique_id = %s",
-            (teacher_unique_id,)
-        )
+        cursor.execute("DELETE FROM ta_teacher WHERE teacher_unique_id = %s", (teacher_unique_id,))
         connection.commit()
-
         if cursor.rowcount > 0:
-            return jsonify({
-                "data": {
-                    "message": "删除教师成功",
-                    "code": 200
-                }
-            }), 200
+            return safe_json_response({'data': {'message': '删除教师成功', 'code': 200}})
         else:
-            return jsonify({
-                "data": {
-                    "message": "未找到对应教师",
-                    "code": 404
-                }
-            }), 404
+            return safe_json_response({'data': {'message': '未找到对应教师', 'code': 404}}, status_code=404)
     except Exception as e:
         connection.rollback()
         app_logger.error(f"删除教师时数据库异常: {e}")
-        return jsonify({
-            "data": {
-                "message": "删除教师失败",
-                "code": 500
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '删除教师失败', 'code': 500}}, status_code=500)
     finally:
-        if cursor:
-            cursor.close()
-        if connection and connection.is_connected():
-            connection.close()
+        if cursor: cursor.close()
+        if connection and connection.is_connected(): connection.close()
 
 
-# 📌 查询教师列表接口
-@app.route("/get_list_teachers", methods=["GET"])
-def get_list_teachers():
-    school_id = request.args.get("schoolId")
+@app.get("/get_list_teachers")
+async def get_list_teachers(request: Request):
+    school_id = request.query_params.get("schoolId")
     final_query = "SELECT * FROM ta_teacher WHERE (%s IS NULL OR schoolId = %s)"
     params = (school_id, school_id)
 
     connection = get_db_connection()
     if connection is None:
-        app_logger.error("List teachers failed: Database connection error.")
-        return jsonify({
-            'data': {
-                'message': '数据库连接失败',
-                'code': 500,
-                'teachers': []
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500, 'teachers': []}}, status_code=500)
 
     cursor = None
     try:
@@ -983,295 +762,156 @@ def get_list_teachers():
         cursor.execute(final_query, params)
         teachers = cursor.fetchall()
         app_logger.info(f"Fetched {len(teachers)} teachers.")
-
-        return jsonify({
-            'data': {
-                'message': '获取老师列表成功',
-                'code': 200,
-                'teachers': teachers
-            }
-        }), 200
-
+        return safe_json_response({'data': {'message': '获取老师列表成功', 'code': 200, 'teachers': teachers}})
     except Error as e:
         app_logger.error(f"Database error during fetching teachers: {e}")
-        return jsonify({
-            'data': {
-                'message': '获取老师列表失败',
-                'code': 500,
-                'teachers': []
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '获取老师列表失败', 'code': 500, 'teachers': []}}, status_code=500)
     except Exception as e:
         app_logger.error(f"Unexpected error during fetching teachers: {e}")
-        return jsonify({
-            'data': {
-                'message': '内部服务器错误',
-                'code': 500,
-                'teachers': []
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '内部服务器错误', 'code': 500, 'teachers': []}}, status_code=500)
     finally:
-        if cursor:
-            cursor.close()
+        if cursor: cursor.close()
         if connection and connection.is_connected():
             connection.close()
             app_logger.info("Database connection closed after fetching teachers.")
 
 
-@app.route('/teachers', methods=['GET'])
-def list_teachers():
-    """
-    获取老师列表 (支持根据学校ID筛选和姓名模糊搜索)
-    Query Parameters:
-        - school_id (int, optional): 学校ID，用于筛选特定学校的老师
-        - name (str, optional): 老师姓名，用于模糊搜索
-        - grade_id (int, optional): 年级ID，用于筛选特定年级的老师
-    Returns:
-        JSON: 包含状态信息和老师列表数据的响应
-             { "data": { "message": "...", "code": ..., "teachers": [...] } }
-    """
+@app.get("/teachers")
+async def list_teachers(request: Request):
     connection = get_db_connection()
     if connection is None:
-        app_logger.error("List teachers failed: Database connection error.")
-        return jsonify({
-            'data': {
-                'message': '数据库连接失败',
-                'code': 500,
-                'teachers': []
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500, 'teachers': []}}, status_code=500)
 
     cursor = None
     try:
-        # 1. 获取并解析查询参数
-        school_id_filter = request.args.get('school_id', type=int)
-        grade_id_filter = request.args.get('grade_id', type=int)
-        name_filter = request.args.get('name', type=str)
+        school_id_filter = request.query_params.get('school_id')
+        grade_id_filter = request.query_params.get('grade_id')
+        name_filter = request.query_params.get('name')
 
-        # 2. 构建 SQL 查询
-        base_columns = "id, name, icon, subject, gradeId,schoolId"
+        base_columns = "id, name, icon, subject, gradeId, schoolId"
         base_query = f"SELECT {base_columns} FROM ta_teacher WHERE 1=1"
-        filters = []
-        params = []
+        filters, params = [], []
 
-        # 应用学校ID筛选
-        if school_id_filter is not None:
+        if school_id_filter:
             filters.append("AND schoolId = %s")
-            params.append(school_id_filter)
-
-        if grade_id_filter is not None:
+            params.append(int(school_id_filter))
+        if grade_id_filter:
             filters.append("AND gradeId = %s")
-            params.append(grade_id_filter)
-
-        # 应用姓名模糊搜索
+            params.append(int(grade_id_filter))
         if name_filter:
             filters.append("AND name LIKE %s")
             params.append(f"%{name_filter}%")
 
-        # 3. 执行查询
         final_query = base_query + " " + " ".join(filters)
         cursor = connection.cursor(dictionary=True)
         cursor.execute(final_query, tuple(params))
         teachers = cursor.fetchall()
-
-        # 4. 返回 JSON 响应 (包裹在 data 对象中)
         app_logger.info(f"Fetched {len(teachers)} teachers.")
-        return jsonify({
-            'data': {
-                'message': '获取老师列表成功',
-                'code': 200,
-                'teachers': teachers
-            }
-        }), 200
-
+        return safe_json_response({'data': {'message': '获取老师列表成功', 'code': 200, 'teachers': teachers}})
     except Error as e:
         app_logger.error(f"Database error during fetching teachers: {e}")
-        return jsonify({
-            'data': {
-                'message': '获取老师列表失败',
-                'code': 500,
-                'teachers': []
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '获取老师列表失败', 'code': 500, 'teachers': []}}, status_code=500)
     except Exception as e:
         app_logger.error(f"Unexpected error during fetching teachers: {e}")
-        return jsonify({
-            'data': {
-                'message': '内部服务器错误',
-                'code': 500,
-                'teachers': []
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '内部服务器错误', 'code': 500, 'teachers': []}}, status_code=500)
     finally:
-        if cursor:
-            cursor.close()
+        if cursor: cursor.close()
         if connection and connection.is_connected():
             connection.close()
             app_logger.info("Database connection closed after fetching teachers.")
 
-# 查询最近3天的消息列表
-@app.route('/messages/recent', methods=['GET'])
-def get_recent_messages():
-    """
-    获取最近3天的消息列表，并包含发送者的姓名和图标信息
-    Query Parameters (可选):
-        - school_id (int): 筛选特定学校的消息
-        - class_id (int): 筛选特定班级的消息
-        - sender_id (int): 筛选特定发送者的消息
-    Returns:
-        JSON: 包含状态信息和消息列表数据(含姓名和图标)的响应
-             { "data": { "message": "...", "code": ..., "messages": [...] } }
-    """
+
+@app.get("/messages/recent")
+async def get_recent_messages(request: Request):
     connection = get_db_connection()
     if connection is None:
-        app_logger.error("Get recent messages failed: Database connection error.")
-        return jsonify({
-            'data': {
-                'message': '数据库连接失败',
-                'code': 500,
-                'messages': []
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500, 'messages': []}}, status_code=500)
 
     cursor = None
     try:
-        # 1. 获取并解析查询参数
-        school_id = request.args.get('school_id', type=int)
-        class_id = request.args.get('class_id', type=int)
-        sender_id_filter = request.args.get('sender_id', type=int) # 重命名以避免与循环变量冲突
+        school_id = request.query_params.get('school_id')
+        class_id = request.query_params.get('class_id')
+        sender_id_filter = request.query_params.get('sender_id')
 
-        # 2. 构建 SQL 查询消息
-        # 计算3天前的日期时间
         three_days_ago = datetime.datetime.now() - datetime.timedelta(days=3)
-        
-        # 修改查询列，包含发送者ID以便后续查询教师信息
         base_columns = "id, sender_id, content_type, text_content, school_id, class_id, sent_at, created_at, updated_at"
         base_query = f"SELECT {base_columns} FROM ta_message WHERE sent_at >= %s and content_type='text'"
-        filters = []
-        params = [three_days_ago]
+        filters, params = [], [three_days_ago]
 
-        # 应用可选筛选条件
-        if school_id is not None:
-            filters.append("AND school_id = %s")
-            params.append(school_id)
-        if class_id is not None:
-            filters.append("AND class_id = %s")
-            params.append(class_id)
-        if sender_id_filter is not None: # 使用重命名后的变量
-            filters.append("AND sender_id = %s")
-            params.append(sender_id_filter)
+        if school_id: filters.append("AND school_id = %s"); params.append(int(school_id))
+        if class_id: filters.append("AND class_id = %s"); params.append(int(class_id))
+        if sender_id_filter: filters.append("AND sender_id = %s"); params.append(int(sender_id_filter))
 
-        # 按发送时间降序排列 (最新的在前)
         order_clause = "ORDER BY sent_at DESC"
-
-        # 3. 执行查询消息
         final_query = f"{base_query} {' '.join(filters)} {order_clause}"
         cursor = connection.cursor(dictionary=True)
         cursor.execute(final_query, tuple(params))
         messages = cursor.fetchall()
 
-        # 4. 提取所有唯一的 sender_id
         sender_ids = list(set(msg['sender_id'] for msg in messages))
         sender_info_map = {}
-
-        # 5. 查询所有相关发送者的姓名和图标
         if sender_ids:
-            # 使用 IN 子句一次性查询所有姓名和图标，提高效率
             placeholders = ','.join(['%s'] * len(sender_ids))
-            # 假设 ta_teacher 表包含 id, name, icon 字段
             info_query = f"SELECT id, name, icon FROM ta_teacher WHERE id IN ({placeholders})"
             cursor.execute(info_query, tuple(sender_ids))
             teacher_infos = cursor.fetchall()
-            # 构建 sender_id 到 {name, icon} 字典的映射字典
-            sender_info_map = {
-                teacher['id']: {
-                    'sender_name': teacher['name'],
-                    'sender_icon': teacher['icon']
-                }
-                for teacher in teacher_infos
-            }
-            app_logger.info(f"Fetched name and icon for {len(sender_info_map)} unique senders.")
+            sender_info_map = {t['id']: {'sender_name': t['name'], 'sender_icon': t['icon']} for t in teacher_infos}
 
-        # 6. 将姓名和图标信息合并到消息数据中，并格式化时间
         for msg in messages:
-            # 获取并添加发送者信息
-            sender_info = sender_info_map.get(msg['sender_id'], {})
-            msg['sender_name'] = sender_info.get('sender_name', '未知老师')
-            msg['sender_icon'] = sender_info.get('sender_icon', None) # 如果找不到图标，则为 None
-            
-            # 将 datetime 对象转换为字符串，以便 JSON 序列化
-            if isinstance(msg.get('sent_at'), datetime.datetime):
-                 msg['sent_at'] = msg['sent_at'].strftime('%Y-%m-%d %H:%M:%S')
-            if isinstance(msg.get('created_at'), datetime.datetime):
-                 msg['created_at'] = msg['created_at'].strftime('%Y-%m-%d %H:%M:%S')
-            if isinstance(msg.get('updated_at'), datetime.datetime):
-                 msg['updated_at'] = msg['updated_at'].strftime('%Y-%m-%d %H:%M:%S')
+            info = sender_info_map.get(msg['sender_id'], {})
+            msg['sender_name'] = info.get('sender_name', '未知老师')
+            msg['sender_icon'] = info.get('sender_icon')
+            for f in ['sent_at', 'created_at', 'updated_at']:
+                if isinstance(msg.get(f), datetime.datetime):
+                    msg[f] = msg[f].strftime('%Y-%m-%d %H:%M:%S')
 
-        # 7. 返回 JSON 响应 (包裹在 data 对象中)
-        app_logger.info(f"Fetched {len(messages)} recent messages with sender names and icons.")
-        return jsonify({
-            'data': {
-                'message': '获取最近消息列表成功',
-                'code': 200,
-                'messages': messages
-            }
-        }), 200
-
+        app_logger.info(f"Fetched {len(messages)} recent messages with sender info.")
+        return safe_json_response({'data': {'message': '获取最近消息列表成功', 'code': 200, 'messages': messages}})
     except Error as e:
         app_logger.error(f"Database error during fetching recent messages: {e}")
-        return jsonify({
-            'data': {
-                'message': '获取最近消息列表失败',
-                'code': 500,
-                'messages': []
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '获取最近消息列表失败', 'code': 500, 'messages': []}}, status_code=500)
     except Exception as e:
         app_logger.error(f"Unexpected error during fetching recent messages: {e}")
-        return jsonify({
-            'data': {
-                'message': '内部服务器错误',
-                'code': 500,
-                'messages': []
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '内部服务器错误', 'code': 500, 'messages': []}}, status_code=500)
     finally:
-        if cursor:
-            cursor.close()
+        if cursor: cursor.close()
         if connection and connection.is_connected():
             connection.close()
             app_logger.info("Database connection closed after fetching recent messages.")
 
-# 添加新消息
-@app.route('/messages', methods=['POST'])
-def add_message():
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from fastapi import Path
+
+@app.post("/messages")
+async def add_message(request: Request):
     connection = get_db_connection()
     if not connection:
-        return jsonify({
+        return JSONResponse({
             'data': {
                 'message': '数据库连接失败',
                 'code': 500,
                 'message': None
             }
-        }), 500
+        }, status_code=500)
 
     cursor = None
     try:
-        content_type_header = request.content_type or ""
-        
-        sender_id = request.args.get('sender_id', type=int) or request.form.get('sender_id', type=int)
+        content_type_header = request.headers.get("content-type", "")
+
+        # 先从 query 或 form 中获取 sender_id
+        sender_id = request.query_params.get('sender_id')
+        if sender_id:
+            try:
+                sender_id = int(sender_id)
+            except:
+                sender_id = None
 
         # === 情况1: JSON 格式 - 发送文本消息 ===
         if content_type_header.startswith('application/json'):
-            data = request.get_json()
+            data = await request.json()
             if not data:
-                return jsonify({
-                    'data': {
-                        'message': '无效的 JSON 数据',
-                        'code': 400,
-                        'message': None
-                    }
-                }), 400
+                return JSONResponse({'data': {'message': '无效的 JSON 数据', 'code': 400, 'message': None}}, status_code=400)
 
             sender_id = data.get('sender_id') or sender_id
             text_content = data.get('text_content')
@@ -1281,46 +921,19 @@ def add_message():
             sent_at_str = data.get('sent_at')
 
             if not sender_id:
-                return jsonify({
-                    'data': {
-                        'message': '缺少 sender_id',
-                        'code': 400,
-                        'message': None
-                    }
-                }), 400
-
+                return JSONResponse({'data': {'message': '缺少 sender_id', 'code': 400, 'message': None}}, status_code=400)
             if content_type != 'text':
-                return jsonify({
-                    'data': {
-                        'message': 'content_type 必须为 text 才能发送文本',
-                        'code': 400,
-                        'message': None
-                    }
-                }), 400
-
+                return JSONResponse({'data': {'message': 'content_type 必须为 text', 'code': 400, 'message': None}}, status_code=400)
             if not text_content or not text_content.strip():
-                return jsonify({
-                    'data': {
-                        'message': 'text_content 不能为空',
-                        'code': 400,
-                        'message': None
-                    }
-                }), 400
+                return JSONResponse({'data': {'message': 'text_content 不能为空', 'code': 400, 'message': None}}, status_code=400)
 
             text_content = text_content.strip()
-
-            # 时间处理
             sent_at = datetime.datetime.now()
             if sent_at_str:
                 try:
-                    sent_at = datetime.strptime(sent_at_str, '%Y-%m-%d %H:%M:%S')
+                    sent_at = datetime.datetime.strptime(sent_at_str, '%Y-%m-%d %H:%M:%S')
                 except ValueError:
-                    return jsonify({
-                        'data': {
-                            'message': 'sent_at 格式错误，应为 YYYY-MM-DD HH:MM:SS',
-                            'code': 400
-                        }
-                    }), 400
+                    return JSONResponse({'data': {'message': 'sent_at 格式错误，应为 YYYY-MM-DD HH:MM:SS', 'code': 400}}, status_code=400)
 
             # 插入数据库
             insert_query = """
@@ -1329,18 +942,10 @@ def add_message():
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
             """
             cursor = connection.cursor()
-            cursor.execute(insert_query, (
-                sender_id,
-                'text',
-                text_content,
-                None,        # audio_data
-                school_id,
-                class_id,
-                sent_at
-            ))
+            cursor.execute(insert_query, (sender_id, 'text', text_content, None, school_id, class_id, sent_at))
             connection.commit()
-            new_message_id = cursor.lastrowid
 
+            new_message_id = cursor.lastrowid
             message_dict = {
                 'id': new_message_id,
                 'sender_id': sender_id,
@@ -1353,100 +958,47 @@ def add_message():
                 'created_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'updated_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             }
-
-            return jsonify({
-                'data': {
-                    'message': '文本消息发送成功',
-                    'code': 201,
-                    'message': message_dict
-                }
-            }), 201
-
+            return safe_json_response({'data': {'message': '文本消息发送成功', 'code': 201, 'message': message_dict}}, status_code=201)
 
         # === 情况2: 二进制流 - 发送音频消息 ===
         elif content_type_header.startswith('application/octet-stream'):
             if not sender_id:
-                return jsonify({
-                    'data': {
-                        'message': '缺少 sender_id（请通过 query 或 form 传递）',
-                        'code': 400,
-                        'message': None
-                    }
-                }), 400
+                return JSONResponse({'data': {'message': '缺少 sender_id', 'code': 400, 'message': None}}, status_code=400)
 
-            # 强制要求 content_type=audio（可通过 query 或 header）
-            msg_content_type = request.args.get('content_type') or request.headers.get('X-Content-Type')
+            msg_content_type = request.query_params.get('content_type') or request.headers.get('X-Content-Type')
             if msg_content_type != 'audio':
-                return jsonify({
-                    'data': {
-                        'message': 'content_type 必须为 audio',
-                        'code': 400,
-                        'message': None
-                    }
-                }), 400
+                return JSONResponse({'data': {'message': 'content_type 必须为 audio', 'code': 400, 'message': None}}, status_code=400)
 
-            # 读取音频二进制流
-            audio_data = request.get_data()
-            audio_data = request.get_data()  # 读取原始 body
-            #with open("received.wav", "wb") as f:
-            #    f.write(audio_data)
+            audio_data = await request.body()
             if not audio_data:
-                return jsonify({
-                    'data': {
-                        'message': '音频数据为空',
-                        'code': 400,
-                        'message': None
-                    }
-                }), 400
+                return JSONResponse({'data': {'message': '音频数据为空', 'code': 400, 'message': None}}, status_code=400)
 
-            # 验证音频 MIME 类型
             client_audio_type = request.headers.get('X-Audio-Content-Type') or content_type_header
             valid_types = ['audio/mpeg', 'audio/wav', 'audio/aac', 'audio/ogg', 'audio/mp4']
             if client_audio_type not in valid_types:
-                return jsonify({
-                    'data': {
-                        'message': f'不支持的音频类型: {client_audio_type}',
-                        'code': 400,
-                        'message': None
-                    }
-                }), 400
+                return JSONResponse({'data': {'message': f'不支持的音频类型: {client_audio_type}', 'code': 400, 'message': None}}, status_code=400)
 
-            school_id = request.args.get('school_id', type=int)
-            class_id = request.args.get('class_id', type=int)
-            sent_at_str = request.args.get('sent_at')
-
+            school_id = request.query_params.get('school_id')
+            class_id = request.query_params.get('class_id')
+            sent_at_str = request.query_params.get('sent_at')
             sent_at = datetime.datetime.now()
             if sent_at_str:
                 try:
-                    sent_at = datetime.strptime(sent_at_str, '%Y-%m-%d %H:%M:%S')
+                    sent_at = datetime.datetime.strptime(sent_at_str, '%Y-%m-%d %H:%M:%S')
                 except ValueError:
-                    return jsonify({'data': {
-                        'message': 'sent_at 格式错误',
-                        'code': 400
-                    }}), 400
+                    return JSONResponse({'data': {'message': 'sent_at 格式错误', 'code': 400}}, status_code=400)
 
-            # 插入音频消息
             insert_query = """
                 INSERT INTO ta_message 
                 (sender_id, content_type, text_content, audio_data, school_id, class_id, sent_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
             """
             cursor = connection.cursor()
-            cursor.execute(insert_query, (
-                sender_id,
-                'audio',
-                None,           # text_content
-                audio_data,     # 存二进制流
-                school_id,
-                class_id,
-                sent_at
-            ))
+            cursor.execute(insert_query, (sender_id, 'audio', None, audio_data, school_id, class_id, sent_at))
             connection.commit()
+
             new_message_id = cursor.lastrowid
-
-            # 返回动态播放链接
             audio_url = f"/api/audio/{new_message_id}"
-
             message_dict = {
                 'id': new_message_id,
                 'sender_id': sender_id,
@@ -1459,51 +1011,26 @@ def add_message():
                 'created_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'updated_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             }
+            return safe_json_response({'data': {'message': '音频消息发送成功', 'code': 201, 'message': message_dict}}, status_code=201)
 
-            return jsonify({
-                'data': {
-                    'message': '音频消息发送成功',
-                    'code': 201,
-                    'message': message_dict
-                }
-            }), 201
-
-
-        # === 其他 Content-Type 不支持 ===
         else:
-            return jsonify({
-                'data': {
-                    'message': '仅支持 application/json（文本）或 application/octet-stream（音频）',
-                    'code': 400,
-                    'message': None
-                }
-            }), 400
-
+            return JSONResponse({'data': {'message': '仅支持 application/json 或 application/octet-stream', 'code': 400, 'message': None}}, status_code=400)
 
     except Exception as e:
         app_logger.error(f"Error in add_message: {e}")
         if connection and connection.is_connected():
             connection.rollback()
-        return jsonify({
-            'data': {
-                'message': '服务器内部错误',
-                'code': 500,
-                'message': None
-            }
-        }), 500
-
-
+        return JSONResponse({'data': {'message': '服务器内部错误', 'code': 500, 'message': None}}, status_code=500)
     finally:
-        if cursor:
-            cursor.close()
-        if connection and connection.is_connected():
-            connection.close()
+        if cursor: cursor.close()
+        if connection and connection.is_connected(): connection.close()
 
-@app.route('/api/audio/<int:message_id>', methods=['GET'])
-def get_audio(message_id):
+
+@app.get("/api/audio/{message_id}")
+async def get_audio(message_id: int = Path(..., description="音频消息ID")):
     connection = get_db_connection()
     if not connection:
-        return 'Database error', 500
+        return JSONResponse({'message': 'Database error'}, status_code=500)
 
     cursor = None
     try:
@@ -1513,70 +1040,40 @@ def get_audio(message_id):
         result = cursor.fetchone()
 
         if not result or not result[0]:
-            return 'Audio not found', 404
+            return JSONResponse({'message': 'Audio not found'}, status_code=404)
 
         audio_data = result[0]
-
-        # 可通过扩展名或 header 推断类型，这里默认 mp3
-        response = app.response_class(
-            response=audio_data,
-            status=200,
-            mimetype='audio/mpeg'  # 可根据实际调整
-        )
-        response.headers['Content-Length'] = len(audio_data)
-        response.headers['Accept-Ranges'] = 'bytes'
-        return response
-
+        return safe_json_response(content=audio_data, media_type="audio/mpeg")  # 替代 Flask response_class
     except Exception as e:
         app_logger.error(f"Error serving audio: {e}")
-        return 'Internal error', 500
+        return JSONResponse({'message': 'Internal error'}, status_code=500)
     finally:
         if cursor: cursor.close()
         if connection and connection.is_connected(): connection.close()
 
-# --- 通知接口 ---
 
-@app.route('/notifications', methods=['POST'])
-def send_notification_to_class():
-    """
-    发送通知给指定班级
-    Request Body (JSON):
-        - sender_id (int): 发送者老师ID (必需)
-        - class_id (int): 接收通知的班级ID (必需) -> 存入 receiver_id 字段
-        - content (str): 通知内容 (必需)
-    Returns:
-        JSON: { "data": { "message": "...", "code": ..., "notification": {...} } }
-              返回的通知对象包含发送者的 name 和 icon 字段。
-    """
+@app.post("/notifications")
+async def send_notification_to_class(request: Request):
     connection = get_db_connection()
     if connection is None:
-        return jsonify({'data': {'message': '数据库连接失败', 'code': 500}}), 500
+        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500}}, status_code=500)
 
     cursor = None
     try:
-        data = request.get_json()
+        data = await request.json()
         sender_id = data.get('sender_id')
         class_id = data.get('class_id')
         content = data.get('content')
 
-        # 基本验证
         if not all([sender_id, class_id, content]):
-            return jsonify({'data': {'message': '缺少必需参数: sender_id, class_id, content', 'code': 400}}), 400
+            return JSONResponse({'data': {'message': '缺少必需参数', 'code': 400}}, status_code=400)
 
-        # 开始事务
         connection.start_transaction()
-
         cursor = connection.cursor(dictionary=True)
-        # 1. 插入通知，receiver_id 存储班级ID
-        insert_query = """
-            INSERT INTO ta_notification 
-            (sender_id, receiver_id, content) 
-            VALUES (%s, %s, %s)
-        """
+        insert_query = "INSERT INTO ta_notification (sender_id, receiver_id, content) VALUES (%s, %s, %s)"
         cursor.execute(insert_query, (sender_id, class_id, content))
         notification_id = cursor.lastrowid
 
-        # 2. 获取刚插入的通知详情，并关联 ta_teacher 表获取发送者信息
         select_query = """
             SELECT n.*, t.name AS sender_name, t.icon AS sender_icon
             FROM ta_notification n
@@ -1587,78 +1084,61 @@ def send_notification_to_class():
         new_notification = cursor.fetchone()
 
         if not new_notification:
-             # 理论上不应该发生，但做个检查
-             connection.rollback()
-             app_logger.error(f"Failed to retrieve newly created notification {notification_id} with sender info.")
-             return jsonify({'data': {'message': '创建通知后查询失败', 'code': 500}}), 500
+            connection.rollback()
+            app_logger.error(f"Failed to retrieve notification {notification_id}")
+            return JSONResponse({'data': {'message': '创建通知后查询失败', 'code': 500}}, status_code=500)
 
-        # 3. 格式化时间
         new_notification = format_notification_time(new_notification)
-
-        # 提交事务
         connection.commit()
-
-        app_logger.info(f"Notification sent by teacher {sender_id} (Name: {new_notification.get('sender_name', 'N/A')}) to class {class_id}: ID {notification_id}")
-        return jsonify({
-            'data': {
-                'message': '通知发送成功',
-                'code': 201,
-                'notification': new_notification
-            }
-        }), 201
-
+        return safe_json_response({'data': {'message': '通知发送成功', 'code': 201, 'notification': new_notification}}, status_code=201)
     except Error as e:
         connection.rollback()
-        app_logger.error(f"Database error sending notification to class {class_id}: {e}")
-        return jsonify({'data': {'message': '发送通知失败', 'code': 500}}), 500
+        app_logger.error(f"Database error: {e}")
+        return JSONResponse({'data': {'message': '发送通知失败', 'code': 500}}, status_code=500)
     except Exception as e:
         connection.rollback()
-        app_logger.error(f"Unexpected error sending notification to class {class_id}: {e}")
-        return jsonify({'data': {'message': '内部服务器错误', 'code': 500}}), 500
+        app_logger.error(f"Unexpected error: {e}")
+        return JSONResponse({'data': {'message': '内部服务器错误', 'code': 500}}, status_code=500)
     finally:
-        if cursor:
-            cursor.close()
-        if connection and connection.is_connected():
-            connection.close()
-            app_logger.info("Database connection closed after sending notification.")
+        if cursor: cursor.close()
+        if connection and connection.is_connected(): connection.close()
 
-def format_notification_time(notif_dict):
-    """格式化通知中的时间字段"""
-    for time_field in ['created_at', 'updated_at']:
-        if isinstance(notif_dict.get(time_field), datetime.datetime):
-            notif_dict[time_field] = notif_dict[time_field].strftime('%Y-%m-%d %H:%M:%S')
-    return notif_dict
+from fastapi import Path
 
-@app.route('/notifications/class/<int:class_id>', methods=['GET'])
-def get_notifications_for_class(class_id):
+@app.get("/notifications/class/{class_id}")
+async def get_notifications_for_class(
+    class_id: int = Path(..., description="班级ID"),
+    request: Request = None
+):
     """
     获取指定班级的最新通知，并将这些通知标记为已读 (is_read=1)。
-    Path Parameter:
-        - class_id (int): 班级ID
-    Query Parameters (可选):
-        - limit (int): 限制返回的通知数量，默认 20，最大 100
-    Returns:
-        JSON: { "data": { "message": "...", "code": ..., "notifications": [...] } }
-             返回的通知列表包含发送者的 name 和 icon 字段。
-             返回的通知列表是调用此接口前未读的通知。
+    - class_id (path参数): 班级ID
+    - limit (query参数, 可选): 默认 20，最大 100
     """
     connection = get_db_connection()
     if connection is None:
-        return jsonify({'data': {'message': '数据库连接失败', 'code': 500, 'notifications': []}}), 500
+        return JSONResponse({
+            'data': {
+                'message': '数据库连接失败',
+                'code': 500,
+                'notifications': []
+            }
+        }, status_code=500)
 
     cursor = None
     try:
-        # 获取可选的 limit 参数
-        limit = request.args.get('limit', default=20, type=int)
-        # 限制 limit 范围
+        # 获取 limit 参数并限制范围
+        limit_param = request.query_params.get('limit')
+        try:
+            limit = int(limit_param) if limit_param else 20
+        except ValueError:
+            limit = 20
         limit = max(1, min(limit, 100))
 
-        # 开始事务
         connection.start_transaction()
-
         cursor = connection.cursor(dictionary=True)
 
-        # 1. 首先查询该班级未读的通知，并关联 ta_teacher 表获取发送者信息 (按创建时间倒序)
+        # 1. 查询该班级未读通知，并关联老师表
         select_query = """
             SELECT n.*, t.name AS sender_name, t.icon AS sender_icon
             FROM ta_notification n
@@ -1670,82 +1150,92 @@ def get_notifications_for_class(class_id):
         cursor.execute(select_query, (class_id, limit))
         notifications = cursor.fetchall()
 
-        # 2. 提取要更新为已读的通知ID
+        # 2. 批量标记为已读
         notification_ids = [notif['id'] for notif in notifications]
-
-        # 3. 如果有未读通知，则批量更新它们的 is_read 状态
         if notification_ids:
             ids_placeholder = ','.join(['%s'] * len(notification_ids))
-            update_query = f"UPDATE ta_notification SET is_read = 1, updated_at = CURRENT_TIMESTAMP WHERE id IN ({ids_placeholder})"
+            update_query = f"""
+                UPDATE ta_notification 
+                SET is_read = 1, updated_at = CURRENT_TIMESTAMP 
+                WHERE id IN ({ids_placeholder})
+            """
             cursor.execute(update_query, tuple(notification_ids))
-            # connection.commit() # 暂不提交，事务结束时统一提交
             app_logger.info(f"Marked {len(notification_ids)} notifications as read for class {class_id}.")
         else:
             app_logger.info(f"No unread notifications found for class {class_id}.")
 
-        # 4. 格式化返回的通知的时间
-        for notif in notifications:
-             notif = format_notification_time(notif)
+        # 3. 格式化时间
+        for i, notif in enumerate(notifications):
+            notifications[i] = format_notification_time(notif)
 
-        # 提交事务
         connection.commit()
-
-        app_logger.info(f"Fetched and marked {len(notifications)} notifications for class {class_id} (limit: {limit}).")
-        return jsonify({
+        return safe_json_response({
             'data': {
                 'message': '获取班级通知成功',
                 'code': 200,
-                'notifications': notifications # 返回的是获取前未读的通知，已包含发送者信息
+                'notifications': notifications
             }
-        }), 200
-
+        })
     except Error as e:
-        connection.rollback() # 回滚事务
+        connection.rollback()
         app_logger.error(f"Database error fetching/reading notifications for class {class_id}: {e}")
-        return jsonify({'data': {'message': '获取/标记通知失败', 'code': 500, 'notifications': []}}), 500
+        return JSONResponse({
+            'data': {
+                'message': '获取/标记通知失败',
+                'code': 500,
+                'notifications': []
+            }
+        }, status_code=500)
     except Exception as e:
         connection.rollback()
         app_logger.error(f"Unexpected error fetching/reading notifications for class {class_id}: {e}")
-        return jsonify({'data': {'message': '内部服务器错误', 'code': 500, 'notifications': []}}), 500
+        return JSONResponse({
+            'data': {
+                'message': '内部服务器错误',
+                'code': 500,
+                'notifications': []
+            }
+        }, status_code=500)
     finally:
-        if cursor:
-            cursor.close()
+        if cursor: cursor.close()
         if connection and connection.is_connected():
             connection.close()
-            app_logger.info("Database connection closed after fetching/reading notifications for class.")
+            app_logger.info(f"Database connection closed after fetching/reading notifications for class {class_id}.")
+
 
 # --- 修改后的壁纸列表接口 ---
-@app.route('/wallpapers', methods=['GET'])
-def list_wallpapers():
+from fastapi import Request
+from fastapi.responses import JSONResponse
+import time, secrets
+
+@app.get("/wallpapers")
+async def list_wallpapers(request: Request):
     """
     获取所有壁纸列表 (支持筛选、排序)
     Query Parameters:
-        - is_enabled (int, optional): 是否启用 (1: 启用, 0: 禁用)
-        - resolution (str, optional): 分辨率筛选 (例如 '1920x1080')
-        - sort_by (str, optional): 排序字段 ('created_at', 'updated_at') (默认 'created_at')
-        - order (str, optional): 排序方式 ('asc', 'desc') (默认 'desc')
-    Returns:
-        JSON: 包含状态信息和壁纸列表数据的响应
-             { "data": { "message": "...", "code": ..., "wallpapers": [...] } }
+        - is_enabled (int, optional)
+        - resolution (str, optional)
+        - sort_by (str, optional)
+        - order (str, optional)
     """
     connection = get_db_connection()
     if connection is None:
         app_logger.error("List wallpapers failed: Database connection error.")
-        return jsonify({
-            'data': {
-                'message': '数据库连接失败',
-                'code': 500,
-                'wallpapers': []
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500, 'wallpapers': []}}, status_code=500)
 
     cursor = None
     try:
-        # 1. 获取并解析查询参数
-        is_enabled_filter = request.args.get('is_enabled', type=int) # 1 or 0 or None
-        resolution_filter = request.args.get('resolution', type=str) # e.g., '1920x1080' or None
-        sort_by = request.args.get('sort_by', 'created_at', type=str) # Default sort
-        order = request.args.get('order', 'desc', type=str) # Default order
+        # 1. 获取查询参数
+        is_enabled_filter = request.query_params.get('is_enabled')
+        resolution_filter = request.query_params.get('resolution')
+        sort_by = request.query_params.get('sort_by', 'created_at')
+        order = request.query_params.get('order', 'desc')
+
+        # 转类型
+        try:
+            is_enabled_filter = int(is_enabled_filter) if is_enabled_filter is not None else None
+        except ValueError:
+            is_enabled_filter = None
 
         # 2. 验证排序参数
         valid_sort_fields = ['created_at', 'updated_at', 'id']
@@ -1755,134 +1245,90 @@ def list_wallpapers():
         if order not in valid_orders:
             order = 'desc'
 
-        # 3. 构建 SQL 查询
+        # 3. 构建 SQL
         base_columns = "id, title, image_url, resolution, file_size, file_type, uploader_id, is_enabled, created_at, updated_at"
         base_query = f"SELECT {base_columns} FROM ta_wallpaper WHERE 1=1"
-        filters = []
-        params = []
+        filters, params = [], []
 
-        # 应用筛选条件
         if is_enabled_filter is not None:
             filters.append("AND is_enabled = %s")
             params.append(is_enabled_filter)
-        
         if resolution_filter:
             filters.append("AND resolution = %s")
             params.append(resolution_filter)
 
-        # 应用排序
         order_clause = f"ORDER BY {sort_by} {order}"
-
-        # 4. 执行查询
         final_query = base_query + " " + " ".join(filters) + " " + order_clause
+
+        # 4. 执行
         cursor = connection.cursor(dictionary=True)
         cursor.execute(final_query, tuple(params))
         wallpapers = cursor.fetchall()
 
-        # 5. 返回 JSON 响应 (包裹在 data 对象中)
         app_logger.info(f"Fetched {len(wallpapers)} wallpapers.")
-        return jsonify({
-            'data': {
-                'message': '获取壁纸列表成功',
-                'code': 200,
-                'wallpapers': wallpapers
-            }
-        }), 200
-
+        return safe_json_response({'data': {'message': '获取壁纸列表成功', 'code': 200, 'wallpapers': wallpapers}})
     except Error as e:
         app_logger.error(f"Database error during fetching wallpapers: {e}")
-        return jsonify({
-            'data': {
-                'message': '获取壁纸列表失败',
-                'code': 500,
-                'wallpapers': []
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '获取壁纸列表失败', 'code': 500, 'wallpapers': []}}, status_code=500)
     except Exception as e:
         app_logger.error(f"Unexpected error during fetching wallpapers: {e}")
-        return jsonify({
-            'data': {
-                'message': '内部服务器错误',
-                'code': 500,
-                'wallpapers': []
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '内部服务器错误', 'code': 500, 'wallpapers': []}}, status_code=500)
     finally:
-        if cursor:
-            cursor.close()
-        if connection and connection.is_connected():
+        if cursor: cursor.close()
+        if connection and connection.is_connected(): 
             connection.close()
             app_logger.info("Database connection closed after fetching wallpapers.")
 
-# --- 壁纸列表接口结束 ---
-
-@app.route('/send_verification_code', methods=['POST'])
-def send_verification_code():
+@app.post("/send_verification_code")
+async def send_verification_code(request: Request):
     """发送短信验证码接口"""
-    data = request.get_json()
+    # 存储验证码和发送时间
+    data = await request.json()
     phone = data.get('phone')
 
     if not phone:
         app_logger.warning("Send verification code failed: Phone number is missing.")
-        return jsonify({
-            'data': {
-                'message': '手机号不能为空',
-                'code': 400
-            }
-        }), 400
+        return JSONResponse({'data': {'message': '手机号不能为空', 'code': 400}}, status_code=400)
 
     code = generate_verification_code()
-    session['verification_code'] = {
+
+    # 用一个全局内存缓存（可以替代 Flask session）
+    verification_memory[phone] = {  # 你可以在程序顶部定义： verification_memory = {}
         'code': code,
-        'phone': phone,
-        #'expires_at': datetime.datetime.now() + datetime.timedelta(seconds=VERIFICATION_CODE_EXPIRY)
-        'expires_at': time.time() + VERIFICATION_CODE_EXPIRY   # 例如 VERIFICATION_CODE_EXPIRY = 300
+        'expires_at': time.time() + VERIFICATION_CODE_EXPIRY
     }
 
     if send_sms_verification_code(phone, code):
         app_logger.info(f"Verification code sent successfully to {phone}.")
-        return jsonify({
-            'data': {
-                'message': '验证码已发送',
-                'code': 200
-            }
-        }), 200
+        return JSONResponse({'data': {'message': '验证码已发送', 'code': 200}})
     else:
-        session.pop('verification_code', None)
+        verification_memory.pop(phone, None)
         app_logger.error(f"Failed to send verification code to {phone}.")
-        return jsonify({
-            'data': {
-                'message': '验证码发送失败',
-                'code': 500
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '验证码发送失败', 'code': 500}}, status_code=500)
 
 
-@app.route('/register', methods=['POST'])
-def register():
-    data = request.get_json()
+@app.post("/register")
+async def register(request: Request):
+    data = await request.json()
     phone = data.get('phone')
     password = data.get('password')
     verification_code = data.get('verification_code')
 
     if not phone or not password or not verification_code:
         app_logger.warning("Registration failed: Missing phone, password, or verification code.")
-        return jsonify({
-            'data': {
-                'message': '手机号、密码和验证码不能为空',
-                'code': 400
-            }
-        }), 400
+        return JSONResponse({'data': {'message': '手机号、密码和验证码不能为空', 'code': 400}}, status_code=400)
 
-    is_valid, message = verify_code_from_session(phone, verification_code)
-    if not is_valid:
-        app_logger.warning(f"Registration failed for {phone}: {message}")
-        return jsonify({
-            'data': {
-                'message': message,
-                'code': 400
-            }
-        }), 400
+    # 验证验证码
+    valid_info = verification_memory.get(phone)
+    if not valid_info:
+        return JSONResponse({'data': {'message': '验证码已失效，请重新获取', 'code': 400}}, status_code=400)
+    elif time.time() > valid_info['expires_at']:
+        verification_memory.pop(phone, None)
+        return JSONResponse({'data': {'message': '验证码已过期，请重新获取', 'code': 400}}, status_code=400)
+    elif str(verification_code) != str(valid_info['code']):
+        return JSONResponse({'data': {'message': '验证码错误', 'code': 400}}, status_code=400)
+    else:
+        verification_memory.pop(phone, None)
 
     salt = secrets.token_hex(16)
     password_hash = hash_password(password, salt)
@@ -1890,12 +1336,7 @@ def register():
     connection = get_db_connection()
     if connection is None:
         app_logger.error("Registration failed: Database connection error.")
-        return jsonify({
-            'data': {
-                'message': '数据库连接失败',
-                'code': 500
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500}}, status_code=500)
 
     try:
         cursor = connection.cursor()
@@ -1903,12 +1344,7 @@ def register():
         if cursor.fetchone():
             app_logger.info(f"Registration failed for {phone}: Phone number already registered.")
             cursor.close()
-            return jsonify({
-                'data': {
-                    'message': '手机号已注册',
-                    'code': 400
-                }
-            }), 400
+            return JSONResponse({'data': {'message': '手机号已注册', 'code': 400}}, status_code=400)
 
         insert_query = """
             INSERT INTO ta_user (phone, password_hash, salt, is_verified, created_at)
@@ -1919,179 +1355,130 @@ def register():
         user_id = cursor.lastrowid
         cursor.close()
         app_logger.info(f"User registered successfully: Phone {phone}, User ID {user_id}.")
-        return jsonify({
-            'data': {
-                'message': '注册成功',
-                'code': 201,
-                'user_id': user_id # 可以将具体数据放在 data 对象下
-            }
-        }), 201
-
+        return safe_json_response({'data': {'message': '注册成功', 'code': 201, 'user_id': user_id}}, status_code=201)
     except Error as e:
         connection.rollback()
         app_logger.error(f"Database error during registration for {phone}: {e}")
-        return jsonify({
-            'data': {
-                'message': '注册失败',
-                'code': 500
-            }
-        }), 500
+        return JSONResponse({'data': {'message': '注册失败', 'code': 500}}, status_code=500)
     finally:
         if connection and connection.is_connected():
             connection.close()
-            # app_logger.info("Database connection closed after registration attempt.")
+            app_logger.info("Database connection closed after registration attempt.")
 
+# 用于签名的密钥（实际项目中放到环境变量里）
+#SECRET_KEY = "my_secret_key"
+ALGORITHM = "HS256"
 
-@app.route('/login', methods=['POST'])
-def login():
-    data = request.get_json()
+# 生成 JWT token
+def create_access_token(data: dict, expires_delta: int = 30):
+    to_encode = data.copy()
+    expire = datetime.datetime.utcnow() + datetime.timedelta(minutes=expires_delta)
+    to_encode.update({"exp": expire})
+    token = jwt.encode(to_encode, app.secret_key, algorithm=ALGORITHM)
+    return token
+
+# ======= 登录接口 =======
+@app.post("/login")
+async def login(request: Request):
+    data = await request.json()
     phone = data.get('phone')
     password = data.get('password')
     verification_code = data.get('verification_code')
 
     if not phone or (not password and not verification_code):
-        app_logger.warning("Login failed: Missing phone and either password or verification code.")
-        return jsonify({
-            'data': {
-                'message': '手机号和密码或验证码必须提供',
-                'code': 400
-            }
-        }), 400
+        return JSONResponse({'data': {'message': '手机号和密码或验证码必须提供', 'code': 400}}, status_code=400)
 
     connection = get_db_connection()
     if connection is None:
-        app_logger.error("Login failed: Database connection error.")
-        return jsonify({
-            'data': {
-                'message': '数据库连接失败',
-                'code': 500
-            }
-        }), 500
+        print(" 数据库连接失败\n")
+        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500}}, status_code=500)
 
+    cursor = None
     try:
         cursor = connection.cursor(dictionary=True)
         cursor.execute("SELECT id, password_hash, salt, is_verified FROM ta_user WHERE phone = %s", (phone,))
         user = cursor.fetchone()
 
         if not user:
-            app_logger.info(f"Login failed for {phone}: User not found.")
-            cursor.close()
-            return jsonify({
-                'data': {
-                    'message': '用户不存在',
-                    'code': 404
-                }
-            }), 404
-
+            return JSONResponse({'data': {'message': '用户不存在', 'code': 404}}, status_code=404)
         if not user['is_verified']:
-            app_logger.info(f"Login failed for {phone}: Account not verified.")
-            cursor.close()
-            return jsonify({
-                'data': {
-                    'message': '账户未验证',
-                    'code': 403
-                }
-            }), 403
+            return JSONResponse({'data': {'message': '账户未验证', 'code': 403}}, status_code=403)
 
-        # 验证方式
+        print(" 111111 phone:", phone, "\n")
         auth_success = False
         if password:
-            stored_hash = user['password_hash']
-            salt = user['salt']
-            input_hash = hash_password(password, salt)
-            if input_hash == stored_hash:
+            if hash_password(password, user['salt']) == user['password_hash']:
                 auth_success = True
-                app_logger.info(f"Password login successful for user ID {user['id']}.")
             else:
-                app_logger.warning(f"Password login failed for {phone}: Incorrect password.")
-                cursor.close()
-                return jsonify({
-                    'data': {
-                        'message': '密码错误',
-                        'code': 401
-                    }
-                }), 401
-
+                print(hash_password(password, user['salt']));
+                print(user['password_hash']);
+                return JSONResponse({'data': {'message': '密码错误', 'code': 401}}, status_code=401)
         elif verification_code:
-            is_valid, message = verify_code_from_session(phone, verification_code)
+            is_valid, message = verify_code_from_memory(phone, verification_code)
             if is_valid:
                 auth_success = True
-                app_logger.info(f"Verification code login successful for user ID {user['id']}.")
             else:
-                app_logger.warning(f"Verification code login failed for {phone}: {message}")
-                cursor.close()
-                # 这里也用 400，因为是客户端传参问题
-                return jsonify({
-                    'data': {
-                        'message': message,
-                        'code': 400
-                    }
-                }), 400
+                return JSONResponse({'data': {'message': message, 'code': 400}}, status_code=400)
 
+        print(" 111111 auth_success:", auth_success, "\n")
         if auth_success:
-            update_query = "UPDATE ta_user SET last_login_at = %s WHERE id = %s"
-            cursor.execute(update_query, (datetime.datetime.now(), user['id']))
+            # 登录成功 -> 生成 token
+            token_data = {"sub": phone}  # sub: subject，表示用户标识
+            access_token = create_access_token(token_data, expires_delta=60)  # 60分钟有效期
+            cursor.execute("UPDATE ta_user SET last_login_at = %s WHERE id = %s", (datetime.datetime.now(), user['id']))
             connection.commit()
-            cursor.close()
-            return jsonify({
-                'data': {
-                    'message': '登录成功',
-                    'code': 200,
-                    'user_id': user['id'] # 返回用户ID
-                }
-            }), 200
-
-    except Error as e:
-        app_logger.error(f"Database error during login for {phone}: {e}")
-        return jsonify({
-            'data': {
-                'message': '登录失败',
-                'code': 500
-            }
-        }), 500
+            return safe_json_response({'data': {'message': '登录成功', 'code': 200, "access_token": access_token, "token_type": "bearer", 'user_id': user['id']}}, status_code=200)
+    except Exception as e:
+        app_logger.error(f"Database error during login: {e}")
+        return JSONResponse({'data': {'message': '登录失败', 'code': 500}}, status_code=500)
     finally:
-        if connection and connection.is_connected():
-            connection.close()
-            # app_logger.info("Database connection closed after login attempt.")
+        if cursor: cursor.close()
+        if connection and connection.is_connected(): connection.close()
 
 
-@app.route('/verify_and_set_password', methods=['POST'])
-def verify_and_set_password():
+from fastapi import Request
+from fastapi.responses import JSONResponse
+import secrets
+
+@app.post("/verify_and_set_password")
+async def verify_and_set_password(request: Request):
     """忘记密码 - 验证并重置密码"""
-    data = request.get_json()
+    data = await request.json()
     phone = data.get('phone')
     verification_code = data.get('verification_code')
     new_password = data.get('new_password')
 
     if not phone or not verification_code or not new_password:
         app_logger.warning("Password reset failed: Missing phone, verification code, or new password.")
-        return jsonify({
+        return JSONResponse({
             'data': {
                 'message': '手机号、验证码和新密码不能为空',
                 'code': 400
             }
-        }), 400
+        }, status_code=400)
 
-    is_valid, message = verify_code_from_session(phone, verification_code)
+    # 统一验证码校验方式
+    is_valid, message = verify_code_from_memory(phone, verification_code)
     if not is_valid:
         app_logger.warning(f"Password reset failed for {phone}: {message}")
-        return jsonify({
+        return JSONResponse({
             'data': {
                 'message': message,
                 'code': 400
             }
-        }), 400
+        }, status_code=400)
 
     connection = get_db_connection()
     if connection is None:
         app_logger.error("Password reset failed: Database connection error.")
-        return jsonify({
+        return JSONResponse({
             'data': {
                 'message': '数据库连接失败',
                 'code': 500
             }
-        }), 500
+        }, status_code=500)
 
+    cursor = None
     try:
         cursor = connection.cursor()
         cursor.execute("SELECT id FROM ta_user WHERE phone = %s AND is_verified = 1", (phone,))
@@ -2099,13 +1486,12 @@ def verify_and_set_password():
 
         if not user:
             app_logger.info(f"Password reset failed for {phone}: User not found or not verified.")
-            cursor.close()
-            return jsonify({
+            return JSONResponse({
                 'data': {
                     'message': '用户不存在或账户未验证',
                     'code': 400
                 }
-            }), 400
+            }, status_code=400)
 
         new_salt = secrets.token_hex(16)
         new_password_hash = hash_password(new_password, new_salt)
@@ -2120,38 +1506,557 @@ def verify_and_set_password():
 
         if cursor.rowcount == 0:
             app_logger.error(f"Password reset failed for user ID {user[0]}: Update query affected 0 rows.")
-            cursor.close()
-            return jsonify({
+            return JSONResponse({
                 'data': {
                     'message': '更新失败',
                     'code': 500
                 }
-            }), 500
+            }, status_code=500)
 
-        cursor.close()
         app_logger.info(f"Password reset successful for user ID {user[0]}.")
-        return jsonify({
+        return safe_json_response({
             'data': {
                 'message': '密码重置成功',
                 'code': 200
             }
-        }), 200
+        }, status_code=200)
 
     except Error as e:
         connection.rollback()
         app_logger.error(f"Database error during password reset for {phone}: {e}")
-        return jsonify({
+        return JSONResponse({
             'data': {
                 'message': '密码重置失败',
                 'code': 500
             }
-        }), 500
+        }, status_code=500)
     finally:
+        if cursor:
+            cursor.close()
         if connection and connection.is_connected():
             connection.close()
-            # app_logger.info("Database connection closed after password reset attempt.")
+            app_logger.info(f"Database connection closed after password reset attempt for {phone}.")
+
+BASE_PATH = '/data/nginx/html/icons'
+os.makedirs(BASE_PATH, exist_ok=True)
+
+@app.post("/upload_icon")
+async def upload_icon(
+    teacher_id: str = Form(...),     # 唯一教师编号
+    file: UploadFile = File(...)     # 图标文件
+):
+    # 1. 创建教师目录
+    teacher_dir = os.path.join(BASE_PATH, teacher_id)
+    os.makedirs(teacher_dir, exist_ok=True)
+
+    # 2. 保存文件
+    save_path = os.path.join(teacher_dir, file.filename)
+    with open(save_path, "wb") as f:
+        f.write(await file.read())
+
+    # 3. 返回结果
+    url_path = f"/icons/{teacher_id}/{file.filename}"
+    return JSONResponse({
+        "status": "ok",
+        "message": "Upload success",
+        "url": url_path
+    })
+
+@app.get("/groups")
+def get_groups_by_admin(group_admin_id: str = Query(..., description="群管理员的唯一ID"),nickname_keyword: str = Query(None, description="群名关键词（支持模糊查询）")):
+    """
+    根据群管理员ID查询ta_group表，可选群名关键词模糊匹配
+    """
+    # 参数校验
+    if not group_admin_id:
+        return JSONResponse({
+            "data": {
+                "message": "缺少群管理员ID",
+                "code": 400
+            }
+        }, status_code=400)
+
+    # 数据库连接
+    connection = get_db_connection()
+    if connection is None or not connection.is_connected():
+        return JSONResponse({
+            "data": {
+                "message": "数据库连接失败",
+                "code": 500
+            }
+        }, status_code=500)
+
+    try:
+        cursor = connection.cursor(dictionary=True)
+
+        # 判断是否要加模糊查询
+        if nickname_keyword:
+            sql = """
+                SELECT * FROM ta_group
+                WHERE group_admin_id=%s AND nickname LIKE %s
+            """
+            cursor.execute(sql, (group_admin_id, f"%{nickname_keyword}%"))
+        else:
+            sql = "SELECT * FROM ta_group WHERE group_admin_id=%s"
+            cursor.execute(sql, (group_admin_id,))
+
+        groups = cursor.fetchall()
+        #cursor.close()
+        #conn.close()
+
+         # 转换所有的 datetime 成字符串
+        for row in groups:
+            for key in row:
+                if isinstance(row[key], datetime.datetime):
+                    row[key] = row[key].strftime("%Y-%m-%d %H:%M:%S")
+
+        return JSONResponse({
+            "data": {
+                "message": "查询成功",
+                "code": 200,
+                "groups": groups
+            }
+        }, status_code=200)
+
+    except mysql.connector.Error as e:
+        print(f"查询错误: {e}")
+        return JSONResponse({
+            "data": {
+                "message": "查询失败",
+                "code": 500
+            }
+        }, status_code=500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info(f"Database connection closed after get_groups_by_admin attempt for {group_admin_id}.")
+
+@app.get("/member/groups")
+def get_member_groups(
+    unique_member_id: str = Query(..., description="成员唯一ID")
+):
+    """
+    根据 unique_member_id 查询该成员所在的群列表 (JOIN ta_group)
+    """
+    if not unique_member_id:
+        return JSONResponse({
+            "data": {
+                "message": "缺少成员唯一ID",
+                "code": 400
+            }
+        }, status_code=400)
+
+    connection = get_db_connection()
+    if connection is None or not connection.is_connected():
+        return JSONResponse({
+            "data": {
+                "message": "数据库连接失败",
+                "code": 500
+            }
+        }, status_code=500)
+
+    try:
+        cursor = connection.cursor(dictionary=True)
+        sql = """
+            SELECT g.*
+            FROM ta_group_member_relation m
+            INNER JOIN ta_group g ON m.unique_group_id = g.unique_group_id
+            WHERE m.unique_member_id = %s
+        """
+        cursor.execute(sql, (unique_member_id,))
+        groups = cursor.fetchall()
+
+        # 转换 datetime 防止 JSON 报错
+        for row in groups:
+            for key, value in row.items():
+                if isinstance(value, datetime.datetime):
+                    row[key] = value.strftime("%Y-%m-%d %H:%M:%S")
+
+        return JSONResponse({
+            "data": {
+                "message": "查询成功",
+                "code": 200,
+                "joingroups": groups
+            }
+        }, status_code=200)
+
+    except mysql.connector.Error as e:
+        print(f"查询错误: {e}")
+        return JSONResponse({
+            "data": {
+                "message": "查询失败",
+                "code": 500
+            }
+        }, status_code=500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info(f"Database connection closed after get_member_groups attempt for {unique_member_id}.")
+
+@app.get("/friends")
+def get_friends(id_card: str = Query(..., description="教师身份证号")):
+    """根据教师 id_card 查询关联朋友信息"""
+    connection = get_db_connection()
+    if connection is None or not connection.is_connected():
+        app_logger.error("Database connection error in /friends API.")
+        return JSONResponse({
+            'data': {
+                'message': '数据库连接失败',
+                'code': 500
+            }
+        }, status_code=500)
+
+    results: List[Dict] = []
+    try:
+        # ① 查 teacher_unique_id
+        with connection.cursor(dictionary=True) as cursor:
+            cursor.execute("SELECT teacher_unique_id FROM ta_teacher WHERE id_card=%s", (id_card,))
+            rows = cursor.fetchall()  # 保证取完数据
+            app_logger.info(f"📌 Step1: ta_teacher for id_card={id_card} -> {rows}")
+        if not rows:
+            return {"friends": []}
+
+        teacher_unique_id = rows[0]["teacher_unique_id"]
+
+        # ② 查 ta_friend 获取 friendcode
+        with connection.cursor(dictionary=True) as cursor:
+            cursor.execute("SELECT friendcode FROM ta_friend WHERE teacher_unique_id=%s", (teacher_unique_id,))
+            friend_rows = cursor.fetchall()
+            app_logger.info(f"📌 Step2: ta_friend for teacher_unique_id={teacher_unique_id} -> {friend_rows}")
+        if not friend_rows:
+            return {"friends": []}
+
+        # ③ 遍历每个 friendcode
+        for fr in friend_rows:
+            friendcode = fr["friendcode"]
+
+            # 查 ta_teacher
+            with connection.cursor(dictionary=True) as cursor:
+                cursor.execute("SELECT * FROM ta_teacher WHERE teacher_unique_id=%s", (friendcode,))
+                teacher_rows = cursor.fetchall()
+                app_logger.info(f"📌 Step3: ta_teacher for friendcode={friendcode} -> {teacher_rows}")
+            if not teacher_rows:
+                continue
+            friend_teacher = teacher_rows[0]
+
+            # 查 ta_user_details
+            id_number = friend_teacher.get("id_card")
+            with connection.cursor(dictionary=True) as cursor:
+                cursor.execute("SELECT * FROM ta_user_details WHERE id_number=%s", (id_number,))
+                user_rows = cursor.fetchall()
+                app_logger.info(f"📌 Step4: ta_user_details for id_number={id_number} -> {user_rows}")
+            user_details = user_rows[0] if user_rows else None
+
+            avatar_path = user_details.get("avatar")
+            if avatar_path:
+                full_path = os.path.join(IMAGE_DIR, avatar_path)
+                if os.path.exists(full_path):
+                    try:
+                        with open(full_path, "rb") as img:
+                            user_details["avatar_base64"] = base64.b64encode(img.read()).decode("utf-8")
+                    except Exception as e:
+                        app_logger.error(f"读取图片失败 {full_path}: {e}")
+                        user_details["avatar_base64"] = None
+                else:
+                    user_details["avatar_base64"] = None
+            else:
+                user_details["avatar_base64"] = None
+
+            combined = {
+                "teacher_info": friend_teacher,
+                "user_details": user_details
+            }
+            # 打印组合后的数据
+            app_logger.info(f"📌 Step5: combined record -> {combined}")
+            results.append({
+                "teacher_info": friend_teacher,
+                "user_details": user_details
+            })
+        app_logger.info(f"✅ Finished. Total friends found: {len(results)}")
+        return {
+            "count": len(results),
+            "friends": results
+        }
+
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info(f"Database connection closed for id_card={id_card}")
+
+# if __name__ == '__main__':
+#     app_logger.info("Flask application starting...")
+#     app.run(host="0.0.0.0", port=5000, debug=True)
+
+#from datetime import datetime   # 注意这里！！！
+def convert_datetime(obj):
+    if isinstance(obj, datetime.datetime):
+        return obj.strftime("%Y-%m-%d %H:%M:%S")
+    raise TypeError(f"Type {type(obj)} not serializable")
+
+# ====== WebSocket 接口：聊天室 + 心跳 ======
+# 创建群
+ # data: { group_name, permission_level, headImage_path, group_type, nickname, owner_id, members: [{unique_member_id, member_name, group_role}] }
+ #
+async def create_group(data):
+    connection = get_db_connection()
+    if connection is None or not connection.is_connected():
+        app_logger.error("Database connection error in /friends API.")
+        return JSONResponse({
+            'data': {
+                'message': '数据库连接失败',
+                'code': 500
+            }
+        }, status_code=500)
+
+    cursor = connection.cursor()
+    unique_group_id = str(uuid.uuid4())
+
+    try:
+        cursor.execute(
+            "INSERT INTO ta_group (permission_level, headImage_path, group_type, nickname, unique_group_id, group_admin_id, create_time)"
+            " VALUES (%s,%s,%s,%s,%s,%s,NOW())",
+            (data.get('permission_level'),
+             data.get('headImage_path'),
+             data.get('group_type'),
+             data.get('nickname'),
+             unique_group_id,
+             data.get('owner_id'))
+        )
+
+        for m in data['members']:
+            cursor.execute(
+                "INSERT INTO ta_group_member_relation (unique_member_id, unique_group_id, join_time, group_role, member_name)"
+                " VALUES (%s,%s,NOW(),%s,%s)",
+                (m['unique_member_id'], unique_group_id, m['group_role'], m['member_name'])
+            )
+
+        connection.commit()
+        cursor.close()
+        connection.close()
+
+        # 给在线成员推送
+        for m in data['members']:
+            if m['unique_member_id'] in clients:
+                await clients[m['unique_member_id']].send_text(json.dumps({
+                    "type":"notify",
+                    "message":f"你已加入群: {data['nickname']}",
+                    "group_id": unique_group_id
+                }))
+
+        return {"code":200, "message":"群创建成功", "group_id":unique_group_id}
+
+    except Exception as e:
+        print(f"create_group错误: {e}")
+        return {"code":500, "message":"群创建失败"}
+
+ # 邀请成员加入群
+ # data: { unique_group_id, group_name, new_members: [{unique_member_id, member_name, group_role}] }
+ #
+async def invite_members(data):
+    conn = await get_db_connection()
+    if conn is None:
+        return {"code":500, "message":"数据库连接失败"}
+
+    cursor = conn.cursor()
+    try:
+        for m in data['new_members']:
+            cursor.execute(
+                "INSERT INTO ta_group_member_relation (unique_member_id, unique_group_id, join_time, group_role, member_name)"
+                " VALUES (%s,%s,NOW(),%s,%s)",
+                (m['unique_member_id'], data['unique_group_id'], m['group_role'], m['member_name'])
+            )
+
+            if m['unique_member_id'] in clients:
+                await clients[m['unique_member_id']].send_text(json.dumps({
+                    "type":"notify",
+                    "message":f"你被邀请加入群: {data['group_name']}",
+                    "group_id": data['unique_group_id']
+                }))
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {"code":200, "message":"成员邀请成功"}
+
+    except Exception as e:
+        print(f"invite_members错误: {e}")
+        return {"code":500, "message":"成员邀请失败"}
+
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    await websocket.accept()
+    connections[user_id] = {"ws": websocket, "last_heartbeat": time.time()}
+    print(f"用户 {user_id} 已连接")
+
+    connection = get_db_connection()
+    if connection is None or not connection.is_connected():
+        app_logger.error("Database connection error in /friends API.")
+        return JSONResponse({
+            'data': {
+                'message': '数据库连接失败',
+                'code': 500
+            }
+        }, status_code=500)
+
+    cursor = None
+    try:
+        update_query = """
+                    SELECT *
+                    FROM ta_notification
+                    WHERE receiver_id = %s
+                    AND is_read = 0;
+                    """
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(update_query, (user_id,))
+        unread_notifications = cursor.fetchall()
+
+        if unread_notifications:
+            await websocket.send_text(json.dumps({
+                "type": "unread_notifications",
+                "data": unread_notifications
+            }, default=convert_datetime, ensure_ascii=False))
+
+        while True:
+            data = await websocket.receive_text()
+
+            if data == "ping":
+                if user_id in connections:
+                    connections[user_id]["last_heartbeat"] = time.time()
+                else:
+                    print(f"收到 {user_id} 的 ping，但该用户已不在连接列表")
+                    continue
+                await websocket.send_text("pong")
+                continue
 
 
-if __name__ == '__main__':
-    app_logger.info("Flask application starting...")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+            # 定向发送：to:目标ID:消息
+            if data.startswith("to:"):
+                parts = data.split(":", 2)
+                if len(parts) == 3:
+                    target_id, msg = parts[1], parts[2]
+                    msg_data1 = json.loads(msg)
+                    print(msg)
+                    print(msg_data1['type'])
+                    if msg_data1['type'] == "1":
+                        print(" 加好友消息")
+                        target_conn = connections.get(target_id)
+                        if target_conn:
+                            print(target_id, " 在线", ", 来自:", user_id)
+                            print(data)
+                            await target_conn["ws"].send_text(f"[私信来自 {user_id}] {msg}")
+                        else:
+                            print(target_id, " 不在线", ", 来自:", user_id)
+                            print(data)
+                            await websocket.send_text(f"用户 {target_id} 不在线")
+
+                            # 解析 JSON
+                            msg_data = json.loads(msg)
+                            #print(msg_data['type'])
+                            cursor = connection.cursor(dictionary=True)
+
+                            update_query = """
+                                        INSERT INTO ta_notification (sender_id, receiver_id, content, content_text)
+                                        VALUES (%s, %s, %s, %s)
+                                    """
+                            cursor.execute(update_query, (user_id, msg_data['teacher_unique_id'], msg_data['text'], msg_data['type']))
+                            connection.commit()
+                    elif msg_data1['type'] == "3": 
+                        print(" 创建群")   
+                        cursor = connection.cursor(dictionary=True)
+                        unique_group_id = str(uuid.uuid4())
+
+                        cursor.execute(
+                            "INSERT INTO ta_group (permission_level, headImage_path, group_type, nickname, unique_group_id, group_admin_id, create_time)"
+                            " VALUES (%s,%s,%s,%s,%s,%s,NOW())",
+                            (msg_data1.get('permission_level'),
+                            msg_data1.get('headImage_path'),
+                            msg_data1.get('group_type'),
+                            msg_data1.get('nickname'),
+                            unique_group_id,
+                            msg_data1.get('owner_id'))
+                        )
+
+                        for m in msg_data1['members']:
+                            cursor.execute(
+                                "INSERT INTO ta_group_member_relation (unique_member_id, unique_group_id, join_time, group_role, member_name)"
+                                " VALUES (%s,%s,NOW(),%s,%s)",
+                                (m['unique_member_id'], unique_group_id, m['group_role'], m['member_name'])
+                            )
+
+                        connection.commit()
+                        # 给在线成员推送
+                        for m in msg_data1['members']:
+                            target_conn = connections.get(m['unique_member_id'])
+                            if target_conn:
+                                await target_conn["ws"].send_text(json.dumps({
+                                    "type":"notify",
+                                    "message":f"你已加入群: {msg_data1['nickname']}",
+                                    "group_id": unique_group_id,
+                                    "groupname": msg_data1.get('nickname')
+                                }))
+                            else:
+                                print(m['unique_member_id'], " 不在线", ", 来自:", user_id)
+                                cursor = connection.cursor(dictionary=True)
+
+                                update_query = """
+                                        INSERT INTO ta_notification (sender_id, sender_name, receiver_id, unique_group_id, group_name, content, content_text)
+                                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                    """
+                                cursor.execute(update_query, (user_id, msg_data1.get('owner_name'), m['unique_member_id'], unique_group_id, msg_data1.get("nickname"), "邀请你加入了群", msg_data1['type']))
+                                connection.commit()    
+
+                else:
+                    print(" 格式错误")
+                    await websocket.send_text("格式错误: to:<target_id>:<消息>")
+            else:
+                print(data)
+            # 广播
+            for uid, conn in connections.items():
+                if uid != user_id:
+                    await conn["ws"].send_text(f"[{user_id} 广播] {data}")
+
+    except WebSocketDisconnect:
+        if user_id in connections:
+            if connections[user_id]:
+                del connections[user_id]
+                print(f"用户 {user_id} 离线")
+        connection.rollback()
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info(f"Database connection closed.")
+
+# ====== 心跳检测任务 ======
+# @app.on_event("startup")
+# async def startup_event():
+#     import asyncio
+#     asyncio.create_task(heartbeat_checker())
+
+async def heartbeat_checker():
+    import asyncio
+    while True:
+        now = time.time()
+        to_remove = []
+        for uid, conn in list(connections.items()):
+            if now - conn["last_heartbeat"] > 30:
+                print(f"用户 {uid} 心跳超时，断开连接")
+                await conn["ws"].close()
+                to_remove.append(uid)
+        for uid in to_remove:
+            if uid in connections:
+                del connections[uid]
+        await asyncio.sleep(10)
+
+# ====== 像 Flask 那样可直接运行 ======
+if __name__ == "__main__":
+    import uvicorn
+    print("服务已启动: http://0.0.0.0:5000")
+    uvicorn.run("app:app", host="0.0.0.0", port=5000, reload=True)
