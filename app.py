@@ -114,6 +114,9 @@ VERIFICATION_CODE_EXPIRY = 300 # 5分钟
 
 from werkzeug.utils import secure_filename
 
+IMAGE_DIR = "./group_images"  # 群组头像目录
+os.makedirs(IMAGE_DIR, exist_ok=True)
+
 # 根上传目录
 UPLOAD_FOLDER = './uploads/audio'
 ALLOWED_EXTENSIONS = {'mp3', 'wav', 'aac', 'ogg', 'm4a'}
@@ -427,15 +430,35 @@ async def list_userInfo(request: Request):
     cursor = None
     try:
         phone_filter = request.query_params.get('phone')
-        #base_query = "SELECT * FROM ta_user_details WHERE phone = %s"
-        base_query = "SELECT u.*, t.teacher_unique_id FROM ta_user_details AS u LEFT JOIN ta_teacher AS t ON u.id_number = t.id_card WHERE u.phone = %s"
+        user_id_filter = request.query_params.get('userid')  # 新增: userid 参数
+        print(" xxx user_id_filter:", user_id_filter)
+        # 如果传的是 userid 而不是 phone
+        if not phone_filter and user_id_filter:
+            app_logger.info(f"Received userid={user_id_filter}, will fetch phone from ta_user table.")
+            cursor = connection.cursor(dictionary=True)
+            cursor.execute("SELECT phone FROM ta_user WHERE id = %s", (user_id_filter,))
+            user_row = cursor.fetchone()
+            if not user_row:
+                app_logger.warning(f"No user found with id={user_id_filter}")
+                return JSONResponse({'data': {'message': '未找到该用户', 'code': 404, 'userinfo': []}}, status_code=404)
+            phone_filter = user_row["phone"]  # 从 ta_user 获取 phone
+            cursor.close()
 
-        print(" userInfo 1111111\n")
+        print(" xxx phone_filter:", phone_filter)
+        if not phone_filter:
+            return JSONResponse({'data': {'message': '缺少必要参数 phone 或 userid', 'code': 400, 'userinfo': []}}, status_code=400)
+
+        # 继续走原来的逻辑：关联 ta_user_details 和 ta_teacher
+        base_query = """
+            SELECT u.*, t.teacher_unique_id
+            FROM ta_user_details AS u
+            LEFT JOIN ta_teacher AS t ON u.id_number = t.id_card
+            WHERE u.phone = %s
+        """
+
         cursor = connection.cursor(dictionary=True)
         cursor.execute(base_query, (phone_filter,))
         userinfo = cursor.fetchall()
-
-        print(" userInfo 222222\n")
 
         # 附加头像Base64字段
         for user in userinfo:
@@ -456,6 +479,7 @@ async def list_userInfo(request: Request):
 
         app_logger.info(f"Fetched {len(userinfo)} userinfo.")
         return safe_json_response({'data': {'message': '获取用户信息成功', 'code': 200, 'userinfo': userinfo}})
+
     except Error as e:
         print("Database error during fetching userinfo:", e)
         app_logger.error(f"Database error during fetching userinfo: {e}")
@@ -465,7 +489,8 @@ async def list_userInfo(request: Request):
         app_logger.error(f"Unexpected error during fetching userinfo: {e}")
         return JSONResponse({'data': {'message': '内部服务器错误', 'code': 500, 'userinfo': []}}, status_code=500)
     finally:
-        if cursor: cursor.close()
+        if cursor:
+            cursor.close()
         if connection and connection.is_connected():
             connection.close()
             app_logger.info("Database connection closed after fetching userinfo.")
@@ -1601,8 +1626,23 @@ def get_groups_by_admin(group_admin_id: str = Query(..., description="群管理�
             cursor.execute(sql, (group_admin_id,))
 
         groups = cursor.fetchall()
-        #cursor.close()
-        #conn.close()
+        for group in groups:
+            avatar_path = group.get("headImage_path")
+            if avatar_path:
+                #full_path = os.path.join(IMAGE_DIR, avatar_path)
+                full_path = avatar_path
+                print(full_path)
+                if os.path.exists(full_path):
+                    try:
+                        with open(full_path, "rb") as img:
+                            group["avatar_base64"] = base64.b64encode(img.read()).decode("utf-8")
+                    except Exception as e:
+                        app_logger.error(f"读取图片失败 {full_path}: {e}")
+                        group["avatar_base64"] = None
+                else:
+                    group["avatar_base64"] = None
+            else:
+                group["avatar_base64"] = None
 
          # 转换所有的 datetime 成字符串
         for row in groups:
@@ -1668,6 +1708,24 @@ def get_member_groups(
         cursor.execute(sql, (unique_member_id,))
         groups = cursor.fetchall()
 
+        for group in groups:
+            avatar_path = group.get("headImage_path")
+            if avatar_path:
+                #full_path = os.path.join(IMAGE_DIR, avatar_path)
+                full_path = avatar_path
+                print(full_path)
+                if os.path.exists(full_path):
+                    try:
+                        with open(full_path, "rb") as img:
+                            group["avatar_base64"] = base64.b64encode(img.read()).decode("utf-8")
+                    except Exception as e:
+                        app_logger.error(f"读取图片失败 {full_path}: {e}")
+                        group["avatar_base64"] = None
+                else:
+                    group["avatar_base64"] = None
+            else:
+                group["avatar_base64"] = None
+
         # 转换 datetime 防止 JSON 报错
         for row in groups:
             for key, value in row.items():
@@ -1696,6 +1754,73 @@ def get_member_groups(
         if connection and connection.is_connected():
             connection.close()
             app_logger.info(f"Database connection closed after get_member_groups attempt for {unique_member_id}.")
+
+@app.post("/updateGroupInfo")
+async def updateGroupInfo(request: Request):
+    data = await request.json()
+    unique_group_id = data.get('unique_group_id')
+    avatar = data.get('avatar')
+
+    if not unique_group_id or not avatar:
+        app_logger.warning("UpdateGroupInfo failed: Missing unique_group_id or avatar.")
+        return JSONResponse(
+            {'data': {'message': '群ID和头像必须提供', 'code': 400}},
+            status_code=400
+        )
+
+    # 数据库连接
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("UpdateGroupInfo failed: Database connection error.")
+        return JSONResponse(
+            {'data': {'message': '数据库连接失败', 'code': 500}},
+            status_code=500
+        )
+
+    # 保存头像到服务器文件系统
+    try:
+        avatar_bytes = base64.b64decode(avatar)
+    except Exception as e:
+        app_logger.error(f"Base64 decode error for unique_group_id={unique_group_id}: {e}")
+        return JSONResponse(
+            {'data': {'message': '头像数据解析失败', 'code': 400}},
+            status_code=400
+        )
+
+    filename = f"{unique_group_id}_.png"
+    file_path = os.path.join(IMAGE_DIR, filename)
+    try:
+        with open(file_path, "wb") as f:
+            f.write(avatar_bytes)
+    except Exception as e:
+        app_logger.error(f"Error writing avatar file {file_path}: {e}")
+        return JSONResponse(
+            {'data': {'message': '头像文件写入失败', 'code': 500}},
+            status_code=500
+        )
+
+    # 更新数据库记录
+    cursor = None
+    try:
+        update_query = """
+            UPDATE ta_group
+            SET headImage_path = %s
+            WHERE unique_group_id = %s
+        """
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(update_query, (file_path, unique_group_id))
+        connection.commit()
+        cursor.close()
+
+        app_logger.info(f"Updated group avatar for {unique_group_id} -> {file_path}")
+        return JSONResponse({'data': {'message': '更新成功', 'code': 200}})
+    except Error as e:
+        app_logger.error(f"Database error during updateGroupInfo for {unique_group_id}: {e}")
+        return JSONResponse({'data': {'message': '更新失败', 'code': 500}}, status_code=500)
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info(f"Database connection closed after updating group info for {unique_group_id}.")
 
 @app.get("/friends")
 def get_friends(id_card: str = Query(..., description="教师身份证号")):
