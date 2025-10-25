@@ -2150,9 +2150,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         cursor = connection.cursor(dictionary=True)
 
                         unique_group_id = msg_data1.get('unique_group_id')
-                        sender_id = user_id  # 群主就是当前 WebSocket 用户
+                        sender_id = user_id  # 当前发送者（可能是群主，也可能是群成员）
+                        groupowner_flag = msg_data1.get('groupowner', False)  # bool 或字符串
 
-                        # 1. 查群主 ID + 群名
+                        # 查询群信息
                         cursor.execute("""
                             SELECT group_admin_id, nickname 
                             FROM ta_group 
@@ -2166,52 +2167,98 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         group_admin_id = row['group_admin_id']
                         group_name = row['nickname'] or ""  # 群名
 
-                        if group_admin_id != sender_id:
-                            await websocket.send_text(f"不是群主，不能发送群消息")
-                            return
+                        if str(groupowner_flag).lower() in ("true", "1", "yes"):
+                            # --------------------------- 群主发送 ---------------------------
+                            if group_admin_id != sender_id:
+                                await websocket.send_text(f"不是群主，不能发送群消息")
+                                return
 
-                        # 2. 查群成员（排除群主）
-                        cursor.execute("""
-                            SELECT unique_member_id 
-                            FROM ta_group_member_relation
-                            WHERE unique_group_id = %s AND unique_member_id != %s
-                        """, (unique_group_id, sender_id))
-                        members = cursor.fetchall()
+                            # 查成员（排除群主）
+                            cursor.execute("""
+                                SELECT unique_member_id 
+                                FROM ta_group_member_relation
+                                WHERE unique_group_id = %s AND unique_member_id != %s
+                            """, (unique_group_id, sender_id))
+                            members = cursor.fetchall()
 
-                        if not members:
-                            await websocket.send_text("群没有其他成员")
-                            return
+                            if not members:
+                                await websocket.send_text("群没有其他成员")
+                                return
 
-                        # 3. 给成员推送或存通知
-                        for m in members:
-                            member_id = m['unique_member_id']
-                            target_conn = connections.get(member_id)
+                            for m in members:
+                                member_id = m['unique_member_id']
+                                target_conn = connections.get(member_id)
+                                if target_conn:
+                                    print(member_id, "在线，发送群消息")
+                                    await target_conn["ws"].send_text(json.dumps({
+                                        "type": "5",
+                                        "group_id": unique_group_id,
+                                        "from": sender_id,
+                                        "content": msg_data1.get("content", ""),
+                                        "groupname": group_name
+                                    }, ensure_ascii=False))
+                                else:
+                                    print(member_id, "不在线，插入通知")
+                                    cursor.execute("""
+                                        INSERT INTO ta_notification (
+                                        sender_id, receiver_id, unique_group_id, group_name, content, content_text
+                                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                                    """, (
+                                        sender_id, member_id, unique_group_id, group_name,
+                                        msg_data1.get("content", ""), msg_data1['type']
+                                    ))
+                                    connection.commit()
+                        else:
+                            # --------------------------- 群成员发送 ---------------------------
+                            print("群成员发送群消息")
 
-                            if target_conn:
-                                print(member_id, "在线，发送群消息")
-                                await target_conn["ws"].send_text(json.dumps({
-                                    "type": "5",   # 5代表群消息
-                                    "group_id": unique_group_id,
-                                    "from": sender_id,
-                                    "content": msg_data1.get("content", ""),
-                                    "groupname": group_name   # 用数据库查到的群名
-                                }, ensure_ascii=False))
-                            else:
-                                print(member_id, "不在线，插入通知")
-                                cursor.execute("""
-                                    INSERT INTO ta_notification (
-                                        sender_id, receiver_id, unique_group_id, group_name,
-                                        content, content_text
-                                    ) VALUES (%s, %s, %s, %s, %s, %s)
-                                """, (
-                                    sender_id,
-                                    member_id,
-                                    unique_group_id,
-                                    group_name,   # 用数据库查到的群名
-                                    msg_data1.get("content", ""),
-                                    msg_data1['type']
-                                ))
-                                connection.commit()
+                            # 找到所有需要接收的人：群主 + 其他成员（去掉发送者）
+                            receivers = []
+
+                            # 添加群主
+                            if group_admin_id != sender_id:
+                                receivers.append(group_admin_id)
+
+                            # 查其他成员（排除自己）
+                            cursor.execute("""
+                                SELECT unique_member_id 
+                                FROM ta_group_member_relation
+                                WHERE unique_group_id = %s AND unique_member_id != %s
+                            """, (unique_group_id, sender_id))
+                            member_rows = cursor.fetchall()
+                            for r in member_rows:
+                                receivers.append(r['unique_member_id'])
+
+                            # 去重（以防群主也在成员列表里）
+                            receivers = list(set(receivers))
+
+                            if not receivers:
+                                await websocket.send_text("群没有其他成员可以接收此消息")
+                                return
+
+                            # 给这些接收者发消息 / 存通知
+                            for rid in receivers:
+                                target_conn = connections.get(rid)
+                                if target_conn:
+                                    print(rid, "在线，发送群成员消息")
+                                    await target_conn["ws"].send_text(json.dumps({
+                                        "type": "5",
+                                        "group_id": unique_group_id,
+                                        "from": sender_id,
+                                        "content": msg_data1.get("content", ""),
+                                        "groupname": group_name
+                                    }, ensure_ascii=False))
+                                else:
+                                    print(rid, "不在线，插入通知")
+                                    cursor.execute("""
+                                        INSERT INTO ta_notification (
+                                        sender_id, receiver_id, unique_group_id, group_name, content, content_text
+                                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                                    """, (
+                                        sender_id, rid, unique_group_id, group_name,
+                                        msg_data1.get("content", ""), msg_data1['type']
+                                    ))
+                                    connection.commit()
     
                 else:
                     print(" 格式错误")
