@@ -2031,14 +2031,15 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
     cursor = None
     try:
+        # 查询条件改为：receiver_id = user_id 或 sender_id = user_id，并且 is_read = 0
         update_query = """
-                    SELECT *
-                    FROM ta_notification
-                    WHERE receiver_id = %s
-                    AND is_read = 0;
-                    """
+            SELECT *
+            FROM ta_notification
+            WHERE (receiver_id = %s OR sender_id = %s)
+            AND is_read = 0;
+        """
         cursor = connection.cursor(dictionary=True)
-        cursor.execute(update_query, (user_id,))
+        cursor.execute(update_query, (user_id, user_id))
         unread_notifications = cursor.fetchall()
 
         if unread_notifications:
@@ -2195,16 +2196,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                         "group_id": unique_group_id,
                                         "from": sender_id,
                                         "content": msg_data1.get("content", ""),
-                                        "groupname": group_name
+                                        "groupname": group_name,
+                                        "sender_name": msg_data1.get("sender_name", "")
                                     }, ensure_ascii=False))
                                 else:
                                     print(member_id, "不在线，插入通知")
                                     cursor.execute("""
                                         INSERT INTO ta_notification (
-                                        sender_id, receiver_id, unique_group_id, group_name, content, content_text
-                                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                                        sender_id, sender_name, receiver_id, unique_group_id, group_name, content, content_text
+                                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                                     """, (
-                                        sender_id, member_id, unique_group_id, group_name,
+                                        sender_id, msg_data1.get("sender_name", ""), member_id, unique_group_id, group_name,
                                         msg_data1.get("content", ""), msg_data1['type']
                                     ))
                                     connection.commit()
@@ -2246,16 +2248,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                         "group_id": unique_group_id,
                                         "from": sender_id,
                                         "content": msg_data1.get("content", ""),
-                                        "groupname": group_name
+                                        "groupname": group_name,
+                                        "sender_name": msg_data1.get("sender_name", "")
                                     }, ensure_ascii=False))
                                 else:
                                     print(rid, "不在线，插入通知")
                                     cursor.execute("""
                                         INSERT INTO ta_notification (
-                                        sender_id, receiver_id, unique_group_id, group_name, content, content_text
-                                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                                        sender_id, sender_name, receiver_id, unique_group_id, group_name, content, content_text
+                                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                                     """, (
-                                        sender_id, rid, unique_group_id, group_name,
+                                        sender_id, msg_data1.get("sender_name", ""), rid, unique_group_id, group_name,
                                         msg_data1.get("content", ""), msg_data1['type']
                                     ))
                                     connection.commit()
