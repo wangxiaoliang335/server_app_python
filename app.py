@@ -15,6 +15,7 @@ import os
 import redis
 import json
 import uuid
+import struct
 from fastapi import FastAPI, Query
 from typing import List, Dict, Optional
 #import session
@@ -30,6 +31,7 @@ from fastapi.encoders import jsonable_encoder
 from dotenv import load_dotenv
 #from datetime import datetime
 import jwt
+import asyncio
 
 import time
 import secrets
@@ -45,15 +47,30 @@ load_dotenv()
 
 IMAGE_DIR = "/var/www/images"  # 存头像的目录
 
+# ===== 停止事件，用于控制心跳协程退出 =====
+stop_event = asyncio.Event()
+
 from contextlib import asynccontextmanager
+# ===== 生命周期管理 =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 🚀 启动时执行
-    import asyncio
-    asyncio.create_task(heartbeat_checker())
-    yield
-    # 🔴 关闭时执行
-    print("应用关闭")
+    global stop_event
+    stop_event.clear()
+
+    # 启动心跳检测任务
+    hb_task = asyncio.create_task(heartbeat_checker())
+    print("🚀 应用启动，心跳检测已启动")
+
+    yield  # 应用运行中
+
+    # 应用关闭逻辑
+    print("🛑 应用关闭，准备停止心跳检测")
+    stop_event.set()  # 通知心跳退出
+    hb_task.cancel()  # 强制取消
+    try:
+        await hb_task
+    except asyncio.CancelledError:
+        print("heartbeat_checker 已安全停掉")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -2012,6 +2029,33 @@ async def invite_members(data):
     except Exception as e:
         print(f"invite_members错误: {e}")
         return {"code":500, "message":"成员邀请失败"}
+    
+def safe_del(user_id: str):
+    conn = connections.pop(user_id, None)
+    return conn
+
+async def safe_send_text(ws: WebSocket, text: str):
+    try:
+        await ws.send_text(text)
+        return True
+    except Exception:
+        return False
+
+async def safe_send_bytes(ws: WebSocket, data: bytes):
+    try:
+        await ws.send_bytes(data)
+        return True
+    except Exception:
+        return False
+
+async def safe_close(ws: WebSocket, code: int = 1000, reason: str = ""):
+    # 只在连接仍处于 CONNECTED 时尝试关闭，避免重复 close 报错
+    try:
+        if getattr(ws, "client_state", None) == WebSocketState.CONNECTED:
+            await ws.close(code=code, reason=reason)
+        return True
+    except Exception:
+        return False
 
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
@@ -2049,229 +2093,317 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             }, default=convert_datetime, ensure_ascii=False))
 
         while True:
-            data = await websocket.receive_text()
+            try:
+                message = await websocket.receive()
+            except WebSocketDisconnect:
+                # 正常断开
+                print(f"用户 {user_id} 断开（WebSocketDisconnect）")
+                break
+            except RuntimeError as e:
+                # 已收到 disconnect 后再次 receive 会到这里
+                print(f"用户 {user_id} receive RuntimeError: {e}")
+                break
 
-            if data == "ping":
-                if user_id in connections:
-                    connections[user_id]["last_heartbeat"] = time.time()
-                else:
-                    print(f"收到 {user_id} 的 ping，但该用户已不在连接列表")
+            # starlette 会在断开时 raise WebSocketDisconnect，保险起见也判断 type
+            if message.get("type") == "websocket.disconnect":
+                print(f"用户 {user_id} 断开（disconnect event）")
+                break
+            
+            if "text" in message:
+                data = message["text"]
+                if data == "ping":
+                    if user_id in connections:
+                        connections[user_id]["last_heartbeat"] = time.time()
+                    else:
+                        print(f"收到 {user_id} 的 ping，但该用户已不在连接列表")
+                        continue
+                    await websocket.send_text("pong")
                     continue
-                await websocket.send_text("pong")
-                continue
 
 
-            # 定向发送：to:目标ID:消息
-            if data.startswith("to:"):
-                parts = data.split(":", 2)
-                if len(parts) == 3:
-                    target_id, msg = parts[1], parts[2]
-                    msg_data1 = json.loads(msg)
-                    print(msg)
-                    print(msg_data1['type'])
-                    if msg_data1['type'] == "1":
-                        print(" 加好友消息")
-                        target_conn = connections.get(target_id)
-                        if target_conn:
-                            print(target_id, " 在线", ", 来自:", user_id)
-                            print(data)
-                            await target_conn["ws"].send_text(f"[私信来自 {user_id}] {msg}")
-                        else:
-                            print(target_id, " 不在线", ", 来自:", user_id)
-                            print(data)
-                            await websocket.send_text(f"用户 {target_id} 不在线")
-
-                            # 解析 JSON
-                            msg_data = json.loads(msg)
-                            #print(msg_data['type'])
-                            cursor = connection.cursor(dictionary=True)
-
-                            update_query = """
-                                        INSERT INTO ta_notification (sender_id, receiver_id, content, content_text)
-                                        VALUES (%s, %s, %s, %s)
-                                    """
-                            cursor.execute(update_query, (user_id, msg_data['teacher_unique_id'], msg_data['text'], msg_data['type']))
-                            connection.commit()
-                    elif msg_data1['type'] == "3": 
-                        print(" 创建群")   
-                        cursor = connection.cursor(dictionary=True)
-                        unique_group_id = str(uuid.uuid4())
-
-                        cursor.execute(
-                            "INSERT INTO ta_group (permission_level, headImage_path, group_type, nickname, unique_group_id, group_admin_id, create_time)"
-                            " VALUES (%s,%s,%s,%s,%s,%s,NOW())",
-                            (msg_data1.get('permission_level'),
-                            msg_data1.get('headImage_path'),
-                            msg_data1.get('group_type'),
-                            msg_data1.get('nickname'),
-                            unique_group_id,
-                            msg_data1.get('owner_id'))
-                        )
-
-                        for m in msg_data1['members']:
-                            cursor.execute(
-                                "INSERT INTO ta_group_member_relation (unique_member_id, unique_group_id, join_time, group_role, member_name)"
-                                " VALUES (%s,%s,NOW(),%s,%s)",
-                                (m['unique_member_id'], unique_group_id, m['group_role'], m['member_name'])
-                            )
-
-                        connection.commit()
-                        # 给在线成员推送
-                        for m in msg_data1['members']:
-                            target_conn = connections.get(m['unique_member_id'])
+                # 定向发送：to:目标ID:消息
+                if data.startswith("to:"):
+                    parts = data.split(":", 2)
+                    if len(parts) == 3:
+                        target_id, msg = parts[1], parts[2]
+                        msg_data1 = json.loads(msg)
+                        print(msg)
+                        print(msg_data1['type'])
+                        if msg_data1['type'] == "1":
+                            print(" 加好友消息")
+                            target_conn = connections.get(target_id)
                             if target_conn:
-                                await target_conn["ws"].send_text(json.dumps({
-                                    "type":"notify",
-                                    "message":f"你已加入群: {msg_data1['nickname']}",
-                                    "group_id": unique_group_id,
-                                    "groupname": msg_data1.get('nickname')
-                                }))
+                                print(target_id, " 在线", ", 来自:", user_id)
+                                print(data)
+                                await target_conn["ws"].send_text(f"[私信来自 {user_id}] {msg}")
                             else:
-                                print(m['unique_member_id'], " 不在线", ", 来自:", user_id)
+                                print(target_id, " 不在线", ", 来自:", user_id)
+                                print(data)
+                                await websocket.send_text(f"用户 {target_id} 不在线")
+
+                                # 解析 JSON
+                                msg_data = json.loads(msg)
+                                #print(msg_data['type'])
                                 cursor = connection.cursor(dictionary=True)
 
                                 update_query = """
-                                        INSERT INTO ta_notification (sender_id, sender_name, receiver_id, unique_group_id, group_name, content, content_text)
-                                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                                    """
-                                cursor.execute(update_query, (user_id, msg_data1.get('owner_name'), m['unique_member_id'], unique_group_id, msg_data1.get("nickname"), "邀请你加入了群", msg_data1['type']))
+                                            INSERT INTO ta_notification (sender_id, receiver_id, content, content_text)
+                                            VALUES (%s, %s, %s, %s)
+                                        """
+                                cursor.execute(update_query, (user_id, msg_data['teacher_unique_id'], msg_data['text'], msg_data['type']))
                                 connection.commit()
+                        elif msg_data1['type'] == "3": 
+                            print(" 创建群")   
+                            cursor = connection.cursor(dictionary=True)
+                            unique_group_id = str(uuid.uuid4())
 
-                        #把创建成功的群信息发回给创建者
-                        await websocket.send_text(json.dumps({
-                                    "type":"3",
-                                    "message":f"你创建了群: {msg_data1['nickname']}",
-                                    "group_id": unique_group_id,
-                                    "groupname": msg_data1.get('nickname')
-                                }))
+                            cursor.execute(
+                                "INSERT INTO ta_group (permission_level, headImage_path, group_type, nickname, unique_group_id, group_admin_id, create_time)"
+                                " VALUES (%s,%s,%s,%s,%s,%s,NOW())",
+                                (msg_data1.get('permission_level'),
+                                msg_data1.get('headImage_path'),
+                                msg_data1.get('group_type'),
+                                msg_data1.get('nickname'),
+                                unique_group_id,
+                                msg_data1.get('owner_id'))
+                            )
 
-                                # 群消息: 群主发消息，发给除群主外的所有群成员
-                    elif msg_data1['type'] == "5":
-                        print("群消息发送")
-                        cursor = connection.cursor(dictionary=True)
+                            for m in msg_data1['members']:
+                                cursor.execute(
+                                    "INSERT INTO ta_group_member_relation (unique_member_id, unique_group_id, join_time, group_role, member_name)"
+                                    " VALUES (%s,%s,NOW(),%s,%s)",
+                                    (m['unique_member_id'], unique_group_id, m['group_role'], m['member_name'])
+                                )
 
-                        unique_group_id = msg_data1.get('unique_group_id')
-                        sender_id = user_id  # 当前发送者（可能是群主，也可能是群成员）
-                        groupowner_flag = msg_data1.get('groupowner', False)  # bool 或字符串
-
-                        # 查询群信息
-                        cursor.execute("""
-                            SELECT group_admin_id, nickname 
-                            FROM ta_group 
-                            WHERE unique_group_id = %s
-                        """, (unique_group_id,))
-                        row = cursor.fetchone()
-                        if not row:
-                            await websocket.send_text(f"群 {unique_group_id} 不存在")
-                            return
-
-                        group_admin_id = row['group_admin_id']
-                        group_name = row['nickname'] or ""  # 群名
-
-                        if str(groupowner_flag).lower() in ("true", "1", "yes"):
-                            # --------------------------- 群主发送 ---------------------------
-                            if group_admin_id != sender_id:
-                                await websocket.send_text(f"不是群主，不能发送群消息")
-                                return
-
-                            # 查成员（排除群主）
-                            cursor.execute("""
-                                SELECT unique_member_id 
-                                FROM ta_group_member_relation
-                                WHERE unique_group_id = %s AND unique_member_id != %s
-                            """, (unique_group_id, sender_id))
-                            members = cursor.fetchall()
-
-                            if not members:
-                                await websocket.send_text("群没有其他成员")
-                                return
-
-                            for m in members:
-                                member_id = m['unique_member_id']
-                                target_conn = connections.get(member_id)
+                            connection.commit()
+                            # 给在线成员推送
+                            for m in msg_data1['members']:
+                                target_conn = connections.get(m['unique_member_id'])
                                 if target_conn:
-                                    print(member_id, "在线，发送群消息")
                                     await target_conn["ws"].send_text(json.dumps({
-                                        "type": "5",
+                                        "type":"notify",
+                                        "message":f"你已加入群: {msg_data1['nickname']}",
                                         "group_id": unique_group_id,
-                                        "from": sender_id,
-                                        "content": msg_data1.get("content", ""),
-                                        "groupname": group_name,
-                                        "sender_name": msg_data1.get("sender_name", "")
-                                    }, ensure_ascii=False))
+                                        "groupname": msg_data1.get('nickname')
+                                    }))
                                 else:
-                                    print(member_id, "不在线，插入通知")
-                                    cursor.execute("""
-                                        INSERT INTO ta_notification (
-                                        sender_id, sender_name, receiver_id, unique_group_id, group_name, content, content_text
-                                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-                                    """, (
-                                        sender_id, msg_data1.get("sender_name", ""), member_id, unique_group_id, group_name,
-                                        msg_data1.get("content", ""), msg_data1['type']
-                                    ))
+                                    print(m['unique_member_id'], " 不在线", ", 来自:", user_id)
+                                    cursor = connection.cursor(dictionary=True)
+
+                                    update_query = """
+                                            INSERT INTO ta_notification (sender_id, sender_name, receiver_id, unique_group_id, group_name, content, content_text)
+                                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                        """
+                                    cursor.execute(update_query, (user_id, msg_data1.get('owner_name'), m['unique_member_id'], unique_group_id, msg_data1.get("nickname"), "邀请你加入了群", msg_data1['type']))
                                     connection.commit()
-                        else:
-                            # --------------------------- 群成员发送 ---------------------------
-                            print("群成员发送群消息")
 
-                            # 找到所有需要接收的人：群主 + 其他成员（去掉发送者）
-                            receivers = []
+                            #把创建成功的群信息发回给创建者
+                            await websocket.send_text(json.dumps({
+                                        "type":"3",
+                                        "message":f"你创建了群: {msg_data1['nickname']}",
+                                        "group_id": unique_group_id,
+                                        "groupname": msg_data1.get('nickname')
+                                    }))
 
-                            # 添加群主
-                            if group_admin_id != sender_id:
-                                receivers.append(group_admin_id)
+                                    # 群消息: 群主发消息，发给除群主外的所有群成员
+                        elif msg_data1['type'] == "5":
+                            print("群消息发送")
+                            cursor = connection.cursor(dictionary=True)
 
-                            # 查其他成员（排除自己）
+                            unique_group_id = msg_data1.get('unique_group_id')
+                            sender_id = user_id  # 当前发送者（可能是群主，也可能是群成员）
+                            groupowner_flag = msg_data1.get('groupowner', False)  # bool 或字符串
+
+                            # 查询群信息
                             cursor.execute("""
-                                SELECT unique_member_id 
-                                FROM ta_group_member_relation
-                                WHERE unique_group_id = %s AND unique_member_id != %s
-                            """, (unique_group_id, sender_id))
-                            member_rows = cursor.fetchall()
-                            for r in member_rows:
-                                receivers.append(r['unique_member_id'])
-
-                            # 去重（以防群主也在成员列表里）
-                            receivers = list(set(receivers))
-
-                            if not receivers:
-                                await websocket.send_text("群没有其他成员可以接收此消息")
+                                SELECT group_admin_id, nickname 
+                                FROM ta_group 
+                                WHERE unique_group_id = %s
+                            """, (unique_group_id,))
+                            row = cursor.fetchone()
+                            if not row:
+                                await websocket.send_text(f"群 {unique_group_id} 不存在")
                                 return
 
-                            # 给这些接收者发消息 / 存通知
-                            for rid in receivers:
-                                target_conn = connections.get(rid)
-                                if target_conn:
-                                    print(rid, "在线，发送群成员消息")
-                                    await target_conn["ws"].send_text(json.dumps({
-                                        "type": "5",
-                                        "group_id": unique_group_id,
-                                        "from": sender_id,
-                                        "content": msg_data1.get("content", ""),
-                                        "groupname": group_name,
-                                        "sender_name": msg_data1.get("sender_name", "")
-                                    }, ensure_ascii=False))
-                                else:
-                                    print(rid, "不在线，插入通知")
-                                    cursor.execute("""
-                                        INSERT INTO ta_notification (
-                                        sender_id, sender_name, receiver_id, unique_group_id, group_name, content, content_text
-                                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-                                    """, (
-                                        sender_id, msg_data1.get("sender_name", ""), rid, unique_group_id, group_name,
-                                        msg_data1.get("content", ""), msg_data1['type']
-                                    ))
-                                    connection.commit()
-    
+                            group_admin_id = row['group_admin_id']
+                            group_name = row['nickname'] or ""  # 群名
+
+                            if str(groupowner_flag).lower() in ("true", "1", "yes"):
+                                # --------------------------- 群主发送 ---------------------------
+                                if group_admin_id != sender_id:
+                                    await websocket.send_text(f"不是群主，不能发送群消息")
+                                    return
+
+                                # 查成员（排除群主）
+                                cursor.execute("""
+                                    SELECT unique_member_id 
+                                    FROM ta_group_member_relation
+                                    WHERE unique_group_id = %s AND unique_member_id != %s
+                                """, (unique_group_id, sender_id))
+                                members = cursor.fetchall()
+
+                                if not members:
+                                    await websocket.send_text("群没有其他成员")
+                                    return
+
+                                for m in members:
+                                    member_id = m['unique_member_id']
+                                    target_conn = connections.get(member_id)
+                                    if target_conn:
+                                        print(member_id, "在线，发送群消息")
+                                        await target_conn["ws"].send_text(json.dumps({
+                                            "type": "5",
+                                            "group_id": unique_group_id,
+                                            "from": sender_id,
+                                            "content": msg_data1.get("content", ""),
+                                            "groupname": group_name,
+                                            "sender_name": msg_data1.get("sender_name", "")
+                                        }, ensure_ascii=False))
+                                    else:
+                                        print(member_id, "不在线，插入通知")
+                                        cursor.execute("""
+                                            INSERT INTO ta_notification (
+                                            sender_id, sender_name, receiver_id, unique_group_id, group_name, content, content_text
+                                            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                        """, (
+                                            sender_id, msg_data1.get("sender_name", ""), member_id, unique_group_id, group_name,
+                                            msg_data1.get("content", ""), msg_data1['type']
+                                        ))
+                                        connection.commit()
+                            else:
+                                # --------------------------- 群成员发送 ---------------------------
+                                print("群成员发送群消息")
+
+                                # 找到所有需要接收的人：群主 + 其他成员（去掉发送者）
+                                receivers = []
+
+                                # 添加群主
+                                if group_admin_id != sender_id:
+                                    receivers.append(group_admin_id)
+
+                                # 查其他成员（排除自己）
+                                cursor.execute("""
+                                    SELECT unique_member_id 
+                                    FROM ta_group_member_relation
+                                    WHERE unique_group_id = %s AND unique_member_id != %s
+                                """, (unique_group_id, sender_id))
+                                member_rows = cursor.fetchall()
+                                for r in member_rows:
+                                    receivers.append(r['unique_member_id'])
+
+                                # 去重（以防群主也在成员列表里）
+                                receivers = list(set(receivers))
+
+                                if not receivers:
+                                    await websocket.send_text("群没有其他成员可以接收此消息")
+                                    return
+
+                                # 给这些接收者发消息 / 存通知
+                                for rid in receivers:
+                                    target_conn = connections.get(rid)
+                                    if target_conn:
+                                        print(rid, "在线，发送群成员消息")
+                                        await target_conn["ws"].send_text(json.dumps({
+                                            "type": "5",
+                                            "group_id": unique_group_id,
+                                            "from": sender_id,
+                                            "content": msg_data1.get("content", ""),
+                                            "groupname": group_name,
+                                            "sender_name": msg_data1.get("sender_name", "")
+                                        }, ensure_ascii=False))
+                                    else:
+                                        print(rid, "不在线，插入通知")
+                                        cursor.execute("""
+                                            INSERT INTO ta_notification (
+                                            sender_id, sender_name, receiver_id, unique_group_id, group_name, content, content_text
+                                            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                        """, (
+                                            sender_id, msg_data1.get("sender_name", ""), rid, unique_group_id, group_name,
+                                            msg_data1.get("content", ""), msg_data1['type']
+                                        ))
+                                        connection.commit()
+        
+                    else:
+                        print(" 格式错误")
+                        await websocket.send_text("格式错误: to:<target_id>:<消息>")
                 else:
-                    print(" 格式错误")
-                    await websocket.send_text("格式错误: to:<target_id>:<消息>")
-            else:
-                print(data)
-            # 广播
-            for uid, conn in connections.items():
-                if uid != user_id:
-                    await conn["ws"].send_text(f"[{user_id} 广播] {data}")
+                    print(data)
+                # 广播
+                for uid, conn in connections.items():
+                    if uid != user_id:
+                        await conn["ws"].send_text(f"[{user_id} 广播] {data}")
+                        
+            elif "bytes" in message:
+                audio_bytes = message["bytes"]
+
+                # 解析多字段协议
+                offset = 0
+                frameType = audio_bytes[offset]
+                offset += 1
+
+                if frameType != 6:
+                    print("收到非音频类型二进制数据")
+                    continue
+
+                # 读取 groupId
+                group_len = struct.unpack("<I", audio_bytes[offset:offset+4])[0]
+                offset += 4
+                group_id = audio_bytes[offset:offset+group_len].decode("utf-8")
+                offset += group_len
+
+                # 读取 senderId
+                sender_len = struct.unpack("<I", audio_bytes[offset:offset+4])[0]
+                offset += 4
+                sender_id = audio_bytes[offset:offset+sender_len].decode("utf-8")
+                offset += sender_len
+
+                # 读取 senderName
+                name_len = struct.unpack("<I", audio_bytes[offset:offset+4])[0]
+                offset += 4
+                sender_name = audio_bytes[offset:offset+name_len].decode("utf-8")
+                offset += name_len
+
+                # 读取 timestamp
+                ts = struct.unpack("<Q", audio_bytes[offset:offset+8])[0]
+                offset += 8
+
+                # 读取 AAC 数据
+                aac_len = struct.unpack("<I", audio_bytes[offset:offset+4])[0]
+                offset += 4
+                aac_data = audio_bytes[offset:offset+aac_len]
+
+                print(f"[音频] 群 {group_id} 来自 {sender_name} ({sender_id}) AAC大小={aac_len}")
+
+                # 查群成员并转发（排除自己）
+                cursor.execute("""
+                    SELECT unique_member_id 
+                    FROM ta_group_member_relation
+                    WHERE unique_group_id = %s AND unique_member_id != %s
+                """, (group_id, sender_id))
+                rows = cursor.fetchall()
+
+                receivers = [r["unique_member_id"] for r in rows]
+
+                # 转发给在线成员 / 存离线文件 + 通知
+                for rid in receivers:
+                    target_conn = connections.get(rid)
+                    if target_conn:
+                        await target_conn["ws"].send_bytes(audio_bytes)
+                    else:
+                        # 离线 -> 保存文件
+                        filename = f"{group_id}_{sender_id}_{int(ts)}.aac"
+                        with open(filename, "wb") as f:
+                            f.write(aac_data)
+
+                        cursor.execute("""
+                            INSERT INTO ta_notification (
+                                sender_id, sender_name, receiver_id, unique_group_id, group_name, content, content_text
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """, (
+                            sender_id, sender_name, rid, group_id, "语音群聊",
+                            f"离线语音文件: {filename}", "6"  # type=6 表示音频
+                        ))
+                        connection.commit()
 
     except WebSocketDisconnect:
         if user_id in connections:
@@ -2284,7 +2416,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             cursor.close()
         if connection and connection.is_connected():
             connection.close()
-            app_logger.info(f"Database connection closed.")
+        await safe_close(websocket)    
+        app_logger.info(f"Database connection closed.")
 
 # ====== 心跳检测任务 ======
 # @app.on_event("startup")
@@ -2292,20 +2425,23 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 #     import asyncio
 #     asyncio.create_task(heartbeat_checker())
 
+# ===== 心跳检测线程 =====
 async def heartbeat_checker():
-    import asyncio
-    while True:
-        now = time.time()
-        to_remove = []
-        for uid, conn in list(connections.items()):
-            if now - conn["last_heartbeat"] > 30:
-                print(f"用户 {uid} 心跳超时，断开连接")
-                await conn["ws"].close()
-                to_remove.append(uid)
-        for uid in to_remove:
-            if uid in connections:
-                del connections[uid]
-        await asyncio.sleep(10)
+    try:
+        while not stop_event.is_set():
+            now = time.time()
+            to_remove = []
+            for uid, conn in list(connections.items()):
+                if now - conn["last_heartbeat"] > 30:
+                    print(f"用户 {uid} 心跳超时，断开连接")
+                    await safe_close(conn["ws"], 1001, "Heartbeat timeout")
+                    to_remove.append(uid)
+            for uid in to_remove:
+                connections.pop(uid, None)  # 安全移除
+            await asyncio.sleep(10)
+    except asyncio.CancelledError:
+        print("heartbeat_checker 已安全退出")
+
 
 # ====== 像 Flask 那样可直接运行 ======
 if __name__ == "__main__":
