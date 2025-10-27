@@ -32,6 +32,7 @@ from dotenv import load_dotenv
 #from datetime import datetime
 import jwt
 import asyncio
+import shutil
 
 import time
 import secrets
@@ -2333,91 +2334,115 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     if uid != user_id:
                         await conn["ws"].send_text(f"[{user_id} 广播] {data}")
                         
+            # 二进制音频消息处理 (flag协议)
             elif "bytes" in message:
                 audio_bytes = message["bytes"]
+                try:
+                    frameType = audio_bytes[0]
+                    flag = audio_bytes[1]
+                    offset = 2
+                    if frameType != 6:
+                        continue
+                    group_len = struct.unpack("<I", audio_bytes[offset:offset+4])[0]
+                    offset += 4
+                    group_id = audio_bytes[offset:offset+group_len].decode("utf-8")
+                    offset += group_len
+                    sender_len = struct.unpack("<I", audio_bytes[offset:offset+4])[0]
+                    offset += 4
+                    sender_id = audio_bytes[offset:offset+sender_len].decode("utf-8")
+                    offset += sender_len
+                    name_len = struct.unpack("<I", audio_bytes[offset:offset+4])[0]
+                    offset += 4
+                    sender_name = audio_bytes[offset:offset+name_len].decode("utf-8")
+                    offset += name_len
+                    ts = struct.unpack("<Q", audio_bytes[offset:offset+8])[0]
+                    offset += 8
+                    aac_len = struct.unpack("<I", audio_bytes[offset:offset+4])[0]
+                    offset += 4
+                    aac_data = audio_bytes[offset:offset+aac_len]
 
-                # 解析多字段协议
-                offset = 0
-                frameType = audio_bytes[offset]
-                offset += 1
+                    if flag == 0:
+                        temp_filename = f"/tmp/{group_id}_{sender_id}_{ts}.aac"
+                        with open(temp_filename, "wb") as f:
+                            if aac_len > 0:
+                                f.write(aac_data)
+                        connections[sender_id]["voice_file"] = temp_filename
+                        print(" init acc flag:", temp_filename)
 
-                if frameType != 6:
-                    print("收到非音频类型二进制数据")
-                    continue
-
-                # 读取 groupId
-                group_len = struct.unpack("<I", audio_bytes[offset:offset+4])[0]
-                offset += 4
-                group_id = audio_bytes[offset:offset+group_len].decode("utf-8")
-                offset += group_len
-
-                # 读取 senderId
-                sender_len = struct.unpack("<I", audio_bytes[offset:offset+4])[0]
-                offset += 4
-                sender_id = audio_bytes[offset:offset+sender_len].decode("utf-8")
-                offset += sender_len
-
-                # 读取 senderName
-                name_len = struct.unpack("<I", audio_bytes[offset:offset+4])[0]
-                offset += 4
-                sender_name = audio_bytes[offset:offset+name_len].decode("utf-8")
-                offset += name_len
-
-                # 读取 timestamp
-                ts = struct.unpack("<Q", audio_bytes[offset:offset+8])[0]
-                offset += 8
-
-                # 读取 AAC 数据
-                aac_len = struct.unpack("<I", audio_bytes[offset:offset+4])[0]
-                offset += 4
-                aac_data = audio_bytes[offset:offset+aac_len]
-
-                print(f"[音频] 群 {group_id} 来自 {sender_name} ({sender_id}) AAC大小={aac_len}")
-
-                # 查群成员并转发（排除自己）
-                cursor.execute("""
-                    SELECT unique_member_id 
-                    FROM ta_group_member_relation
-                    WHERE unique_group_id = %s AND unique_member_id != %s
-                """, (group_id, sender_id))
-                rows = cursor.fetchall()
-
-                receivers = [r["unique_member_id"] for r in rows]
-
-                # 转发给在线成员 / 存离线文件 + 通知
-                for rid in receivers:
-                    target_conn = connections.get(rid)
-                    if target_conn:
-                        await target_conn["ws"].send_bytes(audio_bytes)
-                    else:
-                        # 离线 -> 保存文件
-                        filename = f"{group_id}_{sender_id}_{int(ts)}.aac"
-                        with open(filename, "wb") as f:
-                            f.write(aac_data)
-
+                    elif flag == 1:
+                        if "voice_file" in connections[sender_id]:
+                            with open(connections[sender_id]["voice_file"], "ab") as f:
+                                f.write(aac_data)
                         cursor.execute("""
-                            INSERT INTO ta_notification (
-                                sender_id, sender_name, receiver_id, unique_group_id, group_name, content, content_text
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        """, (
-                            sender_id, sender_name, rid, group_id, "语音群聊",
-                            f"离线语音文件: {filename}", "6"  # type=6 表示音频
-                        ))
-                        connection.commit()
+                            SELECT unique_member_id FROM ta_group_member_relation
+                            WHERE unique_group_id=%s AND unique_member_id!=%s
+                        """, (group_id, sender_id))
+                        for m in cursor.fetchall():
+                            tc = connections.get(m['unique_member_id'])
+                            if tc:
+                                await tc["ws"].send_bytes(audio_bytes)
+
+                    elif flag == 2:
+                        voice_file_path = connections[sender_id].pop("voice_file", None)
+                        cursor.execute("""
+                            SELECT unique_member_id FROM ta_group_member_relation
+                            WHERE unique_group_id=%s AND unique_member_id!=%s
+                        """, (group_id, sender_id))
+                        for m in cursor.fetchall():
+                            rid = m["unique_member_id"]
+                            tc = connections.get(rid)
+                            if tc:
+                                await tc["ws"].send_bytes(audio_bytes)
+                            else:
+                                if voice_file_path and os.path.exists(voice_file_path):
+                                    offline_path = f"/var/offline_voice/{os.path.basename(voice_file_path)}"
+                                    os.makedirs(os.path.dirname(offline_path), exist_ok=True)
+
+                                    try:
+                                        shutil.move(voice_file_path, offline_path)
+                                    except Exception as e:
+                                        print(f"拷贝离线语音失败: {e}")
+                                        offline_path = voice_file_path  # 保底使用原路径
+
+                                    # 写数据库通知
+                                    cursor.execute("""
+                                        INSERT INTO ta_notification (
+                                            sender_id, sender_name, receiver_id, unique_group_id, group_name, content, content_text
+                                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                    """, (
+                                        sender_id,
+                                        sender_name,
+                                        rid,
+                                        group_id,
+                                        "语音群聊",
+                                        f"离线语音文件: {os.path.basename(offline_path)}",
+                                        "6"  # type=6 表示音频消息
+                                    ))
+                                    connection.commit()
+
+                        # 清理临时文件
+                        if voice_file_path and os.path.exists(voice_file_path):
+                            try:
+                                os.remove(voice_file_path)
+                            except Exception as e:
+                                print(f"删除临时语音文件失败: {e}")
+
+                except Exception as e:
+                    print(f"解析音频包失败: {e}")
 
     except WebSocketDisconnect:
         if user_id in connections:
-            if connections[user_id]:
-                del connections[user_id]
-                print(f"用户 {user_id} 离线")
-        connection.rollback()
+            connections.pop(user_id, None)
+            print(f"用户 {user_id} 离线")
+        if connection:
+            connection.rollback()
     finally:
         if cursor:
             cursor.close()
         if connection and connection.is_connected():
             connection.close()
-        await safe_close(websocket)    
-        app_logger.info(f"Database connection closed.")
+        await safe_close(websocket)
+        app_logger.info(f"WebSocket关闭，数据库连接已释放。")
 
 # ====== 心跳检测任务 ======
 # @app.on_event("startup")
