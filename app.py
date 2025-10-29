@@ -1356,6 +1356,8 @@ async def register(request: Request):
     phone = data.get('phone')
     password = data.get('password')
     verification_code = data.get('verification_code')
+    
+    print(data);
 
     if not phone or not password or not verification_code:
         app_logger.warning("Registration failed: Missing phone, password, or verification code.")
@@ -1427,6 +1429,8 @@ async def login(request: Request):
     phone = data.get('phone')
     password = data.get('password')
     verification_code = data.get('verification_code')
+    
+    print(data);
 
     if not phone or (not password and not verification_code):
         return JSONResponse({'data': {'message': '手机号和密码或验证码必须提供', 'code': 400}}, status_code=400)
@@ -1772,6 +1776,111 @@ def get_member_groups(
         if connection and connection.is_connected():
             connection.close()
             app_logger.info(f"Database connection closed after get_member_groups attempt for {unique_member_id}.")
+
+@app.get("/group/members")
+def get_group_members(
+    unique_group_id: str = Query(..., description="群唯一ID")
+):
+    """
+    根据 unique_group_id 查询群主和所有成员的 id + name
+    """
+    if not unique_group_id:
+        return JSONResponse({
+            "data": {
+                "message": "缺少群唯一ID",
+                "code": 400
+            }
+        }, status_code=400)
+
+    connection = get_db_connection()
+    if connection is None or not connection.is_connected():
+        return JSONResponse({
+            "data": {
+                "message": "数据库连接失败",
+                "code": 500
+            }
+        }, status_code=500)
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+
+        # 1. 查群主ID
+        sql_admin = """
+            SELECT group_admin_id
+            FROM ta_group
+            WHERE unique_group_id = %s
+        """
+        cursor.execute(sql_admin, (unique_group_id,))
+        group_info = cursor.fetchone()
+
+        if not group_info:
+            return JSONResponse({
+                "data": {
+                    "message": "群不存在",
+                    "code": 404
+                }
+            }, status_code=404)
+
+        group_admin_id = group_info.get("group_admin_id")
+
+        members_data = []
+
+        # 2. 查群主姓名（从 ta_teacher）
+        if group_admin_id:
+            sql_teacher = """
+                SELECT teacher_unique_id, name
+                FROM ta_teacher
+                WHERE teacher_unique_id = %s
+            """
+            cursor.execute(sql_teacher, (group_admin_id,))
+            teacher_info = cursor.fetchone()
+            if teacher_info:
+                members_data.append({
+                    "id": teacher_info.get("teacher_unique_id"),
+                    "name": teacher_info.get("name"),
+                    "role": "群主"
+                })
+
+        # 3. 查群成员（从 ta_group_member_relation）
+        sql_member = """
+            SELECT unique_member_id, member_name
+            FROM ta_group_member_relation
+            WHERE unique_group_id = %s
+        """
+        cursor.execute(sql_member, (unique_group_id,))
+        member_infos = cursor.fetchall()
+
+        for m in member_infos:
+            members_data.append({
+                "id": m.get("unique_member_id"),
+                "name": m.get("member_name"),
+                "role": "成员"
+            })
+
+        return JSONResponse({
+            "data": {
+                "message": "查询成功",
+                "code": 200,
+                "members": members_data
+            }
+        }, status_code=200)
+
+    except mysql.connector.Error as e:
+        app_logger.error(f"查询错误: {e}")
+        return JSONResponse({
+            "data": {
+                "message": "查询失败",
+                "code": 500
+            }
+        }, status_code=500)
+
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info(f"Database connection closed after get_group_members attempt for {unique_group_id}.")
 
 @app.post("/updateGroupInfo")
 async def updateGroupInfo(request: Request):
