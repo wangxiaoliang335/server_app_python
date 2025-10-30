@@ -2500,34 +2500,36 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         for m in cursor.fetchall():
                             rid = m["unique_member_id"]
                             tc = connections.get(rid)
+                            
+                            if voice_file_path and os.path.exists(voice_file_path):
+                                offline_path = f"/var/offline_voice/{os.path.basename(voice_file_path)}"
+                                os.makedirs(os.path.dirname(offline_path), exist_ok=True)
+
+                                try:
+                                    shutil.move(voice_file_path, offline_path)
+                                except Exception as e:
+                                    print(f"拷贝离线语音失败: {e}")
+                                    offline_path = voice_file_path  # 保底使用原路径
+
+                                # 写数据库通知
+                                cursor.execute("""
+                                    INSERT INTO ta_notification (
+                                        sender_id, sender_name, receiver_id, unique_group_id, group_name, content, content_text
+                                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                """, (
+                                    sender_id,
+                                    sender_name,
+                                    rid,
+                                    group_id,
+                                    "语音群聊",
+                                    f"离线语音文件: {os.path.basename(offline_path)}",
+                                    "6"  # type=6 表示音频消息
+                                ))
+                                connection.commit()
+                            
                             if tc:
                                 await tc["ws"].send_bytes(audio_bytes)
-                            else:
-                                if voice_file_path and os.path.exists(voice_file_path):
-                                    offline_path = f"/var/offline_voice/{os.path.basename(voice_file_path)}"
-                                    os.makedirs(os.path.dirname(offline_path), exist_ok=True)
-
-                                    try:
-                                        shutil.move(voice_file_path, offline_path)
-                                    except Exception as e:
-                                        print(f"拷贝离线语音失败: {e}")
-                                        offline_path = voice_file_path  # 保底使用原路径
-
-                                    # 写数据库通知
-                                    cursor.execute("""
-                                        INSERT INTO ta_notification (
-                                            sender_id, sender_name, receiver_id, unique_group_id, group_name, content, content_text
-                                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-                                    """, (
-                                        sender_id,
-                                        sender_name,
-                                        rid,
-                                        group_id,
-                                        "语音群聊",
-                                        f"离线语音文件: {os.path.basename(offline_path)}",
-                                        "6"  # type=6 表示音频消息
-                                    ))
-                                    connection.commit()
+                            
 
                         # 清理临时文件
                         if voice_file_path and os.path.exists(voice_file_path):
