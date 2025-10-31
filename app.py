@@ -699,6 +699,8 @@ async def add_teacher(request: Request):
     if not data or 'schoolId' not in data:
         return JSONResponse({'data': {'message': '缺少 schoolId', 'code': 400}}, status_code=400)
 
+    print(data)
+
     school_id = data['schoolId']
     teacher_unique_id = generate_teacher_unique_id(school_id)
     if teacher_unique_id is None:
@@ -741,8 +743,60 @@ async def add_teacher(request: Request):
             data.get('subjects_of_teacher_qualification_examination'),
             data.get('educational_stage'), teacher_unique_id
         ))
-        connection.commit()
+        
         teacher_id = cursor.lastrowid
+        
+        # 2️⃣ 检查 ta_user_details 是否已经存在该手机号
+        cursor.execute("SELECT phone FROM ta_user_details WHERE phone = %s", (data.get('phone'),))
+        user_exists = cursor.fetchone()
+
+        if user_exists:
+            # 已存在 -> 更新信息
+            sql_update_user_details = """
+            UPDATE ta_user_details
+            SET name=%s, sex=%s, address=%s, school_name=%s, grade_level=%s, grade=%s,
+                subject=%s, class_taught=%s, is_administrator=%s, id_number=%s
+            WHERE phone=%s
+            """
+            cursor.execute(sql_update_user_details, (
+                data.get('name'),
+                data.get('sex'),
+                data.get('address'),
+                data.get('school_name'),
+                data.get('grade_level'),
+                data.get('grade'),
+                data.get('subject'),
+                data.get('class_taught'),
+                str(is_admin_flag),
+                data.get('id_card'),  # 教师表的 id_card 对应用户表的 id_number
+                data.get('phone')
+            ))
+        else:
+            # 不存在 -> 插入新用户详情
+            sql_insert_user_details = """
+            INSERT INTO ta_user_details 
+            (phone, name, sex, address, school_name, grade_level, grade,
+             subject, class_taught, is_administrator, avatar, id_number)
+            VALUES (%s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s)
+            """
+            cursor.execute(sql_insert_user_details, (
+                data.get('phone'),
+                data.get('name'),
+                data.get('sex'),
+                data.get('address'),
+                data.get('school_name'),
+                data.get('grade_level'),
+                data.get('grade'),
+                data.get('subject'),
+                data.get('class_taught'),
+                str(is_admin_flag),
+                '',  # avatar 默认空字符串
+                data.get('id_card')
+            ))
+        
+        connection.commit()
+        
         cursor.execute("SELECT * FROM ta_teacher WHERE id = %s", (teacher_id,))
         teacher_info = cursor.fetchone()
         return safe_json_response({'data': {'message': '新增教师成功', 'code': 200, 'teacher': teacher_info}})
@@ -2319,7 +2373,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         elif msg_data1['type'] == "5":
                             print("群消息发送")
                             cursor = connection.cursor(dictionary=True)
-
+                            print(msg_data1)
                             unique_group_id = msg_data1.get('unique_group_id')
                             sender_id = user_id  # 当前发送者（可能是群主，也可能是群成员）
                             groupowner_flag = msg_data1.get('groupowner', False)  # bool 或字符串
