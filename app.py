@@ -165,6 +165,315 @@ def get_db_connection():
         app_logger.error(f"Error connecting to MySQL: {e}")
         return None
 
+def insert_class_schedule(schedule_items: List[Dict], table_name: str = 'ta_class_schedule') -> Dict[str, object]:
+    """
+    批量插入课程表数据到指定表。
+
+    要求每个字典拥有相同的键集合，键名即为表字段名；会在一个事务内批量写入。
+
+    参数:
+    - schedule_items: 课程表条目列表，每个元素为 {列名: 值} 的字典
+    - table_name: 目标表名，默认 'ta_class_schedule'
+
+    返回:
+    - { 'success': bool, 'inserted': int, 'message': str }
+    """
+    if not schedule_items:
+        return { 'success': True, 'inserted': 0, 'message': '无数据可插入' }
+
+    # 校验列一致性
+    first_keys = list(schedule_items[0].keys())
+    for idx, item in enumerate(schedule_items):
+        if list(item.keys()) != first_keys:
+            return {
+                'success': False,
+                'inserted': 0,
+                'message': f'第 {idx} 条与首条的列不一致，请保证所有字典的键顺序和集合一致'
+            }
+
+    columns = first_keys
+    placeholders = ", ".join(["%s"] * len(columns))
+    column_list_sql = ", ".join([f"`{col}`" for col in columns])
+    insert_sql = f"INSERT INTO `{table_name}` ({column_list_sql}) VALUES ({placeholders})"
+
+    values: List[tuple] = []
+    for item in schedule_items:
+        values.append(tuple(item.get(col) for col in columns))
+
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("Insert class schedule failed: Database connection error.")
+        return { 'success': False, 'inserted': 0, 'message': '数据库连接失败' }
+
+    try:
+        connection.start_transaction()
+        cursor = connection.cursor()
+        cursor.executemany(insert_sql, values)
+        connection.commit()
+        inserted_count = cursor.rowcount if cursor.rowcount is not None else len(values)
+        return { 'success': True, 'inserted': inserted_count, 'message': '插入成功' }
+    except mysql.connector.Error as e:
+        if connection and connection.is_connected():
+            connection.rollback()
+        app_logger.error(f"Database error during insert_class_schedule: {e}")
+        return { 'success': False, 'inserted': 0, 'message': f'数据库错误: {e}' }
+    except Exception as e:
+        if connection and connection.is_connected():
+            connection.rollback()
+        app_logger.error(f"Unexpected error during insert_class_schedule: {e}")
+        return { 'success': False, 'inserted': 0, 'message': f'未知错误: {e}' }
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info("Database connection closed after inserting class schedule.")
+
+def save_course_schedule(
+    class_id: str,
+    term: str,
+    days,
+    times,
+    remark: Optional[str],
+    cells: List[Dict]
+) -> Dict[str, object]:
+    """
+    写入/更新课程表：
+    1) 依据 (class_id, term) 在 course_schedule 中插入或更新 days_json/times_json/remark；
+    2) 批量写入/更新 course_schedule_cell（依据唯一键 schedule_id + row_index + col_index）。
+
+    参数说明：
+    - class_id: 班级ID
+    - term: 学期，如 '2025-2026-1'
+    - days: 可传 list[str] 或 JSON 字符串（示例: ["周一",...,"周日"]）
+    - times: 可传 list[str] 或 JSON 字符串（示例: ["6:00","8:10",...]）
+    - remark: 备注，可为空
+    - cells: 单元格列表，每个元素包含: { row_index:int, col_index:int, course_name:str, is_highlight:int(0/1) }
+
+    返回：
+    - { success, schedule_id, upserted_cells, message }
+    """
+    # 规范化 days_json/times_json
+    try:
+        if isinstance(days, str):
+            days_json = days.strip()
+        else:
+            days_json = json.dumps(days, ensure_ascii=False)
+        if isinstance(times, str):
+            times_json = times.strip()
+        else:
+            times_json = json.dumps(times, ensure_ascii=False)
+    except Exception as e:
+        return { 'success': False, 'schedule_id': None, 'upserted_cells': 0, 'message': f'行列标签序列化失败: {e}' }
+
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("Save course schedule failed: Database connection error.")
+        return { 'success': False, 'schedule_id': None, 'upserted_cells': 0, 'message': '数据库连接失败' }
+
+    try:
+        connection.start_transaction()
+        cursor = connection.cursor(dictionary=True)
+
+        # 先尝试获取是否已存在该 (class_id, term)
+        cursor.execute(
+            "SELECT id FROM course_schedule WHERE class_id = %s AND term = %s LIMIT 1",
+            (class_id, term)
+        )
+        row = cursor.fetchone()
+
+        if row is None:
+            # 插入头
+            insert_header_sql = (
+                "INSERT INTO course_schedule (class_id, term, days_json, times_json, remark) "
+                "VALUES (%s, %s, %s, %s, %s)"
+            )
+            cursor.execute(insert_header_sql, (class_id, term, days_json, times_json, remark))
+            schedule_id = cursor.lastrowid
+        else:
+            schedule_id = row['id']
+            # 更新头（若存在）
+            update_header_sql = (
+                "UPDATE course_schedule SET days_json = %s, times_json = %s, remark = %s, updated_at = NOW() "
+                "WHERE id = %s"
+            )
+            cursor.execute(update_header_sql, (days_json, times_json, remark, schedule_id))
+
+        upsert_count = 0
+        if cells:
+            # 批量写入/更新单元格
+            # 依赖唯一键 (schedule_id, row_index, col_index)
+            # 对于 MySQL，我们用 ON DUPLICATE KEY UPDATE；如果唯一键未建，将退化为仅插入。
+            insert_cell_sql = (
+                "INSERT INTO course_schedule_cell (schedule_id, row_index, col_index, course_name, is_highlight) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE course_name = VALUES(course_name), is_highlight = VALUES(is_highlight)"
+            )
+            values = []
+            for cell in cells:
+                values.append((
+                    schedule_id,
+                    int(cell.get('row_index', 0)),
+                    int(cell.get('col_index', 0)),
+                    str(cell.get('course_name', '')),
+                    int(cell.get('is_highlight', 0)),
+                ))
+            cursor.executemany(insert_cell_sql, values)
+            # 在 DUPLICATE 的情况下，rowcount 可能为 2x 更新行数或实现相关，这里统一返回输入数量
+            upsert_count = len(values)
+
+        connection.commit()
+        return { 'success': True, 'schedule_id': schedule_id, 'upserted_cells': upsert_count, 'message': '保存成功' }
+    except mysql.connector.Error as e:
+        if connection and connection.is_connected():
+            connection.rollback()
+        app_logger.error(f"Database error during save_course_schedule: {e}")
+        return { 'success': False, 'schedule_id': None, 'upserted_cells': 0, 'message': f'数据库错误: {e}' }
+    except Exception as e:
+        if connection and connection.is_connected():
+            connection.rollback()
+        app_logger.error(f"Unexpected error during save_course_schedule: {e}")
+        return { 'success': False, 'schedule_id': None, 'upserted_cells': 0, 'message': f'未知错误: {e}' }
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info("Database connection closed after saving course schedule.")
+
+# ===== 课程表 API =====
+@app.post("/course-schedule/save")
+async def api_save_course_schedule(request: Request):
+    """
+    保存/更新课程表
+    请求体 JSON:
+    {
+      "class_id": "class_1001",
+      "term": "2025-2026-1",
+      "days": ["周一", "周二", ...],      // 或 JSON 字符串
+      "times": ["08:00", "08:55", ...], // 或 JSON 字符串
+      "remark": "可选",
+      "cells": [
+        {"row_index":0, "col_index":0, "course_name":"语文", "is_highlight":0},
+        ...
+      ]
+    }
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return safe_json_response({'message': '无效的 JSON 请求体', 'code': 400}, status_code=400)
+
+    # 支持新字段 class_id，兼容旧字段 group_id（若两者同时提供，以 class_id 为准）
+    class_id = data.get('class_id') or data.get('group_id')
+    term = data.get('term')
+    days = data.get('days')
+    times = data.get('times')
+    remark = data.get('remark')
+    cells = data.get('cells', [])
+
+    if not class_id or not term or days is None or times is None:
+        return safe_json_response({'message': '缺少必要参数 class_id/term/days/times', 'code': 400}, status_code=400)
+
+    result = save_course_schedule(
+        class_id=class_id,
+        term=term,
+        days=days,
+        times=times,
+        remark=remark,
+        cells=cells if isinstance(cells, list) else []
+    )
+
+    if result.get('success'):
+        return safe_json_response({'message': '保存成功', 'code': 200, 'data': result})
+    else:
+        return safe_json_response({'message': result.get('message', '保存失败'), 'code': 500}, status_code=500)
+
+@app.get("/course-schedule")
+async def api_get_course_schedule(
+    request: Request,
+    class_id: str = Query(..., description="班级ID"),
+    term: str = Query(..., description="学期，如 2025-2026-1")
+):
+    """
+    查询课程表：根据 (class_id, term) 返回课表头与单元格列表。
+    返回 JSON:
+    {
+      "message": "查询成功",
+      "code": 200,
+      "data": {
+        "schedule": {
+          "id": 1,
+          "class_id": "class_1001",
+          "term": "2025-2026-1",
+          "days": ["周一", ...],
+          "times": ["08:00", ...],
+          "remark": "...",
+          "updated_at": "..."
+        },
+        "cells": [ {"row_index":0, "col_index":0, "course_name":"语文", "is_highlight":0}, ... ]
+      }
+    }
+    """
+    connection = get_db_connection()
+    if connection is None:
+        return safe_json_response({'message': '数据库连接失败', 'code': 500}, status_code=500)
+
+    try:
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT id, class_id, term, days_json, times_json, remark, updated_at "
+            "FROM course_schedule WHERE class_id = %s AND term = %s LIMIT 1",
+            (class_id, term)
+        )
+        header = cursor.fetchone()
+        if not header:
+            return safe_json_response({'message': '未找到课表', 'code': 404}, status_code=404)
+
+        schedule_id = header['id']
+        # 解析 JSON 字段
+        try:
+            days = json.loads(header['days_json']) if header.get('days_json') else []
+        except Exception:
+            days = header.get('days_json')
+        try:
+            times = json.loads(header['times_json']) if header.get('times_json') else []
+        except Exception:
+            times = header.get('times_json')
+
+        schedule = {
+            'id': schedule_id,
+            'class_id': header.get('class_id'),
+            'term': header.get('term'),
+            'days': days,
+            'times': times,
+            'remark': header.get('remark'),
+            'updated_at': header.get('updated_at')
+        }
+
+        cursor.execute(
+            "SELECT row_index, col_index, course_name, is_highlight "
+            "FROM course_schedule_cell WHERE schedule_id = %s",
+            (schedule_id,)
+        )
+        rows = cursor.fetchall() or []
+        cells = []
+        for r in rows:
+            cells.append({
+                'row_index': r.get('row_index'),
+                'col_index': r.get('col_index'),
+                'course_name': r.get('course_name'),
+                'is_highlight': r.get('is_highlight')
+            })
+
+        return safe_json_response({'message': '查询成功', 'code': 200, 'data': {'schedule': schedule, 'cells': cells}})
+    except mysql.connector.Error as e:
+        app_logger.error(f"Database error during api_get_course_schedule: {e}")
+        return safe_json_response({'message': '数据库错误', 'code': 500}, status_code=500)
+    except Exception as e:
+        app_logger.error(f"Unexpected error during api_get_course_schedule: {e}")
+        return safe_json_response({'message': '未知错误', 'code': 500}, status_code=500)
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info("Database connection closed after fetching course schedule.")
+
 def hash_password(password, salt):
     return hashlib.sha256((password + salt).encode('utf-8')).hexdigest()
 
@@ -283,7 +592,7 @@ def get_max_code_from_mysql(connection):
     #"""从 MySQL 找最大号码"""
     print(" get_max_code_from_mysql 111\n");
     with connection.cursor(dictionary=True) as cursor:
-        cursor.execute("SELECT MAX(id) AS max_id FROM ta_school")
+        cursor.execute("SELECT MAX(CAST(id AS UNSIGNED)) AS max_id FROM ta_school")
         print(" get_max_code_from_mysql 222\n");
         row = cursor.fetchone()
         #row = cursor.fetchone()[0]
@@ -374,7 +683,7 @@ async def list_schools(request: Request):
 
         if school_id is not None:
             filters.append("AND id = %s")
-            params.append(int(school_id))
+            params.append(school_id)
         elif name_filter:
             filters.append("AND name LIKE %s")
             params.append(f"%{name_filter}%")
@@ -468,7 +777,7 @@ async def list_userInfo(request: Request):
 
         # 继续走原来的逻辑：关联 ta_user_details 和 ta_teacher
         base_query = """
-            SELECT u.*, t.teacher_unique_id
+            SELECT u.*, t.teacher_unique_id, t.schoolId AS schoolId
             FROM ta_user_details AS u
             LEFT JOIN ta_teacher AS t ON u.id_number = t.id_card
             WHERE u.phone = %s
@@ -723,18 +1032,21 @@ async def add_teacher(request: Request):
     cursor = None
     try:
         cursor = connection.cursor(dictionary=True)
+        # 生成字符串主键（与 ta_teacher.id=VARCHAR(255) 兼容）
+        generated_teacher_id = str(uuid.uuid4())
         sql_insert = """
         INSERT INTO ta_teacher 
-        (name, icon, subject, gradeId, schoolId, is_Administarator, phone, id_card, sex, 
+        (id, name, icon, subject, gradeId, schoolId, is_Administarator, phone, id_card, sex, 
          teaching_tenure, education, graduation_institution, major, 
          teacher_certification_level, subjects_of_teacher_qualification_examination, 
          educational_stage, teacher_unique_id)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s,
                 %s, %s,
-                %s, %s, %s)
+                %s, %s, %s, %s)
         """
         cursor.execute(sql_insert, (
+            generated_teacher_id,
             data.get('name'), data.get('icon'), data.get('subject'), data.get('gradeId'),
             school_id, is_admin_flag, data.get('phone'), data.get('id_card'),
             data.get('sex'), data.get('teaching_tenure'), data.get('education'),
@@ -743,8 +1055,8 @@ async def add_teacher(request: Request):
             data.get('subjects_of_teacher_qualification_examination'),
             data.get('educational_stage'), teacher_unique_id
         ))
-        
-        teacher_id = cursor.lastrowid
+
+        teacher_id = generated_teacher_id
         
         # 2️⃣ 检查 ta_user_details 是否已经存在该手机号
         cursor.execute("SELECT phone FROM ta_user_details WHERE phone = %s", (data.get('phone'),))
@@ -891,7 +1203,7 @@ async def list_teachers(request: Request):
 
         if school_id_filter:
             filters.append("AND schoolId = %s")
-            params.append(int(school_id_filter))
+            params.append(school_id_filter)
         if grade_id_filter:
             filters.append("AND gradeId = %s")
             params.append(int(grade_id_filter))
@@ -935,9 +1247,9 @@ async def get_recent_messages(request: Request):
         base_query = f"SELECT {base_columns} FROM ta_message WHERE sent_at >= %s and content_type='text'"
         filters, params = [], [three_days_ago]
 
-        if school_id: filters.append("AND school_id = %s"); params.append(int(school_id))
+        if school_id: filters.append("AND school_id = %s"); params.append(school_id)
         if class_id: filters.append("AND class_id = %s"); params.append(int(class_id))
-        if sender_id_filter: filters.append("AND sender_id = %s"); params.append(int(sender_id_filter))
+        if sender_id_filter: filters.append("AND sender_id = %s"); params.append(sender_id_filter)
 
         order_clause = "ORDER BY sent_at DESC"
         final_query = f"{base_query} {' '.join(filters)} {order_clause}"
@@ -1000,8 +1312,10 @@ async def add_message(request: Request):
         sender_id = request.query_params.get('sender_id')
         if sender_id:
             try:
-                sender_id = int(sender_id)
-            except:
+                sender_id = str(sender_id).strip()
+                if not sender_id:
+                    sender_id = None
+            except Exception:
                 sender_id = None
 
         # === 情况1: JSON 格式 - 发送文本消息 ===
@@ -2125,14 +2439,16 @@ async def create_group(data):
 
     try:
         cursor.execute(
-            "INSERT INTO ta_group (permission_level, headImage_path, group_type, nickname, unique_group_id, group_admin_id, create_time)"
-            " VALUES (%s,%s,%s,%s,%s,%s,NOW())",
+            "INSERT INTO ta_group (permission_level, headImage_path, group_type, nickname, unique_group_id, group_admin_id, school_id, class_id, create_time)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())",
             (data.get('permission_level'),
              data.get('headImage_path'),
              data.get('group_type'),
              data.get('nickname'),
              unique_group_id,
-             data.get('owner_id'))
+             data.get('owner_id'),
+             data.get('school_id'),
+             data.get('class_id'))
         )
 
         for m in data['members']:
@@ -2322,14 +2638,16 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             unique_group_id = str(uuid.uuid4())
 
                             cursor.execute(
-                                "INSERT INTO ta_group (permission_level, headImage_path, group_type, nickname, unique_group_id, group_admin_id, create_time)"
-                                " VALUES (%s,%s,%s,%s,%s,%s,NOW())",
+                                "INSERT INTO ta_group (permission_level, headImage_path, group_type, nickname, unique_group_id, group_admin_id, school_id, class_id, create_time)"
+                                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())",
                                 (msg_data1.get('permission_level'),
                                 msg_data1.get('headImage_path'),
                                 msg_data1.get('group_type'),
                                 msg_data1.get('nickname'),
                                 unique_group_id,
-                                msg_data1.get('owner_id'))
+                                msg_data1.get('owner_id'),
+                                msg_data1.get('school_id'),
+                                msg_data1.get('class_id'))
                             )
 
                             for m in msg_data1['members']:
