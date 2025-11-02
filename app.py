@@ -474,6 +474,634 @@ async def api_get_course_schedule(
             connection.close()
             app_logger.info("Database connection closed after fetching course schedule.")
 
+# ===== 学生成绩表 API =====
+def save_student_scores(
+    class_id: str,
+    exam_name: str,
+    term: Optional[str] = None,
+    remark: Optional[str] = None,
+    scores: List[Dict] = None
+) -> Dict[str, object]:
+    """
+    保存学生成绩表
+    参数说明：
+    - class_id: 班级ID（必需）
+    - exam_name: 考试名称（必需，如"期中考试"、"期末考试"）
+    - term: 学期（可选，如 '2025-2026-1'）
+    - remark: 备注（可选）
+    - scores: 成绩明细列表，每个元素包含:
+      {
+        'student_id': str,      # 学号（可选）
+        'student_name': str,    # 姓名（必需）
+        'chinese': int,         # 语文成绩（可选）
+        'math': int,            # 数学成绩（可选）
+        'english': int,         # 英语成绩（可选）
+        'total_score': float    # 总分（可选，可自动计算）
+      }
+    
+    返回：
+    - { success, score_header_id, inserted_count, message }
+    """
+    if not class_id or not exam_name:
+        return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '缺少必要参数 class_id 或 exam_name' }
+    
+    if not scores or not isinstance(scores, list):
+        return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '成绩明细列表不能为空' }
+
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("Save student scores failed: Database connection error.")
+        return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '数据库连接失败' }
+
+    try:
+        connection.start_transaction()
+        cursor = connection.cursor(dictionary=True)
+
+        # 1. 插入或获取成绩表头
+        cursor.execute(
+            "SELECT id FROM ta_student_score_header WHERE class_id = %s AND exam_name = %s AND (%s IS NULL OR term = %s) LIMIT 1",
+            (class_id, exam_name, term, term)
+        )
+        header_row = cursor.fetchone()
+
+        if header_row is None:
+            # 插入新表头
+            insert_header_sql = (
+                "INSERT INTO ta_student_score_header (class_id, exam_name, term, remark, created_at) "
+                "VALUES (%s, %s, %s, %s, NOW())"
+            )
+            cursor.execute(insert_header_sql, (class_id, exam_name, term, remark))
+            score_header_id = cursor.lastrowid
+        else:
+            score_header_id = header_row['id']
+            # 更新表头信息（若存在）
+            if remark is not None:
+                cursor.execute(
+                    "UPDATE ta_student_score_header SET remark = %s, updated_at = NOW() WHERE id = %s",
+                    (remark, score_header_id)
+                )
+            # 删除旧的成绩明细（重新上传时覆盖）
+            cursor.execute("DELETE FROM ta_student_score_detail WHERE score_header_id = %s", (score_header_id,))
+
+        # 2. 批量插入成绩明细
+        insert_detail_sql = (
+            "INSERT INTO ta_student_score_detail "
+            "(score_header_id, student_id, student_name, chinese, math, english, total_score) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)"
+        )
+        
+        inserted_count = 0
+        for score_item in scores:
+            student_id = score_item.get('student_id')
+            student_name = score_item.get('student_name', '').strip()
+            if not student_name:
+                continue  # 跳过没有姓名的记录
+            
+            chinese = score_item.get('chinese')
+            math = score_item.get('math')
+            english = score_item.get('english')
+            
+            # 计算总分（如果未提供或需要重新计算）
+            total_score = score_item.get('total_score')
+            if total_score is None:
+                # 自动计算总分（只计算提供的科目）
+                total_score = 0.0
+                if chinese is not None:
+                    total_score += float(chinese)
+                if math is not None:
+                    total_score += float(math)
+                if english is not None:
+                    total_score += float(english)
+            
+            cursor.execute(insert_detail_sql, (
+                score_header_id,
+                student_id,
+                student_name,
+                chinese,
+                math,
+                english,
+                total_score
+            ))
+            inserted_count += 1
+
+        connection.commit()
+        return { 'success': True, 'score_header_id': score_header_id, 'inserted_count': inserted_count, 'message': '保存成功' }
+    except mysql.connector.Error as e:
+        if connection and connection.is_connected():
+            connection.rollback()
+        app_logger.error(f"Database error during save_student_scores: {e}")
+        return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': f'数据库错误: {e}' }
+    except Exception as e:
+        if connection and connection.is_connected():
+            connection.rollback()
+        app_logger.error(f"Unexpected error during save_student_scores: {e}")
+        return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': f'未知错误: {e}' }
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info("Database connection closed after saving student scores.")
+
+@app.post("/student-scores/save")
+async def api_save_student_scores(request: Request):
+    """
+    保存学生成绩表
+    请求体 JSON:
+    {
+      "class_id": "class_1001",
+      "exam_name": "期中考试",
+      "term": "2025-2026-1",  // 可选
+      "remark": "备注信息",    // 可选
+      "scores": [
+        {
+          "student_id": "2024001",    // 可选
+          "student_name": "张三",
+          "chinese": 100,
+          "math": 89,
+          "english": 95,
+          "total_score": 284           // 可选，会自动计算
+        },
+        {
+          "student_name": "李四",
+          "chinese": 90,
+          "math": 78
+          // total_score 会自动计算为 168
+        }
+      ]
+    }
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return safe_json_response({'message': '无效的 JSON 请求体', 'code': 400}, status_code=400)
+
+    class_id = data.get('class_id')
+    exam_name = data.get('exam_name')
+    term = data.get('term')
+    remark = data.get('remark')
+    scores = data.get('scores', [])
+
+    if not class_id or not exam_name:
+        return safe_json_response({'message': '缺少必要参数 class_id 或 exam_name', 'code': 400}, status_code=400)
+
+    result = save_student_scores(
+        class_id=class_id,
+        exam_name=exam_name,
+        term=term,
+        remark=remark,
+        scores=scores
+    )
+
+    if result.get('success'):
+        return safe_json_response({'message': '保存成功', 'code': 200, 'data': result})
+    else:
+        return safe_json_response({'message': result.get('message', '保存失败'), 'code': 500}, status_code=500)
+
+@app.get("/student-scores")
+async def api_get_student_scores(
+    request: Request,
+    class_id: str = Query(..., description="班级ID"),
+    exam_name: Optional[str] = Query(None, description="考试名称，如不提供则返回该班级所有成绩表"),
+    term: Optional[str] = Query(None, description="学期，可选")
+):
+    """
+    查询学生成绩表
+    返回 JSON:
+    {
+      "message": "查询成功",
+      "code": 200,
+      "data": {
+        "headers": [
+          {
+            "id": 1,
+            "class_id": "class_1001",
+            "exam_name": "期中考试",
+            "term": "2025-2026-1",
+            "remark": "...",
+            "created_at": "...",
+            "scores": [
+              {
+                "id": 1,
+                "student_id": "2024001",
+                "student_name": "张三",
+                "chinese": 100,
+                "math": 89,
+                "english": 95,
+                "total_score": 284
+              },
+              ...
+            ]
+          },
+          ...
+        ]
+      }
+    }
+    """
+    connection = get_db_connection()
+    if connection is None:
+        return safe_json_response({'message': '数据库连接失败', 'code': 500}, status_code=500)
+
+    try:
+        cursor = connection.cursor(dictionary=True)
+        
+        # 查询成绩表头
+        if exam_name:
+            cursor.execute(
+                "SELECT id, class_id, exam_name, term, remark, created_at, updated_at "
+                "FROM ta_student_score_header "
+                "WHERE class_id = %s AND exam_name = %s AND (%s IS NULL OR term = %s)",
+                (class_id, exam_name, term, term)
+            )
+        else:
+            cursor.execute(
+                "SELECT id, class_id, exam_name, term, remark, created_at, updated_at "
+                "FROM ta_student_score_header "
+                "WHERE class_id = %s AND (%s IS NULL OR term = %s) "
+                "ORDER BY created_at DESC",
+                (class_id, term, term)
+            )
+        
+        headers = cursor.fetchall() or []
+        
+        # 查询每个表头的成绩明细
+        result_headers = []
+        for header in headers:
+            score_header_id = header['id']
+            cursor.execute(
+                "SELECT id, student_id, student_name, chinese, math, english, total_score "
+                "FROM ta_student_score_detail "
+                "WHERE score_header_id = %s "
+                "ORDER BY total_score DESC, student_name ASC",
+                (score_header_id,)
+            )
+            scores = cursor.fetchall() or []
+            
+            header_dict = {
+                'id': header['id'],
+                'class_id': header['class_id'],
+                'exam_name': header['exam_name'],
+                'term': header.get('term'),
+                'remark': header.get('remark'),
+                'created_at': header.get('created_at'),
+                'updated_at': header.get('updated_at'),
+                'scores': scores
+            }
+            result_headers.append(header_dict)
+
+        return safe_json_response({
+            'message': '查询成功',
+            'code': 200,
+            'data': {'headers': result_headers}
+        })
+    except mysql.connector.Error as e:
+        app_logger.error(f"Database error during api_get_student_scores: {e}")
+        return safe_json_response({'message': '数据库错误', 'code': 500}, status_code=500)
+    except Exception as e:
+        app_logger.error(f"Unexpected error during api_get_student_scores: {e}")
+        return safe_json_response({'message': '未知错误', 'code': 500}, status_code=500)
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info("Database connection closed after fetching student scores.")
+
+# ===== 小组管理表 API =====
+def save_group_scores(
+    class_id: str,
+    term: Optional[str] = None,
+    remark: Optional[str] = None,
+    group_scores: List[Dict] = None
+) -> Dict[str, object]:
+    """
+    保存小组管理表
+    参数说明：
+    - class_id: 班级ID（必需）
+    - term: 学期（可选，如 '2025-2026-1'）
+    - remark: 备注（可选）
+    - group_scores: 小组评分明细列表，每个元素包含:
+      {
+        'group_number': int,           # 小组编号（必需）
+        'student_id': str,             # 学号（可选）
+        'student_name': str,           # 姓名（必需）
+        'hygiene': int,                # 卫生评分（可选）
+        'participation': int,          # 课堂发言评分（可选）
+        'discipline': int,             # 纪律评分（可选）
+        'homework': int,               # 作业评分（可选）
+        'recitation': int,             # 背诵评分（可选）
+        'total_score': int             # 个人总分（可选，可自动计算）
+      }
+    
+    返回：
+    - { success, score_header_id, inserted_count, message }
+    """
+    if not class_id:
+        return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '缺少必要参数 class_id' }
+    
+    if not group_scores or not isinstance(group_scores, list):
+        return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '小组评分明细列表不能为空' }
+
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("Save group scores failed: Database connection error.")
+        return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '数据库连接失败' }
+
+    try:
+        connection.start_transaction()
+        cursor = connection.cursor(dictionary=True)
+
+        # 1. 插入或获取小组管理表头（每个班级每个学期一个表头）
+        cursor.execute(
+            "SELECT id FROM ta_group_score_header WHERE class_id = %s AND (%s IS NULL OR term = %s) LIMIT 1",
+            (class_id, term, term)
+        )
+        header_row = cursor.fetchone()
+
+        if header_row is None:
+            # 插入新表头
+            insert_header_sql = (
+                "INSERT INTO ta_group_score_header (class_id, term, remark, created_at) "
+                "VALUES (%s, %s, %s, NOW())"
+            )
+            cursor.execute(insert_header_sql, (class_id, term, remark))
+            score_header_id = cursor.lastrowid
+        else:
+            score_header_id = header_row['id']
+            # 更新表头信息（若存在）
+            if remark is not None:
+                cursor.execute(
+                    "UPDATE ta_group_score_header SET remark = %s, updated_at = NOW() WHERE id = %s",
+                    (remark, score_header_id)
+                )
+            # 删除旧的评分明细（重新上传时覆盖）
+            cursor.execute("DELETE FROM ta_group_score_detail WHERE score_header_id = %s", (score_header_id,))
+
+        # 2. 批量插入评分明细
+        insert_detail_sql = (
+            "INSERT INTO ta_group_score_detail "
+            "(score_header_id, group_number, student_id, student_name, hygiene, participation, discipline, homework, recitation, total_score) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+        )
+        
+        inserted_count = 0
+        for score_item in group_scores:
+            group_number = score_item.get('group_number')
+            student_id = score_item.get('student_id')
+            student_name = score_item.get('student_name', '').strip()
+            
+            if not student_name or group_number is None:
+                continue  # 跳过没有姓名或小组编号的记录
+            
+            hygiene = score_item.get('hygiene')
+            participation = score_item.get('participation')
+            discipline = score_item.get('discipline')
+            homework = score_item.get('homework')
+            recitation = score_item.get('recitation')
+            
+            # 计算个人总分（如果未提供或需要重新计算）
+            total_score = score_item.get('total_score')
+            if total_score is None:
+                # 自动计算总分（只计算提供的科目）
+                total_score = 0
+                if hygiene is not None:
+                    total_score += int(hygiene)
+                if participation is not None:
+                    total_score += int(participation)
+                if discipline is not None:
+                    total_score += int(discipline)
+                if homework is not None:
+                    total_score += int(homework)
+                if recitation is not None:
+                    total_score += int(recitation)
+            
+            cursor.execute(insert_detail_sql, (
+                score_header_id,
+                int(group_number),
+                student_id,
+                student_name,
+                hygiene,
+                participation,
+                discipline,
+                homework,
+                recitation,
+                total_score
+            ))
+            inserted_count += 1
+
+        connection.commit()
+        return { 'success': True, 'score_header_id': score_header_id, 'inserted_count': inserted_count, 'message': '保存成功' }
+    except mysql.connector.Error as e:
+        if connection and connection.is_connected():
+            connection.rollback()
+        app_logger.error(f"Database error during save_group_scores: {e}")
+        return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': f'数据库错误: {e}' }
+    except Exception as e:
+        if connection and connection.is_connected():
+            connection.rollback()
+        app_logger.error(f"Unexpected error during save_group_scores: {e}")
+        return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': f'未知错误: {e}' }
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info("Database connection closed after saving group scores.")
+
+@app.post("/group-scores/save")
+async def api_save_group_scores(request: Request):
+    """
+    保存小组管理表
+    请求体 JSON:
+    {
+      "class_id": "class_1001",
+      "term": "2025-2026-1",  // 可选
+      "remark": "备注信息",    // 可选
+      "group_scores": [
+        {
+          "group_number": 1,              // 小组编号（必需）
+          "student_id": "2024001",        // 可选
+          "student_name": "张三",
+          "hygiene": 100,                 // 卫生评分（可选）
+          "participation": 89,            // 课堂发言评分（可选）
+          "discipline": 84,               // 纪律评分（可选）
+          "homework": 90,                 // 作业评分（可选）
+          "recitation": 85,               // 背诵评分（可选）
+          "total_score": 448              // 个人总分（可选，会自动计算）
+        },
+        {
+          "group_number": 1,
+          "student_name": "李四",
+          "hygiene": 90,
+          "participation": 78,
+          "discipline": 53
+          // total_score 会自动计算为 221
+        },
+        {
+          "group_number": 2,
+          "student_name": "王五",
+          "hygiene": 67,
+          "participation": 97,
+          "discipline": 23
+        }
+      ]
+    }
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return safe_json_response({'message': '无效的 JSON 请求体', 'code': 400}, status_code=400)
+
+    class_id = data.get('class_id')
+    term = data.get('term')
+    remark = data.get('remark')
+    group_scores = data.get('group_scores', [])
+
+    if not class_id:
+        return safe_json_response({'message': '缺少必要参数 class_id', 'code': 400}, status_code=400)
+
+    result = save_group_scores(
+        class_id=class_id,
+        term=term,
+        remark=remark,
+        group_scores=group_scores
+    )
+
+    if result.get('success'):
+        return safe_json_response({'message': '保存成功', 'code': 200, 'data': result})
+    else:
+        return safe_json_response({'message': result.get('message', '保存失败'), 'code': 500}, status_code=500)
+
+@app.get("/group-scores")
+async def api_get_group_scores(
+    request: Request,
+    class_id: str = Query(..., description="班级ID"),
+    term: Optional[str] = Query(None, description="学期，可选")
+):
+    """
+    查询小组管理表
+    返回 JSON:
+    {
+      "message": "查询成功",
+      "code": 200,
+      "data": {
+        "header": {
+          "id": 1,
+          "class_id": "class_1001",
+          "term": "2025-2026-1",
+          "remark": "...",
+          "created_at": "...",
+          "updated_at": "..."
+        },
+        "group_scores": [
+          {
+            "group_number": 1,
+            "group_total_score": 765,  // 小组总分（自动计算）
+            "students": [
+              {
+                "id": 1,
+                "student_id": "2024001",
+                "student_name": "张三",
+                "hygiene": 100,
+                "participation": 89,
+                "discipline": 84,
+                "homework": 90,
+                "recitation": 85,
+                "total_score": 448
+              },
+              ...
+            ]
+          },
+          {
+            "group_number": 2,
+            "group_total_score": 544,
+            "students": [...]
+          },
+          ...
+        ]
+      }
+    }
+    """
+    connection = get_db_connection()
+    if connection is None:
+        return safe_json_response({'message': '数据库连接失败', 'code': 500}, status_code=500)
+
+    try:
+        cursor = connection.cursor(dictionary=True)
+        
+        # 查询小组管理表头
+        cursor.execute(
+            "SELECT id, class_id, term, remark, created_at, updated_at "
+            "FROM ta_group_score_header "
+            "WHERE class_id = %s AND (%s IS NULL OR term = %s) "
+            "ORDER BY created_at DESC LIMIT 1",
+            (class_id, term, term)
+        )
+        
+        header = cursor.fetchone()
+        if not header:
+            return safe_json_response({'message': '未找到小组管理表', 'code': 404}, status_code=404)
+
+        score_header_id = header['id']
+        
+        # 查询所有评分明细，按小组编号和学生姓名排序
+        cursor.execute(
+            "SELECT id, group_number, student_id, student_name, hygiene, participation, discipline, homework, recitation, total_score "
+            "FROM ta_group_score_detail "
+            "WHERE score_header_id = %s "
+            "ORDER BY group_number ASC, student_name ASC",
+            (score_header_id,)
+        )
+        all_scores = cursor.fetchall() or []
+        
+        # 按小组分组，并计算每个小组的总分
+        group_dict = {}
+        for score in all_scores:
+            group_num = score['group_number']
+            if group_num not in group_dict:
+                group_dict[group_num] = {
+                    'group_number': group_num,
+                    'group_total_score': 0,
+                    'students': []
+                }
+            group_dict[group_num]['students'].append({
+                'id': score['id'],
+                'student_id': score.get('student_id'),
+                'student_name': score['student_name'],
+                'hygiene': score.get('hygiene'),
+                'participation': score.get('participation'),
+                'discipline': score.get('discipline'),
+                'homework': score.get('homework'),
+                'recitation': score.get('recitation'),
+                'total_score': score.get('total_score')
+            })
+            # 累加小组总分
+            if score.get('total_score'):
+                group_dict[group_num]['group_total_score'] += int(score['total_score'])
+        
+        # 转换为列表，按小组编号排序
+        group_scores_list = sorted(group_dict.values(), key=lambda x: x['group_number'])
+
+        return safe_json_response({
+            'message': '查询成功',
+            'code': 200,
+            'data': {
+                'header': {
+                    'id': header['id'],
+                    'class_id': header['class_id'],
+                    'term': header.get('term'),
+                    'remark': header.get('remark'),
+                    'created_at': header.get('created_at'),
+                    'updated_at': header.get('updated_at')
+                },
+                'group_scores': group_scores_list
+            }
+        })
+    except mysql.connector.Error as e:
+        app_logger.error(f"Database error during api_get_group_scores: {e}")
+        return safe_json_response({'message': '数据库错误', 'code': 500}, status_code=500)
+    except Exception as e:
+        app_logger.error(f"Unexpected error during api_get_group_scores: {e}")
+        return safe_json_response({'message': '未知错误', 'code': 500}, status_code=500)
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info("Database connection closed after fetching group scores.")
+
 def hash_password(password, salt):
     return hashlib.sha256((password + salt).encode('utf-8')).hexdigest()
 
