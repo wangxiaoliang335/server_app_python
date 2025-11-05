@@ -2808,6 +2808,7 @@ def get_groups_by_teacher(
             SELECT 
                 g.*,
                 gm.user_id,
+                gm.user_name,
                 gm.self_role,
                 gm.join_time as member_join_time,
                 gm.msg_flag,
@@ -2866,6 +2867,7 @@ def get_groups_by_teacher(
                 # 成员信息
                 "member_info": {
                     "user_id": row.get("user_id"),
+                    "user_name": row.get("user_name"),
                     "self_role": row.get("self_role"),
                     "join_time": row.get("member_join_time"),
                     "msg_flag": row.get("msg_flag"),
@@ -2918,6 +2920,275 @@ def get_groups_by_teacher(
         if connection and connection.is_connected():
             connection.close()
             app_logger.info(f"Database connection closed after get_groups_by_teacher attempt for {teacher_unique_id}.")
+
+@app.get("/groups/search")
+def search_groups(
+    schoolid: str = Query(..., description="学校ID，必需参数"),
+    group_id: str = Query(None, description="群组ID，与group_name二选一"),
+    group_name: str = Query(None, description="群组名称，与group_id二选一，支持模糊查询")
+):
+    """
+    搜索群组
+    根据 schoolid 和 group_id 或 group_name 搜索 groups 表
+    - schoolid: 必需参数
+    - group_id 或 group_name: 二选一，不会同时上传
+    """
+    print("=" * 80)
+    print("[groups/search] 收到搜索群组请求")
+    print(f"[groups/search] 请求参数 - schoolid: {schoolid}, group_id: {group_id}, group_name: {group_name}")
+    
+    # 参数验证
+    if not schoolid:
+        print("[groups/search] 错误: 缺少必需参数 schoolid")
+        return JSONResponse({
+            "data": {
+                "message": "缺少必需参数 schoolid",
+                "code": 400
+            }
+        }, status_code=400)
+    
+    # group_id 和 group_name 必须至少提供一个
+    if not group_id and not group_name:
+        print("[groups/search] 错误: group_id 和 group_name 必须至少提供一个")
+        return JSONResponse({
+            "data": {
+                "message": "group_id 和 group_name 必须至少提供一个",
+                "code": 400
+            }
+        }, status_code=400)
+    
+    # group_id 和 group_name 不能同时提供
+    if group_id and group_name:
+        print("[groups/search] 错误: group_id 和 group_name 不能同时提供")
+        return JSONResponse({
+            "data": {
+                "message": "group_id 和 group_name 不能同时提供",
+                "code": 400
+            }
+        }, status_code=400)
+    
+    print("[groups/search] 开始连接数据库...")
+    connection = get_db_connection()
+    if connection is None or not connection.is_connected():
+        print("[groups/search] 错误: 数据库连接失败")
+        app_logger.error(f"[groups/search] 数据库连接失败 for schoolid={schoolid}")
+        return JSONResponse({
+            "data": {
+                "message": "数据库连接失败",
+                "code": 500
+            }
+        }, status_code=500)
+    print("[groups/search] 数据库连接成功")
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+        
+        # 构建查询条件
+        if group_id:
+            # 根据 group_id 精确查询
+            print(f"[groups/search] 根据 group_id 精确查询: {group_id}")
+            sql = """
+                SELECT *
+                FROM `groups`
+                WHERE schoolid = %s AND group_id = %s
+            """
+            params = (schoolid, group_id)
+        else:
+            # 根据 group_name 模糊查询
+            print(f"[groups/search] 根据 group_name 模糊查询: {group_name}")
+            sql = """
+                SELECT *
+                FROM `groups`
+                WHERE schoolid = %s AND group_name LIKE %s
+            """
+            params = (schoolid, f"%{group_name}%")
+        
+        print(f"[groups/search] 执行SQL查询: {sql}")
+        print(f"[groups/search] 查询参数: {params}")
+        
+        cursor.execute(sql, params)
+        groups = cursor.fetchall()
+        
+        print(f"[groups/search] 查询结果: 找到 {len(groups)} 个群组")
+        
+        # 转换 datetime 为字符串
+        for idx, group in enumerate(groups):
+            print(f"[groups/search] 处理第 {idx+1} 个群组: group_id={group.get('group_id')}, group_name={group.get('group_name')}")
+            for key, value in group.items():
+                if isinstance(value, datetime.datetime):
+                    group[key] = value.strftime("%Y-%m-%d %H:%M:%S")
+        
+        result = {
+            "data": {
+                "message": "查询成功",
+                "code": 200,
+                "schoolid": schoolid,
+                "search_key": group_id if group_id else group_name,
+                "search_type": "group_id" if group_id else "group_name",
+                "groups": groups,
+                "count": len(groups)
+            }
+        }
+        
+        print(f"[groups/search] 返回结果: 找到 {len(groups)} 个群组")
+        print("=" * 80)
+        
+        return JSONResponse(result, status_code=200)
+
+    except mysql.connector.Error as e:
+        error_msg = f"搜索群组错误: {e}"
+        print(f"[groups/search] {error_msg}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[groups/search] 错误堆栈: {traceback_str}")
+        app_logger.error(f"[groups/search] {error_msg}\n{traceback_str}")
+        return JSONResponse({
+            "data": {
+                "message": f"查询失败: {str(e)}",
+                "code": 500
+            }
+        }, status_code=500)
+    except Exception as e:
+        error_msg = f"搜索群组时发生异常: {e}"
+        print(f"[groups/search] {error_msg}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[groups/search] 错误堆栈: {traceback_str}")
+        app_logger.error(f"[groups/search] {error_msg}\n{traceback_str}")
+        return JSONResponse({
+            "data": {
+                "message": f"查询失败: {str(e)}",
+                "code": 500
+            }
+        }, status_code=500)
+    finally:
+        if cursor:
+            cursor.close()
+            print("[groups/search] 游标已关闭")
+        if connection and connection.is_connected():
+            connection.close()
+            print("[groups/search] 数据库连接已关闭")
+            app_logger.info(f"[groups/search] Database connection closed after search groups attempt for schoolid={schoolid}.")
+
+@app.get("/groups/members")
+def get_group_members_by_group_id(
+    group_id: str = Query(..., description="群组ID，对应groups表的group_id")
+):
+    """
+    根据 group_id 从 group_members 表获取群成员信息
+    """
+    print("=" * 80)
+    print("[groups/members] 收到查询群成员请求")
+    print(f"[groups/members] 请求参数 - group_id: {group_id}")
+    
+    if not group_id:
+        print("[groups/members] 错误: 缺少群组ID")
+        return JSONResponse({
+            "data": {
+                "message": "缺少群组ID",
+                "code": 400
+            }
+        }, status_code=400)
+
+    print("[groups/members] 开始连接数据库...")
+    connection = get_db_connection()
+    if connection is None or not connection.is_connected():
+        print("[groups/members] 错误: 数据库连接失败")
+        app_logger.error(f"[groups/members] 数据库连接失败 for group_id={group_id}")
+        return JSONResponse({
+            "data": {
+                "message": "数据库连接失败",
+                "code": 500
+            }
+        }, status_code=500)
+    print("[groups/members] 数据库连接成功")
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+        
+        # 查询该群组的所有成员信息
+        sql = """
+            SELECT 
+                gm.group_id,
+                gm.user_id,
+                gm.user_name,
+                gm.self_role,
+                gm.join_time,
+                gm.msg_flag,
+                gm.self_msg_flag,
+                gm.readed_seq,
+                gm.unread_num
+            FROM `group_members` gm
+            WHERE gm.group_id = %s
+            ORDER BY gm.join_time ASC
+        """
+        print(f"[groups/members] 执行SQL查询: {sql}")
+        print(f"[groups/members] 查询参数: group_id={group_id}")
+        
+        cursor.execute(sql, (group_id,))
+        members = cursor.fetchall()
+        
+        print(f"[groups/members] 查询结果: 找到 {len(members)} 个成员")
+        
+        # 转换 datetime 为字符串
+        for idx, member in enumerate(members):
+            print(f"[groups/members] 处理第 {idx+1} 个成员: user_id={member.get('user_id')}, self_role={member.get('self_role')}")
+            for key, value in member.items():
+                if isinstance(value, datetime.datetime):
+                    member[key] = value.strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"[groups/members] 转换时间字段 {key}: {member[key]}")
+        
+        result = {
+            "data": {
+                "message": "查询成功",
+                "code": 200,
+                "group_id": group_id,
+                "members": members,
+                "member_count": len(members)
+            }
+        }
+        
+        print(f"[groups/members] 返回结果: group_id={group_id}, member_count={len(members)}")
+        print("=" * 80)
+        
+        return JSONResponse(result, status_code=200)
+
+    except mysql.connector.Error as e:
+        error_msg = f"查询群成员错误: {e}"
+        print(f"[groups/members] {error_msg}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[groups/members] 错误堆栈: {traceback_str}")
+        app_logger.error(f"[groups/members] {error_msg}\n{traceback_str}")
+        return JSONResponse({
+            "data": {
+                "message": f"查询失败: {str(e)}",
+                "code": 500
+            }
+        }, status_code=500)
+    except Exception as e:
+        error_msg = f"查询群成员时发生异常: {e}"
+        print(f"[groups/members] {error_msg}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[groups/members] 错误堆栈: {traceback_str}")
+        app_logger.error(f"[groups/members] {error_msg}\n{traceback_str}")
+        return JSONResponse({
+            "data": {
+                "message": f"查询失败: {str(e)}",
+                "code": 500
+            }
+        }, status_code=500)
+    finally:
+        if cursor:
+            cursor.close()
+            print("[groups/members] 游标已关闭")
+        if connection and connection.is_connected():
+            connection.close()
+            print("[groups/members] 数据库连接已关闭")
+            app_logger.info(f"[groups/members] Database connection closed after get_group_members_by_group_id attempt for group_id={group_id}.")
 
 @app.get("/group/members")
 def get_group_members(
@@ -3391,22 +3662,42 @@ async def sync_groups(request: Request):
                             # 更新成员信息
                             print(f"[groups/sync] 更新成员信息 group_id={group_id}, user_id={member_user_id}...")
                             join_time_dt = timestamp_to_datetime(member_info.get('join_time'))
-                            update_member_sql = """
-                                UPDATE `group_members` SET
-                                    self_role = %s, join_time = %s, msg_flag = %s,
-                                    self_msg_flag = %s, readed_seq = %s, unread_num = %s
-                                WHERE group_id = %s AND user_id = %s
-                            """
-                            update_member_params = (
+                            member_user_name = member_info.get('user_name')  # 获取成员名称
+                            
+                            # 检查值是否为空（None、空字符串、空值）
+                            def is_empty(value):
+                                return value is None or value == '' or (isinstance(value, str) and value.strip() == '')
+                            
+                            # 构建 UPDATE SQL，如果字段为空则不更新
+                            update_fields = [
+                                "self_role = %s", "join_time = %s", "msg_flag = %s",
+                                "self_msg_flag = %s", "readed_seq = %s", "unread_num = %s"
+                            ]
+                            update_params = [
                                 member_info.get('self_role'),
                                 join_time_dt,
                                 member_info.get('msg_flag'),
                                 member_info.get('self_msg_flag'),
                                 member_info.get('readed_seq'),
-                                member_info.get('unread_num'),
-                                group_id,
-                                member_user_id
-                            )
+                                member_info.get('unread_num')
+                            ]
+                            
+                            # 如果 user_name 不为空，则更新该字段；为空则跳过更新
+                            if not is_empty(member_user_name):
+                                update_fields.append("user_name = %s")
+                                update_params.append(member_user_name)
+                                print(f"[groups/sync] 将更新 user_name: {member_user_name}")
+                            else:
+                                print(f"[groups/sync] user_name 为空，跳过更新该字段")
+                            
+                            update_params.extend([group_id, member_user_id])  # WHERE 条件参数
+                            
+                            update_member_sql = f"""
+                                UPDATE `group_members` SET
+                                    {', '.join(update_fields)}
+                                WHERE group_id = %s AND user_id = %s
+                            """
+                            update_member_params = tuple(update_params)
                             print(f"[groups/sync] 更新成员参数: {update_member_params}")
                             cursor.execute(update_member_sql, update_member_params)
                             affected_rows = cursor.rowcount
@@ -3415,17 +3706,20 @@ async def sync_groups(request: Request):
                             # 插入新成员
                             print(f"[groups/sync] 插入新成员 group_id={group_id}, user_id={member_user_id}...")
                             join_time_dt = timestamp_to_datetime(member_info.get('join_time'))
+                            member_user_name = member_info.get('user_name')  # 获取成员名称
+                            
                             insert_member_sql = """
                                 INSERT INTO `group_members` (
-                                    group_id, user_id, self_role, join_time, msg_flag,
+                                    group_id, user_id, user_name, self_role, join_time, msg_flag,
                                     self_msg_flag, readed_seq, unread_num
                                 ) VALUES (
-                                    %s, %s, %s, %s, %s, %s, %s, %s
+                                    %s, %s, %s, %s, %s, %s, %s, %s, %s
                                 )
                             """
                             insert_member_params = (
                                 group_id,
                                 member_user_id,
+                                member_user_name,  # 如果为空则插入 NULL
                                 member_info.get('self_role'),
                                 join_time_dt,
                                 member_info.get('msg_flag'),
@@ -3433,6 +3727,7 @@ async def sync_groups(request: Request):
                                 member_info.get('readed_seq'),
                                 member_info.get('unread_num')
                             )
+                            print(f"[groups/sync] 插入成员参数: user_name={member_user_name}")
                             print(f"[groups/sync] 插入成员参数: {insert_member_params}")
                             cursor.execute(insert_member_sql, insert_member_params)
                             affected_rows = cursor.rowcount
