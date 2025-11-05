@@ -3071,6 +3071,202 @@ def search_groups(
             print("[groups/search] 数据库连接已关闭")
             app_logger.info(f"[groups/search] Database connection closed after search groups attempt for schoolid={schoolid}.")
 
+@app.post("/groups/join")
+async def join_group(request: Request):
+    """
+    用户申请加入群组
+    接收客户端发送的 group_id, user_id, user_name, reason
+    将用户添加到 group_members 表中
+    """
+    print("=" * 80)
+    print("[groups/join] 收到加入群组请求")
+    
+    try:
+        data = await request.json()
+        print(f"[groups/join] 原始数据: {json.dumps(data, ensure_ascii=False, indent=2)}")
+        
+        group_id = data.get('group_id')
+        user_id = data.get('user_id')
+        user_name = data.get('user_name')
+        reason = data.get('reason')
+        
+        print(f"[groups/join] 解析结果 - group_id: {group_id}, user_id: {user_id}, user_name: {user_name}, reason: {reason}")
+        
+        # 参数验证
+        if not group_id:
+            print("[groups/join] 错误: 缺少 group_id")
+            return JSONResponse({
+                "code": 400,
+                "message": "缺少必需参数 group_id"
+            }, status_code=400)
+        
+        if not user_id:
+            print("[groups/join] 错误: 缺少 user_id")
+            return JSONResponse({
+                "code": 400,
+                "message": "缺少必需参数 user_id"
+            }, status_code=400)
+        
+        print("[groups/join] 开始连接数据库...")
+        connection = get_db_connection()
+        if connection is None or not connection.is_connected():
+            print("[groups/join] 错误: 数据库连接失败")
+            app_logger.error("[groups/join] 数据库连接失败")
+            return JSONResponse({
+                "code": 500,
+                "message": "数据库连接失败"
+            }, status_code=500)
+        print("[groups/join] 数据库连接成功")
+        
+        cursor = None
+        try:
+            cursor = connection.cursor(dictionary=True)
+            
+            # 1. 检查群组是否存在
+            print(f"[groups/join] 检查群组 {group_id} 是否存在...")
+            cursor.execute("SELECT group_id, group_name, max_member_num, member_num FROM `groups` WHERE group_id = %s", (group_id,))
+            group_info = cursor.fetchone()
+            
+            if not group_info:
+                print(f"[groups/join] 错误: 群组 {group_id} 不存在")
+                return JSONResponse({
+                    "code": 404,
+                    "message": "群组不存在"
+                }, status_code=404)
+            
+            print(f"[groups/join] 群组信息: {group_info}")
+            max_member_num = group_info.get('max_member_num') if group_info.get('max_member_num') else 0
+            member_num = group_info.get('member_num') if group_info.get('member_num') else 0
+            
+            # 检查群组是否已满
+            if max_member_num > 0 and member_num >= max_member_num:
+                print(f"[groups/join] 错误: 群组已满 (当前: {member_num}/{max_member_num})")
+                return JSONResponse({
+                    "code": 400,
+                    "message": "群组已满，无法加入"
+                }, status_code=400)
+            
+            # 2. 检查用户是否已经在群组中
+            print(f"[groups/join] 检查用户 {user_id} 是否已在群组 {group_id} 中...")
+            cursor.execute(
+                "SELECT group_id FROM `group_members` WHERE group_id = %s AND user_id = %s",
+                (group_id, user_id)
+            )
+            member_exists = cursor.fetchone()
+            
+            if member_exists:
+                print(f"[groups/join] 用户 {user_id} 已在群组 {group_id} 中")
+                return JSONResponse({
+                    "code": 400,
+                    "message": "您已经在该群组中"
+                }, status_code=400)
+            
+            # 3. 插入新成员（默认角色为普通成员，不是群主）
+            print(f"[groups/join] 插入新成员到群组 {group_id}...")
+            current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            insert_member_sql = """
+                INSERT INTO `group_members` (
+                    group_id, user_id, user_name, self_role, join_time, msg_flag,
+                    self_msg_flag, readed_seq, unread_num
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
+            """
+            # self_role: 200 表示普通成员，400 表示群主
+            insert_params = (
+                group_id,
+                user_id,
+                user_name if user_name else None,  # 如果为空则插入 NULL
+                200,  # 默认角色为普通成员
+                current_time,
+                0,  # msg_flag
+                0,  # self_msg_flag
+                0,  # readed_seq
+                0   # unread_num
+            )
+            
+            print(f"[groups/join] 插入参数: {insert_params}")
+            cursor.execute(insert_member_sql, insert_params)
+            affected_rows = cursor.rowcount
+            lastrowid = cursor.lastrowid
+            print(f"[groups/join] 插入成员完成, 影响行数: {affected_rows}, lastrowid: {lastrowid}")
+            
+            # 4. 更新群组的成员数量
+            print(f"[groups/join] 更新群组 {group_id} 的成员数量...")
+            cursor.execute(
+                "UPDATE `groups` SET member_num = member_num + 1 WHERE group_id = %s",
+                (group_id,)
+            )
+            print(f"[groups/join] 群组成员数量已更新")
+            
+            # 提交事务
+            connection.commit()
+            print(f"[groups/join] 事务提交成功")
+            
+            result = {
+                "code": 200,
+                "message": "成功加入群组",
+                "data": {
+                    "group_id": group_id,
+                    "user_id": user_id,
+                    "user_name": user_name,
+                    "join_time": current_time
+                }
+            }
+            
+            print(f"[groups/join] 返回结果: {result}")
+            print("=" * 80)
+            
+            return JSONResponse(result, status_code=200)
+            
+        except mysql.connector.Error as e:
+            connection.rollback()
+            error_msg = f"数据库错误: {e}"
+            print(f"[groups/join] {error_msg}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[groups/join] 错误堆栈: {traceback_str}")
+            app_logger.error(f"[groups/join] {error_msg}\n{traceback_str}")
+            return JSONResponse({
+                "code": 500,
+                "message": f"数据库操作失败: {str(e)}"
+            }, status_code=500)
+        except Exception as e:
+            connection.rollback()
+            error_msg = f"加入群组时发生异常: {e}"
+            print(f"[groups/join] {error_msg}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[groups/join] 错误堆栈: {traceback_str}")
+            app_logger.error(f"[groups/join] {error_msg}\n{traceback_str}")
+            return JSONResponse({
+                "code": 500,
+                "message": f"操作失败: {str(e)}"
+            }, status_code=500)
+        finally:
+            if cursor:
+                cursor.close()
+                print("[groups/join] 游标已关闭")
+            if connection and connection.is_connected():
+                connection.close()
+                print("[groups/join] 数据库连接已关闭")
+                app_logger.info("[groups/join] Database connection closed after join group attempt.")
+    
+    except Exception as e:
+        error_msg = f"解析请求数据时出错: {e}"
+        print(f"[groups/join] {error_msg}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[groups/join] 错误堆栈: {traceback_str}")
+        app_logger.error(f"[groups/join] {error_msg}\n{traceback_str}")
+        return JSONResponse({
+            "code": 400,
+            "message": "请求数据格式错误"
+        }, status_code=400)
+    finally:
+        print("=" * 80)
+
 @app.get("/groups/members")
 def get_group_members_by_group_id(
     group_id: str = Query(..., description="群组ID，对应groups表的group_id")
