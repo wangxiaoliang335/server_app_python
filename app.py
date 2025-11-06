@@ -27,6 +27,7 @@ from aliyunsdkcore.client import AcsClient
 from aliyunsdkcore.request import CommonRequest
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import ClientDisconnect
 from fastapi.encoders import jsonable_encoder
 from dotenv import load_dotenv
 #from datetime import datetime
@@ -3031,6 +3032,7 @@ def search_groups(
             }
         }
         
+        print(result)
         print(f"[groups/search] 返回结果: 找到 {len(groups)} 个群组")
         print("=" * 80)
         
@@ -3260,6 +3262,232 @@ async def join_group(request: Request):
         traceback_str = traceback.format_exc()
         print(f"[groups/join] 错误堆栈: {traceback_str}")
         app_logger.error(f"[groups/join] {error_msg}\n{traceback_str}")
+        return JSONResponse({
+            "code": 400,
+            "message": "请求数据格式错误"
+        }, status_code=400)
+    finally:
+        print("=" * 80)
+
+@app.post("/groups/leave")
+async def leave_group(request: Request):
+    """
+    用户退出群组
+    接收客户端发送的 group_id, user_id
+    从 group_members 表中删除该用户，并更新群组的成员数量
+    """
+    print("=" * 80)
+    print("[groups/leave] 收到退出群组请求")
+    
+    # 打印请求头信息用于调试
+    content_type = request.headers.get("content-type", "")
+    content_length = request.headers.get("content-length", "")
+    print(f"[groups/leave] 请求头 - Content-Type: {content_type}, Content-Length: {content_length}")
+    
+    try:
+        # 解析请求体JSON数据
+        try:
+            # 先尝试读取原始body
+            body_bytes = await request.body()
+            print(f"[groups/leave] 读取到请求体长度: {len(body_bytes)} 字节")
+            
+            if not body_bytes:
+                print("[groups/leave] 错误: 请求体为空")
+                return JSONResponse({
+                    "code": 400,
+                    "message": "请求体不能为空"
+                }, status_code=400)
+            
+            # 解析JSON
+            try:
+                data = json.loads(body_bytes.decode('utf-8'))
+            except json.JSONDecodeError as e:
+                print(f"[groups/leave] 错误: JSON解析失败 - {e}")
+                print(f"[groups/leave] 请求体内容: {body_bytes.decode('utf-8', errors='ignore')}")
+                return JSONResponse({
+                    "code": 400,
+                    "message": "请求数据格式错误，无法解析JSON"
+                }, status_code=400)
+                
+        except ClientDisconnect:
+            print("[groups/leave] 错误: 客户端断开连接")
+            print(f"[groups/leave] 调试信息 - Content-Type: {content_type}, Content-Length: {content_length}")
+            app_logger.warning("[groups/leave] 客户端在请求完成前断开连接")
+            return JSONResponse({
+                "code": 400,
+                "message": "客户端断开连接，请检查请求数据是否正确发送"
+            }, status_code=400)
+        except Exception as e:
+            print(f"[groups/leave] 读取请求体时发生异常: {type(e).__name__} - {e}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[groups/leave] 错误堆栈: {traceback_str}")
+            return JSONResponse({
+                "code": 400,
+                "message": f"读取请求数据失败: {str(e)}"
+            }, status_code=400)
+        
+        print(f"[groups/leave] 原始数据: {json.dumps(data, ensure_ascii=False, indent=2)}")
+        
+        group_id = data.get('group_id')
+        user_id = data.get('user_id')
+        
+        print(f"[groups/leave] 解析结果 - group_id: {group_id}, user_id: {user_id}")
+        
+        # 参数验证
+        if not group_id:
+            print("[groups/leave] 错误: 缺少 group_id")
+            return JSONResponse({
+                "code": 400,
+                "message": "缺少必需参数 group_id"
+            }, status_code=400)
+        
+        if not user_id:
+            print("[groups/leave] 错误: 缺少 user_id")
+            return JSONResponse({
+                "code": 400,
+                "message": "缺少必需参数 user_id"
+            }, status_code=400)
+        
+        print("[groups/leave] 开始连接数据库...")
+        connection = get_db_connection()
+        if connection is None or not connection.is_connected():
+            print("[groups/leave] 错误: 数据库连接失败")
+            app_logger.error("[groups/leave] 数据库连接失败")
+            return JSONResponse({
+                "code": 500,
+                "message": "数据库连接失败"
+            }, status_code=500)
+        print("[groups/leave] 数据库连接成功")
+        
+        cursor = None
+        try:
+            cursor = connection.cursor(dictionary=True)
+            
+            # 1. 检查群组是否存在
+            print(f"[groups/leave] 检查群组 {group_id} 是否存在...")
+            cursor.execute("SELECT group_id, group_name, member_num FROM `groups` WHERE group_id = %s", (group_id,))
+            group_info = cursor.fetchone()
+            
+            if not group_info:
+                print(f"[groups/leave] 错误: 群组 {group_id} 不存在")
+                return JSONResponse({
+                    "code": 404,
+                    "message": "群组不存在"
+                }, status_code=404)
+            
+            print(f"[groups/leave] 群组信息: {group_info}")
+            
+            # 2. 检查用户是否在群组中
+            print(f"[groups/leave] 检查用户 {user_id} 是否在群组 {group_id} 中...")
+            cursor.execute(
+                "SELECT group_id, user_id, self_role FROM `group_members` WHERE group_id = %s AND user_id = %s",
+                (group_id, user_id)
+            )
+            member_info = cursor.fetchone()
+            
+            if not member_info:
+                print(f"[groups/leave] 错误: 用户 {user_id} 不在群组 {group_id} 中")
+                return JSONResponse({
+                    "code": 400,
+                    "message": "您不在该群组中"
+                }, status_code=400)
+            
+            print(f"[groups/leave] 成员信息: {member_info}")
+            self_role = member_info.get('self_role', 200)
+            
+            # 3. 检查是否是群主（self_role = 400 表示群主）
+            if self_role == 400:
+                print(f"[groups/leave] 警告: 用户 {user_id} 是群主，不允许直接退出")
+                # 可以选择不允许群主退出，或者允许退出（这里选择允许退出）
+                # 如果需要不允许群主退出，可以取消下面的注释并返回错误
+                # return JSONResponse({
+                #     "code": 400,
+                #     "message": "群主不能直接退出群组，请先转移群主权限"
+                # }, status_code=400)
+            
+            # 4. 从群组中删除该成员
+            print(f"[groups/leave] 从群组 {group_id} 中删除用户 {user_id}...")
+            cursor.execute(
+                "DELETE FROM `group_members` WHERE group_id = %s AND user_id = %s",
+                (group_id, user_id)
+            )
+            affected_rows = cursor.rowcount
+            print(f"[groups/leave] 删除成员完成, 影响行数: {affected_rows}")
+            
+            if affected_rows == 0:
+                print(f"[groups/leave] 警告: 删除操作未影响任何行")
+                return JSONResponse({
+                    "code": 500,
+                    "message": "退出群组失败"
+                }, status_code=500)
+            
+            # 5. 更新群组的成员数量（确保不会小于0）
+            print(f"[groups/leave] 更新群组 {group_id} 的成员数量...")
+            cursor.execute(
+                "UPDATE `groups` SET member_num = GREATEST(member_num - 1, 0) WHERE group_id = %s",
+                (group_id,)
+            )
+            print(f"[groups/leave] 群组成员数量已更新")
+            
+            # 提交事务
+            connection.commit()
+            print(f"[groups/leave] 事务提交成功")
+            
+            result = {
+                "code": 200,
+                "message": "成功退出群组",
+                "data": {
+                    "group_id": group_id,
+                    "user_id": user_id
+                }
+            }
+            
+            print(f"[groups/leave] 返回结果: {result}")
+            print("=" * 80)
+            
+            return JSONResponse(result, status_code=200)
+            
+        except mysql.connector.Error as e:
+            connection.rollback()
+            error_msg = f"数据库错误: {e}"
+            print(f"[groups/leave] {error_msg}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[groups/leave] 错误堆栈: {traceback_str}")
+            app_logger.error(f"[groups/leave] {error_msg}\n{traceback_str}")
+            return JSONResponse({
+                "code": 500,
+                "message": f"数据库操作失败: {str(e)}"
+            }, status_code=500)
+        except Exception as e:
+            connection.rollback()
+            error_msg = f"退出群组时发生异常: {e}"
+            print(f"[groups/leave] {error_msg}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[groups/leave] 错误堆栈: {traceback_str}")
+            app_logger.error(f"[groups/leave] {error_msg}\n{traceback_str}")
+            return JSONResponse({
+                "code": 500,
+                "message": f"操作失败: {str(e)}"
+            }, status_code=500)
+        finally:
+            if cursor:
+                cursor.close()
+                print("[groups/leave] 游标已关闭")
+            if connection and connection.is_connected():
+                connection.close()
+                print("[groups/leave] 数据库连接已关闭")
+                app_logger.info("[groups/leave] Database connection closed after leave group attempt.")
+    
+    except Exception as e:
+        error_msg = f"解析请求数据时出错: {e}"
+        print(f"[groups/leave] {error_msg}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[groups/leave] 错误堆栈: {traceback_str}")
+        app_logger.error(f"[groups/leave] {error_msg}\n{traceback_str}")
         return JSONResponse({
             "code": 400,
             "message": "请求数据格式错误"
