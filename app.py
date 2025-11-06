@@ -3495,6 +3495,238 @@ async def leave_group(request: Request):
     finally:
         print("=" * 80)
 
+@app.post("/groups/dismiss")
+async def dismiss_group(request: Request):
+    """
+    解散群组
+    接收客户端发送的 group_id, user_id
+    只有群主才能解散群组
+    删除群组的所有成员和群组本身
+    """
+    print("=" * 80)
+    print("[groups/dismiss] 收到解散群组请求")
+    
+    # 打印请求头信息用于调试
+    content_type = request.headers.get("content-type", "")
+    content_length = request.headers.get("content-length", "")
+    print(f"[groups/dismiss] 请求头 - Content-Type: {content_type}, Content-Length: {content_length}")
+    
+    try:
+        # 解析请求体JSON数据
+        try:
+            # 先尝试读取原始body
+            body_bytes = await request.body()
+            print(f"[groups/dismiss] 读取到请求体长度: {len(body_bytes)} 字节")
+            
+            if not body_bytes:
+                print("[groups/dismiss] 错误: 请求体为空")
+                return JSONResponse({
+                    "code": 400,
+                    "message": "请求体不能为空"
+                }, status_code=400)
+            
+            # 解析JSON
+            try:
+                data = json.loads(body_bytes.decode('utf-8'))
+            except json.JSONDecodeError as e:
+                print(f"[groups/dismiss] 错误: JSON解析失败 - {e}")
+                print(f"[groups/dismiss] 请求体内容: {body_bytes.decode('utf-8', errors='ignore')}")
+                return JSONResponse({
+                    "code": 400,
+                    "message": "请求数据格式错误，无法解析JSON"
+                }, status_code=400)
+                
+        except ClientDisconnect:
+            print("[groups/dismiss] 错误: 客户端断开连接")
+            print(f"[groups/dismiss] 调试信息 - Content-Type: {content_type}, Content-Length: {content_length}")
+            app_logger.warning("[groups/dismiss] 客户端在请求完成前断开连接")
+            return JSONResponse({
+                "code": 400,
+                "message": "客户端断开连接，请检查请求数据是否正确发送"
+            }, status_code=400)
+        except Exception as e:
+            print(f"[groups/dismiss] 读取请求体时发生异常: {type(e).__name__} - {e}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[groups/dismiss] 错误堆栈: {traceback_str}")
+            return JSONResponse({
+                "code": 400,
+                "message": f"读取请求数据失败: {str(e)}"
+            }, status_code=400)
+        
+        print(f"[groups/dismiss] 原始数据: {json.dumps(data, ensure_ascii=False, indent=2)}")
+        
+        group_id = data.get('group_id')
+        user_id = data.get('user_id')
+        
+        print(f"[groups/dismiss] 解析结果 - group_id: {group_id}, user_id: {user_id}")
+        
+        # 参数验证
+        if not group_id:
+            print("[groups/dismiss] 错误: 缺少 group_id")
+            return JSONResponse({
+                "code": 400,
+                "message": "缺少必需参数 group_id"
+            }, status_code=400)
+        
+        if not user_id:
+            print("[groups/dismiss] 错误: 缺少 user_id")
+            return JSONResponse({
+                "code": 400,
+                "message": "缺少必需参数 user_id"
+            }, status_code=400)
+        
+        print("[groups/dismiss] 开始连接数据库...")
+        connection = get_db_connection()
+        if connection is None or not connection.is_connected():
+            print("[groups/dismiss] 错误: 数据库连接失败")
+            app_logger.error("[groups/dismiss] 数据库连接失败")
+            return JSONResponse({
+                "code": 500,
+                "message": "数据库连接失败"
+            }, status_code=500)
+        print("[groups/dismiss] 数据库连接成功")
+        
+        cursor = None
+        try:
+            cursor = connection.cursor(dictionary=True)
+            
+            # 1. 检查群组是否存在
+            print(f"[groups/dismiss] 检查群组 {group_id} 是否存在...")
+            cursor.execute("SELECT group_id, group_name, member_num FROM `groups` WHERE group_id = %s", (group_id,))
+            group_info = cursor.fetchone()
+            
+            if not group_info:
+                print(f"[groups/dismiss] 错误: 群组 {group_id} 不存在")
+                return JSONResponse({
+                    "code": 404,
+                    "message": "群组不存在"
+                }, status_code=404)
+            
+            print(f"[groups/dismiss] 群组信息: {group_info}")
+            group_name = group_info.get('group_name', '')
+            
+            # 2. 检查用户是否在群组中，并且是否是群主
+            print(f"[groups/dismiss] 检查用户 {user_id} 是否是群组 {group_id} 的群主...")
+            cursor.execute(
+                "SELECT group_id, user_id, self_role FROM `group_members` WHERE group_id = %s AND user_id = %s",
+                (group_id, user_id)
+            )
+            member_info = cursor.fetchone()
+            
+            if not member_info:
+                print(f"[groups/dismiss] 错误: 用户 {user_id} 不在群组 {group_id} 中")
+                return JSONResponse({
+                    "code": 403,
+                    "message": "您不是该群组的成员"
+                }, status_code=403)
+            
+            print(f"[groups/dismiss] 成员信息: {member_info}")
+            self_role = member_info.get('self_role', 200)
+            
+            # 3. 检查是否是群主（self_role = 400 表示群主）
+            if self_role != 400:
+                print(f"[groups/dismiss] 错误: 用户 {user_id} 不是群主，无权解散群组")
+                return JSONResponse({
+                    "code": 403,
+                    "message": "只有群主才能解散群组"
+                }, status_code=403)
+            
+            print(f"[groups/dismiss] 验证通过: 用户 {user_id} 是群主，可以解散群组")
+            
+            # 4. 删除群组的所有成员
+            print(f"[groups/dismiss] 删除群组 {group_id} 的所有成员...")
+            cursor.execute(
+                "DELETE FROM `group_members` WHERE group_id = %s",
+                (group_id,)
+            )
+            deleted_members = cursor.rowcount
+            print(f"[groups/dismiss] 已删除 {deleted_members} 个成员")
+            
+            # 5. 删除群组本身
+            print(f"[groups/dismiss] 删除群组 {group_id}...")
+            cursor.execute(
+                "DELETE FROM `groups` WHERE group_id = %s",
+                (group_id,)
+            )
+            deleted_groups = cursor.rowcount
+            print(f"[groups/dismiss] 删除群组完成, 影响行数: {deleted_groups}")
+            
+            if deleted_groups == 0:
+                print(f"[groups/dismiss] 警告: 删除群组操作未影响任何行")
+                connection.rollback()
+                return JSONResponse({
+                    "code": 500,
+                    "message": "解散群组失败"
+                }, status_code=500)
+            
+            # 提交事务
+            connection.commit()
+            print(f"[groups/dismiss] 事务提交成功")
+            
+            result = {
+                "code": 200,
+                "message": "成功解散群组",
+                "data": {
+                    "group_id": group_id,
+                    "group_name": group_name,
+                    "user_id": user_id,
+                    "deleted_members": deleted_members
+                }
+            }
+            
+            print(f"[groups/dismiss] 返回结果: {result}")
+            print("=" * 80)
+            
+            return JSONResponse(result, status_code=200)
+            
+        except mysql.connector.Error as e:
+            connection.rollback()
+            error_msg = f"数据库错误: {e}"
+            print(f"[groups/dismiss] {error_msg}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[groups/dismiss] 错误堆栈: {traceback_str}")
+            app_logger.error(f"[groups/dismiss] {error_msg}\n{traceback_str}")
+            return JSONResponse({
+                "code": 500,
+                "message": f"数据库操作失败: {str(e)}"
+            }, status_code=500)
+        except Exception as e:
+            connection.rollback()
+            error_msg = f"解散群组时发生异常: {e}"
+            print(f"[groups/dismiss] {error_msg}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[groups/dismiss] 错误堆栈: {traceback_str}")
+            app_logger.error(f"[groups/dismiss] {error_msg}\n{traceback_str}")
+            return JSONResponse({
+                "code": 500,
+                "message": f"操作失败: {str(e)}"
+            }, status_code=500)
+        finally:
+            if cursor:
+                cursor.close()
+                print("[groups/dismiss] 游标已关闭")
+            if connection and connection.is_connected():
+                connection.close()
+                print("[groups/dismiss] 数据库连接已关闭")
+                app_logger.info("[groups/dismiss] Database connection closed after dismiss group attempt.")
+    
+    except Exception as e:
+        error_msg = f"解析请求数据时出错: {e}"
+        print(f"[groups/dismiss] {error_msg}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[groups/dismiss] 错误堆栈: {traceback_str}")
+        app_logger.error(f"[groups/dismiss] {error_msg}\n{traceback_str}")
+        return JSONResponse({
+            "code": 400,
+            "message": "请求数据格式错误"
+        }, status_code=400)
+    finally:
+        print("=" * 80)
+
 @app.get("/groups/members")
 def get_group_members_by_group_id(
     group_id: str = Query(..., description="群组ID，对应groups表的group_id")
