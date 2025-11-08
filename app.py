@@ -1512,6 +1512,9 @@ async def get_classes_by_prefix(request: Request):
         SELECT class_code, school_stage, grade, class_name, remark, created_at
         FROM ta_classes
         WHERE LEFT(class_code, 6) = %s
+          AND NOT EXISTS (
+            SELECT 1 FROM `groups` WHERE classid = ta_classes.class_code
+          )
         """
         cursor.execute(sql, (prefix,))
         results = cursor.fetchall()
@@ -4152,7 +4155,7 @@ async def sync_groups(request: Request):
                         # 构建 UPDATE SQL，只更新非空字段
                         update_fields = [
                             "group_name = %s", "group_type = %s", "face_url = %s", "detail_face_url = %s",
-                            "owner_identifier = %s", "create_time = %s", "max_member_num = %s",
+                            "create_time = %s", "max_member_num = %s",
                             "member_num = %s", "introduction = %s", "notification = %s", "searchable = %s",
                             "visible = %s", "add_option = %s", "is_shutup_all = %s", "next_msg_seq = %s",
                             "latest_seq = %s", "last_msg_time = %s", "last_info_time = %s",
@@ -4165,7 +4168,6 @@ async def sync_groups(request: Request):
                             group.get('group_type'),
                             group.get('face_url'),
                             group.get('detail_face_url'),
-                            group.get('owner_identifier'),
                             create_time_dt,
                             group.get('max_member_num'),
                             group.get('member_num'),
@@ -4187,6 +4189,15 @@ async def sync_groups(request: Request):
                             group.get('detail_is_shutup_all'),
                             group.get('online_member_num')
                         ]
+                        
+                        # 只有当 owner_identifier 不为空时才添加到更新语句中
+                        owner_identifier = group.get('owner_identifier')
+                        if not is_empty(owner_identifier):
+                            update_fields.append("owner_identifier = %s")
+                            update_params.append(owner_identifier)
+                            print(f"[groups/sync] 将更新 owner_identifier: {owner_identifier}")
+                        else:
+                            print(f"[groups/sync] owner_identifier 为空，跳过更新")
                         
                         # 只有当 classid 和 schoolid 不为空时才添加到更新语句中
                         if not is_empty(group_classid):
@@ -4390,7 +4401,96 @@ async def sync_groups(request: Request):
                             lastrowid = cursor.lastrowid
                             print(f"[groups/sync] 插入成员完成, 影响行数: {affected_rows}, lastrowid: {lastrowid}")
                     else:
-                        print(f"[groups/sync] 群组 {group_id} 没有成员信息")
+                        # 如果没有成员信息，从 owner_identifier 获取群主信息并插入
+                        print(f"[groups/sync] 群组 {group_id} 没有成员信息，尝试从 owner_identifier 获取群主信息")
+                        owner_identifier = group.get('owner_identifier')
+                        if owner_identifier:
+                            print(f"[groups/sync] 群组 {group_id} 的 owner_identifier: {owner_identifier}")
+                            # 从 ta_teacher 表查询群主姓名
+                            cursor.execute(
+                                "SELECT name FROM ta_teacher WHERE teacher_unique_id = %s",
+                                (owner_identifier,)
+                            )
+                            teacher_result = cursor.fetchone()
+                            if teacher_result:
+                                # groups/sync 接口使用普通游标，返回元组格式
+                                teacher_name = teacher_result[0]
+                                print(f"[groups/sync] 从 ta_teacher 表获取到群主姓名: {teacher_name}")
+                                
+                                # 检查该成员是否已存在
+                                cursor.execute(
+                                    "SELECT group_id FROM `group_members` WHERE group_id = %s AND user_id = %s",
+                                    (group_id, owner_identifier)
+                                )
+                                member_exists = cursor.fetchone()
+                                
+                                if member_exists:
+                                    # 更新群主信息（兼容已有的更新方法）
+                                    print(f"[groups/sync] 更新群主信息 group_id={group_id}, user_id={owner_identifier}...")
+                                    
+                                    # 检查值是否为空（兼容已有的 is_empty 函数逻辑）
+                                    def is_empty(value):
+                                        return value is None or value == '' or (isinstance(value, str) and value.strip() == '')
+                                    
+                                    # 构建 UPDATE SQL，如果字段为空则不更新（兼容已有的更新逻辑）
+                                    update_fields = [
+                                        "self_role = %s"
+                                    ]
+                                    update_params = [
+                                        400  # self_role (群主)
+                                    ]
+                                    
+                                    # 如果 user_name 不为空，则更新该字段；为空则跳过更新（兼容已有的更新逻辑）
+                                    if not is_empty(teacher_name):
+                                        update_fields.append("user_name = %s")
+                                        update_params.append(teacher_name)
+                                        print(f"[groups/sync] 将更新 user_name: {teacher_name}")
+                                    else:
+                                        print(f"[groups/sync] user_name 为空，跳过更新该字段")
+                                    
+                                    update_params.extend([group_id, owner_identifier])  # WHERE 条件参数
+                                    
+                                    update_owner_sql = f"""
+                                        UPDATE `group_members` SET
+                                            {', '.join(update_fields)}
+                                        WHERE group_id = %s AND user_id = %s
+                                    """
+                                    update_owner_params = tuple(update_params)
+                                    print(f"[groups/sync] 更新群主参数: {update_owner_params}")
+                                    cursor.execute(update_owner_sql, update_owner_params)
+                                    affected_rows = cursor.rowcount
+                                    print(f"[groups/sync] 更新群主完成, 影响行数: {affected_rows}")
+                                else:
+                                    # 插入群主信息到 group_members 表（兼容已有的插入方法）
+                                    insert_owner_sql = """
+                                        INSERT INTO `group_members` (
+                                            group_id, user_id, user_name, self_role, join_time, msg_flag,
+                                            self_msg_flag, readed_seq, unread_num
+                                        ) VALUES (
+                                            %s, %s, %s, %s, %s, %s, %s, %s, %s
+                                        )
+                                    """
+                                    insert_owner_params = (
+                                        group_id,
+                                        owner_identifier,  # user_id
+                                        teacher_name,  # user_name
+                                        400,  # self_role (群主)
+                                        None,  # join_time
+                                        None,  # msg_flag
+                                        None,  # self_msg_flag
+                                        None,  # readed_seq
+                                        None   # unread_num
+                                    )
+                                    print(f"[groups/sync] 插入群主信息: group_id={group_id}, user_id={owner_identifier}, user_name={teacher_name}, self_role=400")
+                                    print(f"[groups/sync] 插入群主参数: {insert_owner_params}")
+                                    cursor.execute(insert_owner_sql, insert_owner_params)
+                                    affected_rows = cursor.rowcount
+                                    lastrowid = cursor.lastrowid
+                                    print(f"[groups/sync] 插入群主完成, 影响行数: {affected_rows}, lastrowid: {lastrowid}")
+                            else:
+                                print(f"[groups/sync] 警告: 在 ta_teacher 表中未找到 teacher_unique_id={owner_identifier} 的记录")
+                        else:
+                            print(f"[groups/sync] 群组 {group_id} 没有 owner_identifier 字段")
                     
                     success_count += 1
                     print(f"[groups/sync] 群组 {group_id} 处理成功")
