@@ -1603,6 +1603,7 @@ def generate_teacher_unique_id(school_id):
     """
     并发安全生成 teacher_unique_id
     格式：前6位为schoolId（左补零），后4位为流水号（左补零），总长度10位
+    返回字符串类型
     """
     connection = get_db_connection()
     if connection is None:
@@ -1612,20 +1613,23 @@ def generate_teacher_unique_id(school_id):
         cursor = connection.cursor()
         connection.start_transaction()
         cursor.execute("""
-            SELECT MAX(teacher_unique_id)
+            SELECT teacher_unique_id
             FROM ta_teacher
             WHERE schoolId = %s
+            ORDER BY CAST(teacher_unique_id AS UNSIGNED) DESC
+            LIMIT 1
             FOR UPDATE
         """, (school_id,))
         result = cursor.fetchone()
         if result and result[0]:
+            # teacher_unique_id 现在是字符串类型，格式为10位数字字符串
             max_id_str = str(result[0]).zfill(10)
             last_num = int(max_id_str[6:])
             new_num = last_num + 1
         else:
             new_num = 1
         teacher_unique_id_str = f"{str(school_id).zfill(6)}{str(new_num).zfill(4)}"
-        return int(teacher_unique_id_str)
+        return teacher_unique_id_str
     except Error as e:
         app_logger.error(f"Error generating teacher_unique_id: {e}")
         return None
