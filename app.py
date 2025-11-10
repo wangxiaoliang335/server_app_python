@@ -1624,6 +1624,114 @@ async def list_userInfo(request: Request):
             connection.close()
             app_logger.info("Database connection closed after fetching userinfo.")
 
+def generate_class_code(connection, schoolid):
+    """
+    生成唯一的班级编号 class_code
+    格式：前6位是 schoolid（左补零），后3位是流水号（左补零），总长度9位
+    例如：如果 schoolid=123456，流水号=1，则 class_code=123456001
+    
+    优先重用被删除的编号（从1开始查找最小的未使用流水号）
+    如果1-999都被使用，则使用最大流水号+1
+    """
+    if not schoolid:
+        app_logger.error("generate_class_code: schoolid 不能为空")
+        return None
+    
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        
+        # 将 schoolid 转换为字符串并左补零到6位
+        schoolid_str = str(schoolid).zfill(6)
+        if len(schoolid_str) > 6:
+            # 如果超过6位，取前6位
+            schoolid_str = schoolid_str[:6]
+        
+        # 查询该 schoolid 下所有已使用的流水号（1-999范围内）
+        cursor.execute("""
+            SELECT CAST(SUBSTRING(class_code, 7) AS UNSIGNED) AS sequence_num
+            FROM ta_classes
+            WHERE class_code LIKE %s AND LENGTH(class_code) = 9
+            AND CAST(SUBSTRING(class_code, 7) AS UNSIGNED) BETWEEN 1 AND 999
+            ORDER BY sequence_num ASC
+        """, (f"{schoolid_str}%",))
+        
+        used_sequences = set()
+        for row in cursor.fetchall():
+            if row and row[0]:
+                try:
+                    used_sequences.add(int(row[0]))
+                except (ValueError, TypeError):
+                    pass
+        
+        # 查找最小的未使用流水号（从1开始）
+        new_sequence = None
+        for seq in range(1, 1000):  # 1-999
+            if seq not in used_sequences:
+                new_sequence = seq
+                break
+        
+        # 如果1-999都被使用，使用最大流水号+1
+        if new_sequence is None:
+            cursor.execute("""
+                SELECT CAST(SUBSTRING(class_code, 7) AS UNSIGNED) AS sequence_num
+                FROM ta_classes
+                WHERE class_code LIKE %s AND LENGTH(class_code) = 9
+                ORDER BY sequence_num DESC
+                LIMIT 1
+            """, (f"{schoolid_str}%",))
+            result = cursor.fetchone()
+            if result and result[0]:
+                try:
+                    max_sequence = int(result[0])
+                    new_sequence = max_sequence + 1
+                except (ValueError, TypeError):
+                    new_sequence = 1
+            else:
+                new_sequence = 1
+        
+        # 检查流水号是否超过999
+        if new_sequence > 999:
+            app_logger.error(f"generate_class_code: schoolid {schoolid_str} 的流水号已超过999")
+            return None
+        
+        # 将流水号左补零到3位
+        sequence_str = str(new_sequence).zfill(3)
+        
+        # 组合成 class_code（9位：6位schoolid + 3位流水号）
+        class_code = f"{schoolid_str}{sequence_str}"
+        
+        # 再次检查是否已存在（防止并发问题）
+        cursor.execute("SELECT class_code FROM ta_classes WHERE class_code = %s", (class_code,))
+        if cursor.fetchone() is not None:
+            # 如果已存在，尝试下一个未使用的流水号
+            for seq in range(new_sequence + 1, 1000):
+                if seq not in used_sequences:
+                    new_sequence = seq
+                    sequence_str = str(new_sequence).zfill(3)
+                    class_code = f"{schoolid_str}{sequence_str}"
+                    # 再次检查
+                    cursor.execute("SELECT class_code FROM ta_classes WHERE class_code = %s", (class_code,))
+                    if cursor.fetchone() is None:
+                        break
+            else:
+                # 如果都冲突，使用最大+1
+                app_logger.warning(f"generate_class_code: 所有流水号都被使用，使用最大+1")
+                new_sequence = max(used_sequences) + 1 if used_sequences else 1
+                if new_sequence > 999:
+                    app_logger.error(f"generate_class_code: schoolid {schoolid_str} 的流水号已超过999（并发冲突）")
+                    return None
+                sequence_str = str(new_sequence).zfill(3)
+                class_code = f"{schoolid_str}{sequence_str}"
+        
+        return class_code
+    except Error as e:
+        app_logger.error(f"Error generating class_code: {e}")
+        return None
+    finally:
+        if cursor:
+            cursor.close()
+
 @app.post("/updateClasses")
 async def updateClasses(request: Request):
     data_list = await request.json()
@@ -1638,34 +1746,434 @@ async def updateClasses(request: Request):
         cursor = connection.cursor()
         sql = """
         INSERT INTO ta_classes (
-            class_code, school_stage, grade, class_name, remark, created_at
-        ) VALUES (%s, %s, %s, %s, %s, NOW())
+            class_code, school_stage, grade, class_name, remark, schoolid, created_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, NOW())
         ON DUPLICATE KEY UPDATE
             school_stage = VALUES(school_stage),
             grade        = VALUES(grade),
             class_name   = VALUES(class_name),
             remark       = VALUES(remark),
+            schoolid     = VALUES(schoolid),
             created_at   = VALUES(created_at);
         """
         values = []
+        result_list = []  # 用于返回完整的列表
+        
+        # 用于跟踪每个 schoolid 的流水号（批量处理时避免重复）
+        schoolid_sequence_map = {}  # {schoolid: current_sequence}
+        
         for item in data_list:
-            if not item.get('class_code'):
-                continue
+            class_code = item.get('class_code')
+            schoolid = item.get('schoolid')  # 从上传的数据中获取 schoolid
+            
+            # 如果 class_code 为空，则生成新的唯一编号
+            if not class_code or class_code.strip() == '':
+                # 如果 schoolid 也为空，无法生成 class_code
+                if not schoolid or str(schoolid).strip() == '':
+                    app_logger.error(f"生成 class_code 失败：缺少 schoolid，跳过该班级: {item}")
+                    continue
+                
+                # 确保 schoolid 格式正确
+                schoolid_str = str(schoolid).zfill(6)[:6]
+                
+                # 如果是第一次遇到这个 schoolid，查询数据库中所有已使用的流水号
+                if schoolid_str not in schoolid_sequence_map:
+                    try:
+                        check_cursor = connection.cursor()
+                        # 查询所有已使用的流水号（1-999范围内）
+                        check_cursor.execute("""
+                            SELECT CAST(SUBSTRING(class_code, 7) AS UNSIGNED) AS sequence_num
+                            FROM ta_classes
+                            WHERE class_code LIKE %s AND LENGTH(class_code) = 9
+                            AND CAST(SUBSTRING(class_code, 7) AS UNSIGNED) BETWEEN 1 AND 999
+                            ORDER BY sequence_num ASC
+                        """, (f"{schoolid_str}%",))
+                        
+                        used_sequences = set()
+                        for row in check_cursor.fetchall():
+                            if row and row[0]:
+                                try:
+                                    used_sequences.add(int(row[0]))
+                                except (ValueError, TypeError):
+                                    pass
+                        
+                        # 存储已使用的流水号集合，用于查找最小的未使用流水号
+                        schoolid_sequence_map[schoolid_str] = {
+                            'used': used_sequences,
+                            'next': 1  # 下一个要尝试的流水号
+                        }
+                        check_cursor.close()
+                    except Exception as e:
+                        app_logger.error(f"查询 schoolid {schoolid_str} 的已使用流水号失败: {e}")
+                        schoolid_sequence_map[schoolid_str] = {
+                            'used': set(),
+                            'next': 1
+                        }
+                
+                # 查找最小的未使用流水号
+                seq_info = schoolid_sequence_map[schoolid_str]
+                used_sequences = seq_info['used']
+                next_seq = seq_info['next']
+                
+                # 从 next_seq 开始查找未使用的流水号
+                new_sequence = None
+                for seq in range(next_seq, 1000):  # 从 next_seq 到 999
+                    if seq not in used_sequences:
+                        new_sequence = seq
+                        # 更新下一个要尝试的流水号
+                        seq_info['next'] = seq + 1
+                        # 将该流水号标记为已使用（在当前批量处理中）
+                        used_sequences.add(seq)
+                        break
+                
+                # 如果从 next_seq 到 999 都被使用，从1开始查找
+                if new_sequence is None:
+                    for seq in range(1, next_seq):
+                        if seq not in used_sequences:
+                            new_sequence = seq
+                            seq_info['next'] = seq + 1
+                            used_sequences.add(seq)
+                            break
+                
+                # 如果1-999都被使用，使用最大流水号+1
+                if new_sequence is None:
+                    try:
+                        check_cursor = connection.cursor()
+                        check_cursor.execute("""
+                            SELECT CAST(SUBSTRING(class_code, 7) AS UNSIGNED) AS sequence_num
+                            FROM ta_classes
+                            WHERE class_code LIKE %s AND LENGTH(class_code) = 9
+                            ORDER BY sequence_num DESC
+                            LIMIT 1
+                        """, (f"{schoolid_str}%",))
+                        result = check_cursor.fetchone()
+                        if result and result[0]:
+                            try:
+                                max_sequence = int(result[0])
+                                new_sequence = max_sequence + 1
+                            except (ValueError, TypeError):
+                                new_sequence = 1
+                        else:
+                            new_sequence = 1
+                        check_cursor.close()
+                    except Exception as e:
+                        app_logger.error(f"查询 schoolid {schoolid_str} 的最大流水号失败: {e}")
+                        new_sequence = 1
+                    
+                    # 更新下一个要尝试的流水号
+                    seq_info['next'] = new_sequence + 1
+                    used_sequences.add(new_sequence)
+                
+                # 检查流水号是否超过999
+                if new_sequence > 999:
+                    app_logger.error(f"生成 class_code 失败：schoolid {schoolid_str} 的流水号已超过999")
+                    continue
+                
+                # 生成 class_code
+                sequence_str = str(new_sequence).zfill(3)
+                class_code = f"{schoolid_str}{sequence_str}"
+                
+                # 再次检查是否已存在（防止并发问题）
+                try:
+                    check_cursor = connection.cursor()
+                    check_cursor.execute("SELECT class_code FROM ta_classes WHERE class_code = %s", (class_code,))
+                    if check_cursor.fetchone() is not None:
+                        # 如果已存在，标记为已使用，并查找下一个未使用的流水号
+                        used_sequences.add(new_sequence)
+                        # 从下一个流水号开始查找
+                        for seq in range(new_sequence + 1, 1000):
+                            if seq not in used_sequences:
+                                new_sequence = seq
+                                seq_info['next'] = seq + 1
+                                used_sequences.add(seq)
+                                sequence_str = str(new_sequence).zfill(3)
+                                class_code = f"{schoolid_str}{sequence_str}"
+                                # 再次检查
+                                check_cursor.execute("SELECT class_code FROM ta_classes WHERE class_code = %s", (class_code,))
+                                if check_cursor.fetchone() is None:
+                                    break
+                        else:
+                            # 如果都冲突，使用最大+1
+                            app_logger.warning(f"生成 class_code 时所有流水号都冲突，使用最大+1")
+                            max_used = max(used_sequences) if used_sequences else 0
+                            new_sequence = max_used + 1
+                            if new_sequence > 999:
+                                app_logger.error(f"生成 class_code 失败：schoolid {schoolid_str} 的流水号已超过999（并发冲突）")
+                                check_cursor.close()
+                                continue
+                            seq_info['next'] = new_sequence + 1
+                            used_sequences.add(new_sequence)
+                            sequence_str = str(new_sequence).zfill(3)
+                            class_code = f"{schoolid_str}{sequence_str}"
+                    check_cursor.close()
+                except Exception as e:
+                    app_logger.warning(f"检查 class_code 是否存在时出错: {e}")
+                
+                # 更新 item 中的 class_code，以便返回给客户端
+                item['class_code'] = class_code
+                print(f"[updateClasses] 为班级生成新的 class_code: {class_code}, schoolid: {schoolid_str}, sequence: {new_sequence}")
+            
+            # 如果 class_code 已存在，从 class_code 的前六位提取作为 schoolid（如果 schoolid 为空）
+            if not schoolid or str(schoolid).strip() == '':
+                schoolid = class_code[:6] if len(class_code) >= 6 else class_code
+            else:
+                # 确保 schoolid 是字符串格式
+                schoolid = str(schoolid).zfill(6)[:6]
+            
             values.append((
-                item.get('class_code'),
+                class_code,
                 item.get('school_stage'),
                 item.get('grade'),
                 item.get('class_name'),
-                item.get('remark')
+                item.get('remark'),
+                schoolid
             ))
+            
+            # 添加到结果列表（包含生成的 class_code）
+            result_list.append({
+                'class_code': class_code,
+                'school_stage': item.get('school_stage'),
+                'grade': item.get('grade'),
+                'class_name': item.get('class_name'),
+                'remark': item.get('remark'),
+                'schoolid': schoolid
+            })
+        
         if values:
             cursor.executemany(sql, values)
             connection.commit()
+            print(f"[updateClasses] 批量插入/更新完成，共处理 {len(values)} 条记录")
+        
         cursor.close()
         connection.close()
-        return safe_json_response({'data': {'message': '批量插入/更新完成', 'code': 200, 'count': len(values)}})
+        
+        response_data = {
+            'data': {
+                'message': '批量插入/更新完成', 
+                'code': 200, 
+                'count': len(result_list),
+                'classes': result_list  # 返回完整的列表，包括生成的 class_code
+            }
+        }
+        
+        # 打印返回的 JSON 结果
+        try:
+            response_json = json.dumps(response_data, ensure_ascii=False, indent=2)
+            print(f"[updateClasses] 返回的 JSON 结果:\n{response_json}")
+            app_logger.info(f"[updateClasses] 返回的 JSON 结果: {json.dumps(response_data, ensure_ascii=False)}")
+        except Exception as json_error:
+            print(f"[updateClasses] 打印 JSON 时出错: {json_error}")
+            app_logger.warning(f"[updateClasses] 打印 JSON 时出错: {json_error}")
+        
+        return safe_json_response(response_data)
     except Error as e:
+        if connection:
+            connection.rollback()
+        app_logger.error(f"Database error during updateClasses: {e}")
         return JSONResponse({'data': {'message': f'数据库操作失败: {e}', 'code': 500}}, status_code=500)
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        app_logger.error(f"Unexpected error during updateClasses: {e}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        app_logger.error(f"Error stack: {traceback_str}")
+        return JSONResponse({'data': {'message': f'操作失败: {str(e)}', 'code': 500}}, status_code=500)
+
+
+@app.post("/deleteClasses")
+async def delete_classes(request: Request):
+    """
+    删除班级接口
+    接收班级编号列表，从 ta_classes 表中删除对应的班级
+    删除后，系统唯一班级编号会被收回（可以重新使用）
+    """
+    print("=" * 80)
+    print("[deleteClasses] 收到删除班级请求")
+    
+    try:
+        data = await request.json()
+        print(f"[deleteClasses] 原始数据: {json.dumps(data, ensure_ascii=False, indent=2)}")
+        
+        # 支持多种格式：
+        # 1. 数组格式：[{"class_code": "123456001", ...}, {"class_code": "123456002", ...}]
+        # 2. {"class_codes": ["123456001", "123456002"]} - 批量删除（字符串数组）
+        # 3. {"class_code": "123456001"} - 单个删除
+        class_codes = []
+        
+        if isinstance(data, list):
+            # 如果是数组格式，提取每个对象的 class_code
+            for item in data:
+                if isinstance(item, dict) and "class_code" in item:
+                    class_code = item.get("class_code")
+                    if class_code:
+                        class_codes.append(class_code)
+            print(f"[deleteClasses] 从数组格式中提取到 {len(class_codes)} 个 class_code")
+        elif isinstance(data, dict):
+            # 如果是对象格式
+            if "class_codes" in data and isinstance(data["class_codes"], list):
+                class_codes = data["class_codes"]
+            elif "class_code" in data:
+                class_codes = [data["class_code"]]
+            else:
+                print("[deleteClasses] 错误: 对象格式中缺少 class_code 或 class_codes 参数")
+                return JSONResponse({
+                    'data': {
+                        'message': '缺少必需参数 class_code 或 class_codes',
+                        'code': 400
+                    }
+                }, status_code=400)
+        else:
+            print("[deleteClasses] 错误: 请求数据格式不正确，应为数组或对象")
+            return JSONResponse({
+                'data': {
+                    'message': '请求数据格式不正确，应为数组或对象',
+                    'code': 400
+                }
+            }, status_code=400)
+        
+        if not class_codes:
+            print("[deleteClasses] 错误: class_codes 列表为空")
+            return JSONResponse({
+                'data': {
+                    'message': 'class_codes 列表不能为空',
+                    'code': 400
+                }
+            }, status_code=400)
+        
+        print(f"[deleteClasses] 准备删除 {len(class_codes)} 个班级: {class_codes}")
+        app_logger.info(f"[deleteClasses] 收到删除请求 - class_codes: {class_codes}")
+        
+        connection = get_db_connection()
+        if connection is None:
+            print("[deleteClasses] 错误: 数据库连接失败")
+            app_logger.error("[deleteClasses] 数据库连接失败")
+            return JSONResponse({
+                'data': {
+                    'message': '数据库连接失败',
+                    'code': 500
+                }
+            }, status_code=500)
+        
+        print("[deleteClasses] 数据库连接成功")
+        app_logger.info("[deleteClasses] 数据库连接成功")
+        
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            
+            # 先查询要删除的班级是否存在
+            placeholders = ','.join(['%s'] * len(class_codes))
+            check_sql = f"SELECT class_code, class_name FROM ta_classes WHERE class_code IN ({placeholders})"
+            cursor.execute(check_sql, tuple(class_codes))
+            existing_classes = cursor.fetchall()
+            
+            # 处理查询结果（可能是元组或列表）
+            existing_codes = []
+            if existing_classes:
+                for row in existing_classes:
+                    if isinstance(row, (tuple, list)):
+                        existing_codes.append(row[0])
+                    elif isinstance(row, dict):
+                        existing_codes.append(row.get('class_code'))
+                    else:
+                        existing_codes.append(str(row))
+            
+            not_found_codes = [code for code in class_codes if code not in existing_codes]
+            
+            print(f"[deleteClasses] 找到 {len(existing_codes)} 个班级，未找到 {len(not_found_codes)} 个")
+            app_logger.info(f"[deleteClasses] 查询结果 - 找到: {existing_codes}, 未找到: {not_found_codes}")
+            
+            if not existing_codes:
+                print("[deleteClasses] 未找到任何要删除的班级")
+                return JSONResponse({
+                    'data': {
+                        'message': '未找到要删除的班级',
+                        'code': 404,
+                        'deleted_count': 0,
+                        'not_found_codes': not_found_codes
+                    }
+                }, status_code=404)
+            
+            # 执行删除操作
+            delete_sql = f"DELETE FROM ta_classes WHERE class_code IN ({placeholders})"
+            cursor.execute(delete_sql, tuple(existing_codes))
+            deleted_count = cursor.rowcount
+            connection.commit()
+            
+            print(f"[deleteClasses] 删除完成，成功删除 {deleted_count} 个班级")
+            app_logger.info(f"[deleteClasses] 删除完成 - 成功删除 {deleted_count} 个班级，class_codes: {existing_codes}")
+            
+            result = {
+                'message': '删除班级成功',
+                'code': 200,
+                'deleted_count': deleted_count,
+                'deleted_codes': existing_codes
+            }
+            
+            if not_found_codes:
+                result['not_found_codes'] = not_found_codes
+                result['message'] = f'部分删除成功，{len(not_found_codes)} 个班级未找到'
+            
+            print(f"[deleteClasses] 返回结果: {result}")
+            print("=" * 80)
+            
+            return safe_json_response({'data': result})
+            
+        except mysql.connector.Error as e:
+            if connection:
+                connection.rollback()
+            error_msg = f"数据库错误: {e}"
+            print(f"[deleteClasses] {error_msg}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[deleteClasses] 错误堆栈: {traceback_str}")
+            app_logger.error(f"[deleteClasses] {error_msg}\n{traceback_str}")
+            return JSONResponse({
+                'data': {
+                    'message': f'数据库操作失败: {str(e)}',
+                    'code': 500
+                }
+            }, status_code=500)
+        except Exception as e:
+            if connection:
+                connection.rollback()
+            error_msg = f"删除班级时发生异常: {e}"
+            print(f"[deleteClasses] {error_msg}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[deleteClasses] 错误堆栈: {traceback_str}")
+            app_logger.error(f"[deleteClasses] {error_msg}\n{traceback_str}")
+            return JSONResponse({
+                'data': {
+                    'message': f'操作失败: {str(e)}',
+                    'code': 500
+                }
+            }, status_code=500)
+        finally:
+            if cursor:
+                cursor.close()
+                print("[deleteClasses] 游标已关闭")
+            if connection and connection.is_connected():
+                connection.close()
+                print("[deleteClasses] 数据库连接已关闭")
+                app_logger.info("[deleteClasses] 数据库连接已关闭")
+    
+    except Exception as e:
+        error_msg = f"解析请求数据时出错: {e}"
+        print(f"[deleteClasses] {error_msg}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[deleteClasses] 错误堆栈: {traceback_str}")
+        app_logger.error(f"[deleteClasses] {error_msg}\n{traceback_str}")
+        return JSONResponse({
+            'data': {
+                'message': '请求数据格式错误',
+                'code': 400
+            }
+        }, status_code=400)
+    finally:
+        print("=" * 80)
 
 
 @app.post("/getClassesByPrefix")
@@ -1682,12 +2190,9 @@ async def get_classes_by_prefix(request: Request):
     try:
         cursor = connection.cursor(dictionary=True)
         sql = """
-        SELECT class_code, school_stage, grade, class_name, remark, created_at
+        SELECT class_code, school_stage, grade, class_name, remark, schoolid, created_at
         FROM ta_classes
         WHERE LEFT(class_code, 6) = %s
-          AND NOT EXISTS (
-            SELECT 1 FROM `groups` WHERE classid = ta_classes.class_code
-          )
         """
         cursor.execute(sql, (prefix,))
         results = cursor.fetchall()
