@@ -4110,8 +4110,10 @@ async def leave_group(request: Request):
             
             # 5. 更新群组的成员数量（确保不会小于0）
             print(f"[groups/leave] 更新群组 {group_id} 的成员数量...")
+            # 使用 CASE 语句避免 UNSIGNED 类型溢出问题
+            # 当 member_num 为 0 时，member_num - 1 会导致 UNSIGNED 溢出错误
             cursor.execute(
-                "UPDATE `groups` SET member_num = GREATEST(member_num - 1, 0) WHERE group_id = %s",
+                "UPDATE `groups` SET member_num = CASE WHEN member_num > 0 THEN member_num - 1 ELSE 0 END WHERE group_id = %s",
                 (group_id,)
             )
             print(f"[groups/leave] 群组成员数量已更新")
@@ -4334,8 +4336,10 @@ async def remove_member(request: Request):
             
             # 5. 更新群组的成员数量（确保不会小于0）
             print(f"[groups/remove-member] 更新群组 {group_id} 的成员数量...")
+            # 使用 CASE 语句避免 UNSIGNED 类型溢出问题
+            # 当 member_num 为 0 时，member_num - 1 会导致 UNSIGNED 溢出错误
             cursor.execute(
-                "UPDATE `groups` SET member_num = GREATEST(member_num - 1, 0) WHERE group_id = %s",
+                "UPDATE `groups` SET member_num = CASE WHEN member_num > 0 THEN member_num - 1 ELSE 0 END WHERE group_id = %s",
                 (group_id,)
             )
             print(f"[groups/remove-member] 群组成员数量已更新")
@@ -4630,6 +4634,607 @@ async def dismiss_group(request: Request):
         traceback_str = traceback.format_exc()
         print(f"[groups/dismiss] 错误堆栈: {traceback_str}")
         app_logger.error(f"[groups/dismiss] {error_msg}\n{traceback_str}")
+        return JSONResponse({
+            "code": 400,
+            "message": "请求数据格式错误"
+        }, status_code=400)
+    finally:
+        print("=" * 80)
+
+@app.post("/groups/set_admin_role")
+async def set_admin_role(request: Request):
+    """
+    设置群成员角色（管理员或成员）
+    接收客户端发送的 group_id, user_id, role
+    更新 group_members 表中的 self_role 字段
+    角色映射: 群主=400, 管理员=300, 成员=1
+    role: "管理员" -> self_role = 300, "成员" -> self_role = 1
+    """
+    print("=" * 80)
+    print("[groups/set_admin_role] 收到设置管理员角色请求")
+    
+    # 打印请求头信息用于调试
+    content_type = request.headers.get("content-type", "")
+    content_length = request.headers.get("content-length", "")
+    print(f"[groups/set_admin_role] 请求头 - Content-Type: {content_type}, Content-Length: {content_length}")
+    
+    try:
+        # 解析请求体JSON数据
+        try:
+            # 先尝试读取原始body
+            body_bytes = await request.body()
+            print(f"[groups/set_admin_role] 读取到请求体长度: {len(body_bytes)} 字节")
+            
+            if not body_bytes:
+                print("[groups/set_admin_role] 错误: 请求体为空")
+                return JSONResponse({
+                    "code": 400,
+                    "message": "请求体不能为空"
+                }, status_code=400)
+            
+            # 解析JSON
+            try:
+                data = json.loads(body_bytes.decode('utf-8'))
+            except json.JSONDecodeError as e:
+                print(f"[groups/set_admin_role] 错误: JSON解析失败 - {e}")
+                print(f"[groups/set_admin_role] 请求体内容: {body_bytes.decode('utf-8', errors='ignore')}")
+                return JSONResponse({
+                    "code": 400,
+                    "message": "请求数据格式错误，无法解析JSON"
+                }, status_code=400)
+                
+        except ClientDisconnect:
+            print("[groups/set_admin_role] 错误: 客户端断开连接")
+            print(f"[groups/set_admin_role] 调试信息 - Content-Type: {content_type}, Content-Length: {content_length}")
+            app_logger.warning("[groups/set_admin_role] 客户端在请求完成前断开连接")
+            return JSONResponse({
+                "code": 400,
+                "message": "客户端断开连接，请检查请求数据是否正确发送"
+            }, status_code=400)
+        except Exception as e:
+            print(f"[groups/set_admin_role] 读取请求体时发生异常: {type(e).__name__} - {e}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[groups/set_admin_role] 错误堆栈: {traceback_str}")
+            return JSONResponse({
+                "code": 400,
+                "message": f"读取请求数据失败: {str(e)}"
+            }, status_code=400)
+        
+        print(f"[groups/set_admin_role] 原始数据: {json.dumps(data, ensure_ascii=False, indent=2)}")
+        
+        group_id = data.get('group_id')
+        user_id = data.get('user_id')
+        role = data.get('role')
+        
+        print(f"[groups/set_admin_role] 解析结果 - group_id: {group_id}, user_id: {user_id}, role: {role}")
+        
+        # 参数验证
+        if not group_id:
+            print("[groups/set_admin_role] 错误: 缺少 group_id")
+            return JSONResponse({
+                "code": 400,
+                "message": "缺少必需参数 group_id"
+            }, status_code=400)
+        
+        if not user_id:
+            print("[groups/set_admin_role] 错误: 缺少 user_id")
+            return JSONResponse({
+                "code": 400,
+                "message": "缺少必需参数 user_id"
+            }, status_code=400)
+        
+        if not role:
+            print("[groups/set_admin_role] 错误: 缺少 role")
+            return JSONResponse({
+                "code": 400,
+                "message": "缺少必需参数 role"
+            }, status_code=400)
+        
+        # 将角色从中文映射到数据库值
+        # 群主: 400, 管理员: 300, 成员: 1
+        role_mapping = {
+            "管理员": 300,
+            "成员": 1
+        }
+        
+        if role not in role_mapping:
+            print(f"[groups/set_admin_role] 错误: 无效的角色值 {role}，只支持 '管理员' 或 '成员'")
+            return JSONResponse({
+                "code": 400,
+                "message": f"无效的角色值，只支持 '管理员' 或 '成员'"
+            }, status_code=400)
+        
+        self_role = role_mapping[role]
+        print(f"[groups/set_admin_role] 角色映射: {role} -> {self_role}")
+        
+        print("[groups/set_admin_role] 开始连接数据库...")
+        connection = get_db_connection()
+        if connection is None or not connection.is_connected():
+            print("[groups/set_admin_role] 错误: 数据库连接失败")
+            app_logger.error("[groups/set_admin_role] 数据库连接失败")
+            return JSONResponse({
+                "code": 500,
+                "message": "数据库连接失败"
+            }, status_code=500)
+        print("[groups/set_admin_role] 数据库连接成功")
+        
+        cursor = None
+        try:
+            cursor = connection.cursor(dictionary=True)
+            
+            # 1. 检查群组是否存在
+            print(f"[groups/set_admin_role] 检查群组 {group_id} 是否存在...")
+            cursor.execute("SELECT group_id, group_name FROM `groups` WHERE group_id = %s", (group_id,))
+            group_info = cursor.fetchone()
+            
+            if not group_info:
+                print(f"[groups/set_admin_role] 错误: 群组 {group_id} 不存在")
+                return JSONResponse({
+                    "code": 404,
+                    "message": "群组不存在"
+                }, status_code=404)
+            
+            print(f"[groups/set_admin_role] 群组信息: {group_info}")
+            
+            # 2. 检查成员是否在群组中
+            print(f"[groups/set_admin_role] 检查用户 {user_id} 是否在群组 {group_id} 中...")
+            cursor.execute(
+                "SELECT group_id, user_id, user_name, self_role FROM `group_members` WHERE group_id = %s AND user_id = %s",
+                (group_id, user_id)
+            )
+            member_info = cursor.fetchone()
+            
+            if not member_info:
+                print(f"[groups/set_admin_role] 错误: 用户 {user_id} 不在群组 {group_id} 中")
+                return JSONResponse({
+                    "code": 404,
+                    "message": "该用户不是群组成员"
+                }, status_code=404)
+            
+            print(f"[groups/set_admin_role] 成员信息: {member_info}")
+            current_role = member_info.get('self_role', 200)
+            user_name = member_info.get('user_name', '')
+            
+            # 3. 如果角色没有变化，直接返回成功
+            if current_role == self_role:
+                print(f"[groups/set_admin_role] 用户 {user_id} 的角色已经是 {role}，无需更新")
+                return JSONResponse({
+                    "code": 200,
+                    "message": f"用户角色已经是{role}",
+                    "data": {
+                        "group_id": group_id,
+                        "user_id": user_id,
+                        "user_name": user_name,
+                        "role": role,
+                        "self_role": self_role
+                    }
+                }, status_code=200)
+            
+            # 4. 更新成员角色
+            print(f"[groups/set_admin_role] 更新用户 {user_id} 的角色从 {current_role} 到 {self_role}...")
+            cursor.execute(
+                "UPDATE `group_members` SET self_role = %s WHERE group_id = %s AND user_id = %s",
+                (self_role, group_id, user_id)
+            )
+            affected_rows = cursor.rowcount
+            print(f"[groups/set_admin_role] 更新角色完成, 影响行数: {affected_rows}")
+            
+            if affected_rows == 0:
+                print(f"[groups/set_admin_role] 警告: 更新角色操作未影响任何行")
+                connection.rollback()
+                return JSONResponse({
+                    "code": 500,
+                    "message": "更新角色失败"
+                }, status_code=500)
+            
+            # 提交事务
+            connection.commit()
+            print(f"[groups/set_admin_role] 事务提交成功")
+            
+            result = {
+                "code": 200,
+                "message": f"成功设置用户角色为{role}",
+                "data": {
+                    "group_id": group_id,
+                    "user_id": user_id,
+                    "user_name": user_name,
+                    "role": role,
+                    "self_role": self_role
+                }
+            }
+            
+            print(f"[groups/set_admin_role] 返回结果: {result}")
+            print("=" * 80)
+            
+            return JSONResponse(result, status_code=200)
+            
+        except mysql.connector.Error as e:
+            connection.rollback()
+            error_msg = f"数据库错误: {e}"
+            print(f"[groups/set_admin_role] {error_msg}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[groups/set_admin_role] 错误堆栈: {traceback_str}")
+            app_logger.error(f"[groups/set_admin_role] {error_msg}\n{traceback_str}")
+            return JSONResponse({
+                "code": 500,
+                "message": f"数据库操作失败: {str(e)}"
+            }, status_code=500)
+        except Exception as e:
+            connection.rollback()
+            error_msg = f"设置管理员角色时发生异常: {e}"
+            print(f"[groups/set_admin_role] {error_msg}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[groups/set_admin_role] 错误堆栈: {traceback_str}")
+            app_logger.error(f"[groups/set_admin_role] {error_msg}\n{traceback_str}")
+            return JSONResponse({
+                "code": 500,
+                "message": f"操作失败: {str(e)}"
+            }, status_code=500)
+        finally:
+            if cursor:
+                cursor.close()
+                print("[groups/set_admin_role] 游标已关闭")
+            if connection and connection.is_connected():
+                connection.close()
+                print("[groups/set_admin_role] 数据库连接已关闭")
+                app_logger.info("[groups/set_admin_role] Database connection closed after set admin role attempt.")
+    
+    except Exception as e:
+        error_msg = f"解析请求数据时出错: {e}"
+        print(f"[groups/set_admin_role] {error_msg}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[groups/set_admin_role] 错误堆栈: {traceback_str}")
+        app_logger.error(f"[groups/set_admin_role] {error_msg}\n{traceback_str}")
+        return JSONResponse({
+            "code": 400,
+            "message": "请求数据格式错误"
+        }, status_code=400)
+    finally:
+        print("=" * 80)
+
+@app.post("/groups/transfer_owner")
+async def transfer_owner(request: Request):
+    """
+    转让群主
+    接收客户端发送的 group_id, old_owner_id, new_owner_id
+    1. 将新群主设置为群主（self_role = 400）
+    2. 让原群主退出群组（从 group_members 表中删除）
+    3. 更新群组的成员数量
+    """
+    print("=" * 80)
+    print("[groups/transfer_owner] 收到转让群主请求")
+    
+    # 打印请求头信息用于调试
+    content_type = request.headers.get("content-type", "")
+    content_length = request.headers.get("content-length", "")
+    print(f"[groups/transfer_owner] 请求头 - Content-Type: {content_type}, Content-Length: {content_length}")
+    
+    try:
+        # 解析请求体JSON数据
+        try:
+            # 先尝试读取原始body
+            body_bytes = await request.body()
+            print(f"[groups/transfer_owner] 读取到请求体长度: {len(body_bytes)} 字节")
+            
+            if not body_bytes:
+                print("[groups/transfer_owner] 错误: 请求体为空")
+                return JSONResponse({
+                    "code": 400,
+                    "message": "请求体不能为空"
+                }, status_code=400)
+            
+            # 解析JSON
+            try:
+                data = json.loads(body_bytes.decode('utf-8'))
+            except json.JSONDecodeError as e:
+                print(f"[groups/transfer_owner] 错误: JSON解析失败 - {e}")
+                print(f"[groups/transfer_owner] 请求体内容: {body_bytes.decode('utf-8', errors='ignore')}")
+                return JSONResponse({
+                    "code": 400,
+                    "message": "请求数据格式错误，无法解析JSON"
+                }, status_code=400)
+                
+        except ClientDisconnect:
+            print("[groups/transfer_owner] 错误: 客户端断开连接")
+            print(f"[groups/transfer_owner] 调试信息 - Content-Type: {content_type}, Content-Length: {content_length}")
+            app_logger.warning("[groups/transfer_owner] 客户端在请求完成前断开连接")
+            return JSONResponse({
+                "code": 400,
+                "message": "客户端断开连接，请检查请求数据是否正确发送"
+            }, status_code=400)
+        except Exception as e:
+            print(f"[groups/transfer_owner] 读取请求体时发生异常: {type(e).__name__} - {e}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[groups/transfer_owner] 错误堆栈: {traceback_str}")
+            return JSONResponse({
+                "code": 400,
+                "message": f"读取请求数据失败: {str(e)}"
+            }, status_code=400)
+        
+        print(f"[groups/transfer_owner] 原始数据: {json.dumps(data, ensure_ascii=False, indent=2)}")
+        
+        group_id = data.get('group_id')
+        old_owner_id = data.get('old_owner_id')
+        new_owner_id = data.get('new_owner_id')
+        
+        print(f"[groups/transfer_owner] 解析结果 - group_id: {group_id}, old_owner_id: {old_owner_id}, new_owner_id: {new_owner_id}")
+        
+        # 参数验证
+        if not group_id:
+            print("[groups/transfer_owner] 错误: 缺少 group_id")
+            return JSONResponse({
+                "code": 400,
+                "message": "缺少必需参数 group_id"
+            }, status_code=400)
+        
+        if not old_owner_id:
+            print("[groups/transfer_owner] 错误: 缺少 old_owner_id")
+            return JSONResponse({
+                "code": 400,
+                "message": "缺少必需参数 old_owner_id"
+            }, status_code=400)
+        
+        if not new_owner_id:
+            print("[groups/transfer_owner] 错误: 缺少 new_owner_id")
+            return JSONResponse({
+                "code": 400,
+                "message": "缺少必需参数 new_owner_id"
+            }, status_code=400)
+        
+        # 检查原群主和新群主不能是同一个人
+        if old_owner_id == new_owner_id:
+            print(f"[groups/transfer_owner] 错误: 原群主和新群主不能是同一个人")
+            return JSONResponse({
+                "code": 400,
+                "message": "原群主和新群主不能是同一个人"
+            }, status_code=400)
+        
+        print("[groups/transfer_owner] 开始连接数据库...")
+        connection = get_db_connection()
+        if connection is None or not connection.is_connected():
+            print("[groups/transfer_owner] 错误: 数据库连接失败")
+            app_logger.error("[groups/transfer_owner] 数据库连接失败")
+            return JSONResponse({
+                "code": 500,
+                "message": "数据库连接失败"
+            }, status_code=500)
+        print("[groups/transfer_owner] 数据库连接成功")
+        
+        cursor = None
+        try:
+            cursor = connection.cursor(dictionary=True)
+            
+            # 1. 检查群组是否存在
+            print(f"[groups/transfer_owner] 检查群组 {group_id} 是否存在...")
+            cursor.execute("SELECT group_id, group_name, member_num, owner_identifier FROM `groups` WHERE group_id = %s", (group_id,))
+            group_info = cursor.fetchone()
+            
+            if not group_info:
+                print(f"[groups/transfer_owner] 错误: 群组 {group_id} 不存在")
+                return JSONResponse({
+                    "code": 404,
+                    "message": "群组不存在"
+                }, status_code=404)
+            
+            print(f"[groups/transfer_owner] 群组信息: {group_info}")
+            group_name = group_info.get('group_name', '')
+            old_owner_identifier = group_info.get('owner_identifier', '')
+            print(f"[groups/transfer_owner] 当前群组的 owner_identifier: {old_owner_identifier}")
+            print(f"[groups/transfer_owner] 原群主ID (old_owner_id): {old_owner_id}")
+            print(f"[groups/transfer_owner] 新群主ID (new_owner_id): {new_owner_id}")
+            
+            # 2. 检查原群主是否是群主
+            print(f"[groups/transfer_owner] 检查用户 {old_owner_id} 是否是群组 {group_id} 的群主...")
+            cursor.execute(
+                "SELECT group_id, user_id, user_name, self_role FROM `group_members` WHERE group_id = %s AND user_id = %s",
+                (group_id, old_owner_id)
+            )
+            old_owner_info = cursor.fetchone()
+            
+            if not old_owner_info:
+                print(f"[groups/transfer_owner] 错误: 用户 {old_owner_id} 不在群组 {group_id} 中")
+                return JSONResponse({
+                    "code": 404,
+                    "message": "原群主不是该群组的成员"
+                }, status_code=404)
+            
+            old_owner_role = old_owner_info.get('self_role', 200)
+            if old_owner_role != 400:
+                print(f"[groups/transfer_owner] 错误: 用户 {old_owner_id} 不是群主（当前角色: {old_owner_role}）")
+                return JSONResponse({
+                    "code": 403,
+                    "message": "原群主不是群主，无权转让"
+                }, status_code=403)
+            
+            print(f"[groups/transfer_owner] 原群主信息: {old_owner_info}")
+            
+            # 3. 检查新群主是否是群组成员
+            print(f"[groups/transfer_owner] 检查用户 {new_owner_id} 是否在群组 {group_id} 中...")
+            cursor.execute(
+                "SELECT group_id, user_id, user_name, self_role FROM `group_members` WHERE group_id = %s AND user_id = %s",
+                (group_id, new_owner_id)
+            )
+            new_owner_info = cursor.fetchone()
+            
+            if not new_owner_info:
+                print(f"[groups/transfer_owner] 错误: 用户 {new_owner_id} 不在群组 {group_id} 中")
+                return JSONResponse({
+                    "code": 404,
+                    "message": "新群主不是该群组的成员"
+                }, status_code=404)
+            
+            print(f"[groups/transfer_owner] 新群主信息: {new_owner_info}")
+            new_owner_name = new_owner_info.get('user_name', '')
+            
+            # 4. 将新群主设置为群主（self_role = 400）
+            print(f"[groups/transfer_owner] ========== 步骤4: 将新群主设置为群主 ==========")
+            print(f"[groups/transfer_owner] 将用户 {new_owner_id} 设置为群主 (self_role = 400)...")
+            sql_update_role = "UPDATE `group_members` SET self_role = %s WHERE group_id = %s AND user_id = %s"
+            params_update_role = (400, group_id, new_owner_id)
+            print(f"[groups/transfer_owner] 执行SQL: {sql_update_role}")
+            print(f"[groups/transfer_owner] SQL参数: {params_update_role}")
+            cursor.execute(sql_update_role, params_update_role)
+            update_rows = cursor.rowcount
+            print(f"[groups/transfer_owner] 更新新群主角色完成, 影响行数: {update_rows}")
+            if update_rows > 0:
+                print(f"[groups/transfer_owner] ✓ 成功将用户 {new_owner_id} 的角色更新为群主 (self_role=400)")
+            else:
+                print(f"[groups/transfer_owner] ✗ 警告: 更新新群主角色操作未影响任何行")
+                connection.rollback()
+                return JSONResponse({
+                    "code": 500,
+                    "message": "设置新群主失败"
+                }, status_code=500)
+            
+            # 5. 删除原群主（从群组中移除）
+            print(f"[groups/transfer_owner] ========== 步骤5: 删除原群主 ==========")
+            print(f"[groups/transfer_owner] 从群组 {group_id} 中删除原群主 {old_owner_id}...")
+            sql_delete_owner = "DELETE FROM `group_members` WHERE group_id = %s AND user_id = %s"
+            params_delete_owner = (group_id, old_owner_id)
+            print(f"[groups/transfer_owner] 执行SQL: {sql_delete_owner}")
+            print(f"[groups/transfer_owner] SQL参数: {params_delete_owner}")
+            cursor.execute(sql_delete_owner, params_delete_owner)
+            delete_rows = cursor.rowcount
+            print(f"[groups/transfer_owner] 删除原群主完成, 影响行数: {delete_rows}")
+            if delete_rows > 0:
+                print(f"[groups/transfer_owner] ✓ 成功从群组中删除原群主 {old_owner_id}")
+            else:
+                print(f"[groups/transfer_owner] ✗ 警告: 删除原群主操作未影响任何行")
+                connection.rollback()
+                return JSONResponse({
+                    "code": 500,
+                    "message": "删除原群主失败"
+                }, status_code=500)
+            
+            # 6. 更新群组的 owner_identifier 字段为新群主ID
+            print(f"[groups/transfer_owner] ========== 步骤6: 更新 groups 表的 owner_identifier 字段 ==========")
+            print(f"[groups/transfer_owner] 更新前 - 群组 {group_id} 的 owner_identifier: {old_owner_identifier}")
+            print(f"[groups/transfer_owner] 更新后 - 群组 {group_id} 的 owner_identifier 将设置为: {new_owner_id}")
+            sql_update_owner = "UPDATE `groups` SET owner_identifier = %s WHERE group_id = %s"
+            params_update_owner = (new_owner_id, group_id)
+            print(f"[groups/transfer_owner] 执行SQL: {sql_update_owner}")
+            print(f"[groups/transfer_owner] SQL参数: {params_update_owner}")
+            cursor.execute(sql_update_owner, params_update_owner)
+            update_owner_rows = cursor.rowcount
+            print(f"[groups/transfer_owner] 更新 owner_identifier 完成, 影响行数: {update_owner_rows}")
+            
+            if update_owner_rows == 0:
+                print(f"[groups/transfer_owner] ✗ 警告: 更新 owner_identifier 操作未影响任何行")
+                connection.rollback()
+                return JSONResponse({
+                    "code": 500,
+                    "message": "更新群主标识失败"
+                }, status_code=500)
+            
+            # 验证更新是否成功
+            print(f"[groups/transfer_owner] 验证更新结果: 查询更新后的 owner_identifier...")
+            cursor.execute("SELECT owner_identifier FROM `groups` WHERE group_id = %s", (group_id,))
+            verify_result = cursor.fetchone()
+            if verify_result:
+                updated_owner_identifier = verify_result.get('owner_identifier', '')
+                print(f"[groups/transfer_owner] 验证结果 - 当前群组 {group_id} 的 owner_identifier: {updated_owner_identifier}")
+                if updated_owner_identifier == new_owner_id:
+                    print(f"[groups/transfer_owner] ✓ 成功: owner_identifier 已更新为新群主ID {new_owner_id}")
+                else:
+                    print(f"[groups/transfer_owner] ✗ 错误: owner_identifier 更新失败，期望值: {new_owner_id}, 实际值: {updated_owner_identifier}")
+            else:
+                print(f"[groups/transfer_owner] ✗ 错误: 无法查询到群组信息")
+            
+            # 7. 更新群组的成员数量（减1，因为原群主退出了）
+            print(f"[groups/transfer_owner] ========== 步骤7: 更新群组成员数量 ==========")
+            current_member_num = group_info.get('member_num', 0)
+            print(f"[groups/transfer_owner] 更新前 - 群组 {group_id} 的成员数量: {current_member_num}")
+            # 使用 CASE 语句避免 UNSIGNED 类型溢出问题
+            # 当 member_num 为 0 时，member_num - 1 会导致 UNSIGNED 溢出错误
+            sql_update_member_num = "UPDATE `groups` SET member_num = CASE WHEN member_num > 0 THEN member_num - 1 ELSE 0 END WHERE group_id = %s"
+            params_update_member_num = (group_id,)
+            print(f"[groups/transfer_owner] 执行SQL: {sql_update_member_num}")
+            print(f"[groups/transfer_owner] SQL参数: {params_update_member_num}")
+            cursor.execute(sql_update_member_num, params_update_member_num)
+            update_member_num_rows = cursor.rowcount
+            print(f"[groups/transfer_owner] 更新成员数量完成, 影响行数: {update_member_num_rows}")
+            
+            # 验证成员数量更新
+            cursor.execute("SELECT member_num FROM `groups` WHERE group_id = %s", (group_id,))
+            verify_member_result = cursor.fetchone()
+            if verify_member_result:
+                updated_member_num = verify_member_result.get('member_num', 0)
+                print(f"[groups/transfer_owner] 更新后 - 群组 {group_id} 的成员数量: {updated_member_num}")
+                print(f"[groups/transfer_owner] ✓ 成员数量已更新 (从 {current_member_num} 减少到 {updated_member_num})")
+            
+            # 提交事务
+            print(f"[groups/transfer_owner] ========== 步骤8: 提交事务 ==========")
+            connection.commit()
+            print(f"[groups/transfer_owner] ✓ 事务提交成功")
+            print(f"[groups/transfer_owner] ========== 转让群主操作完成 ==========")
+            print(f"[groups/transfer_owner] 总结:")
+            print(f"[groups/transfer_owner]   - 群组ID: {group_id}")
+            print(f"[groups/transfer_owner]   - 原群主ID: {old_owner_id}")
+            print(f"[groups/transfer_owner]   - 新群主ID: {new_owner_id}")
+            print(f"[groups/transfer_owner]   - owner_identifier 已从 {old_owner_identifier} 更新为 {new_owner_id}")
+            
+            result = {
+                "code": 200,
+                "message": "成功转让群主",
+                "data": {
+                    "group_id": group_id,
+                    "group_name": group_name,
+                    "old_owner_id": old_owner_id,
+                    "new_owner_id": new_owner_id,
+                    "new_owner_name": new_owner_name
+                }
+            }
+            
+            print(f"[groups/transfer_owner] 返回结果: {result}")
+            print("=" * 80)
+            
+            return JSONResponse(result, status_code=200)
+            
+        except mysql.connector.Error as e:
+            connection.rollback()
+            error_msg = f"数据库错误: {e}"
+            print(f"[groups/transfer_owner] {error_msg}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[groups/transfer_owner] 错误堆栈: {traceback_str}")
+            app_logger.error(f"[groups/transfer_owner] {error_msg}\n{traceback_str}")
+            return JSONResponse({
+                "code": 500,
+                "message": f"数据库操作失败: {str(e)}"
+            }, status_code=500)
+        except Exception as e:
+            connection.rollback()
+            error_msg = f"转让群主时发生异常: {e}"
+            print(f"[groups/transfer_owner] {error_msg}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[groups/transfer_owner] 错误堆栈: {traceback_str}")
+            app_logger.error(f"[groups/transfer_owner] {error_msg}\n{traceback_str}")
+            return JSONResponse({
+                "code": 500,
+                "message": f"操作失败: {str(e)}"
+            }, status_code=500)
+        finally:
+            if cursor:
+                cursor.close()
+                print("[groups/transfer_owner] 游标已关闭")
+            if connection and connection.is_connected():
+                connection.close()
+                print("[groups/transfer_owner] 数据库连接已关闭")
+                app_logger.info("[groups/transfer_owner] Database connection closed after transfer owner attempt.")
+    
+    except Exception as e:
+        error_msg = f"解析请求数据时出错: {e}"
+        print(f"[groups/transfer_owner] {error_msg}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[groups/transfer_owner] 错误堆栈: {traceback_str}")
+        app_logger.error(f"[groups/transfer_owner] {error_msg}\n{traceback_str}")
         return JSONResponse({
             "code": 400,
             "message": "请求数据格式错误"
