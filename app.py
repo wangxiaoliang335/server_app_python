@@ -764,6 +764,179 @@ async def api_get_student_scores(
             connection.close()
             app_logger.info("Database connection closed after fetching student scores.")
 
+@app.get("/student-scores/get")
+async def api_get_student_score(
+    class_id: str = Query(..., description="班级ID"),
+    exam_name: str = Query(..., description="考试名称，如'期中考试'"),
+    term: str = Query(..., description="学期，如'2025-2026-1'")
+):
+    """
+    查询学生成绩表（单个，如果查询到多个则返回最新的）
+    返回 JSON:
+    {
+      "message": "查询成功",
+      "code": 200,
+      "data": {
+        "id": 1,
+        "class_id": "class_1001",
+        "exam_name": "期中考试",
+        "term": "2025-2026-1",
+        "remark": "...",
+        "created_at": "...",
+        "updated_at": "...",
+        "scores": [
+          {
+            "id": 1,
+            "student_id": "2024001",
+            "student_name": "张三",
+            "chinese": 100,
+            "math": 89,
+            "english": 95,
+            "total_score": 284
+          },
+          ...
+        ]
+      }
+    }
+    """
+    print("=" * 80)
+    print(f"[student-scores/get] 收到查询请求 - class_id: {class_id}, exam_name: {exam_name}, term: {term}")
+    app_logger.info(f"[student-scores/get] 收到查询请求 - class_id: {class_id}, exam_name: {exam_name}, term: {term}")
+    
+    connection = get_db_connection()
+    if connection is None:
+        print("[student-scores/get] 错误: 数据库连接失败")
+        app_logger.error(f"[student-scores/get] 数据库连接失败 - class_id: {class_id}, exam_name: {exam_name}, term: {term}")
+        return safe_json_response({'message': '数据库连接失败', 'code': 500}, status_code=500)
+    
+    print("[student-scores/get] 数据库连接成功")
+    app_logger.info(f"[student-scores/get] 数据库连接成功 - class_id: {class_id}")
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+        
+        # 查询成绩表头，如果有多个则按创建时间降序排列，取最新的
+        print(f"[student-scores/get] 查询成绩表头...")
+        app_logger.info(f"[student-scores/get] 开始查询成绩表头 - class_id: {class_id}, exam_name: {exam_name}, term: {term}")
+        cursor.execute(
+            "SELECT id, class_id, exam_name, term, remark, created_at, updated_at "
+            "FROM ta_student_score_header "
+            "WHERE class_id = %s AND exam_name = %s AND term = %s "
+            "ORDER BY created_at DESC, updated_at DESC "
+            "LIMIT 1",
+            (class_id, exam_name, term)
+        )
+        
+        header = cursor.fetchone()
+        
+        if not header:
+            print(f"[student-scores/get] 未找到成绩表 - class_id: {class_id}, exam_name: {exam_name}, term: {term}")
+            app_logger.warning(f"[student-scores/get] 未找到成绩表 - class_id: {class_id}, exam_name: {exam_name}, term: {term}")
+            return safe_json_response({
+                'message': '未找到成绩表',
+                'code': 404,
+                'data': None
+            }, status_code=404)
+        
+        print(f"[student-scores/get] 找到成绩表头 - id: {header['id']}, created_at: {header.get('created_at')}")
+        app_logger.info(f"[student-scores/get] 找到成绩表头 - id: {header['id']}, class_id: {class_id}, exam_name: {exam_name}, term: {term}, created_at: {header.get('created_at')}")
+        
+        # 查询成绩明细
+        score_header_id = header['id']
+        print(f"[student-scores/get] 查询成绩明细 - score_header_id: {score_header_id}")
+        app_logger.info(f"[student-scores/get] 开始查询成绩明细 - score_header_id: {score_header_id}")
+        cursor.execute(
+            "SELECT id, student_id, student_name, chinese, math, english, total_score "
+            "FROM ta_student_score_detail "
+            "WHERE score_header_id = %s "
+            "ORDER BY total_score DESC, student_name ASC",
+            (score_header_id,)
+        )
+        scores = cursor.fetchall() or []
+        
+        print(f"[student-scores/get] 查询到 {len(scores)} 条成绩明细")
+        app_logger.info(f"[student-scores/get] 查询到 {len(scores)} 条成绩明细 - score_header_id: {score_header_id}")
+        
+        # 转换 Decimal 类型为 float（用于 JSON 序列化）
+        from decimal import Decimal
+        def convert_decimal(obj):
+            """递归转换 Decimal 类型为 float"""
+            if isinstance(obj, Decimal):
+                return float(obj)
+            elif isinstance(obj, dict):
+                return {k: convert_decimal(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_decimal(item) for item in obj]
+            return obj
+        
+        # 转换成绩明细中的 Decimal 类型
+        scores = convert_decimal(scores)
+        
+        # 转换 datetime 为字符串
+        if header.get('created_at') and isinstance(header['created_at'], datetime.datetime):
+            header['created_at'] = header['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+        if header.get('updated_at') and isinstance(header['updated_at'], datetime.datetime):
+            header['updated_at'] = header['updated_at'].strftime("%Y-%m-%d %H:%M:%S")
+        
+        # 转换 header 中的 Decimal 类型（如果有）
+        header = convert_decimal(header)
+        
+        result = {
+            'id': header['id'],
+            'class_id': header['class_id'],
+            'exam_name': header['exam_name'],
+            'term': header.get('term'),
+            'remark': header.get('remark'),
+            'created_at': header.get('created_at'),
+            'updated_at': header.get('updated_at'),
+            'scores': scores
+        }
+        
+        print(f"[student-scores/get] 返回结果 - id: {result['id']}, scores_count: {len(scores)}")
+        app_logger.info(f"[student-scores/get] 查询成功 - score_header_id: {result['id']}, class_id: {class_id}, exam_name: {exam_name}, term: {term}, scores_count: {len(scores)}")
+        
+        response_data = {
+            'message': '查询成功',
+            'code': 200,
+            'data': result
+        }
+        
+        # 打印返回的 JSON 结果
+        try:
+            response_json = json.dumps(response_data, ensure_ascii=False, indent=2)
+            print(f"[student-scores/get] 返回的 JSON 结果:\n{response_json}")
+            app_logger.info(f"[student-scores/get] 返回的 JSON 结果: {json.dumps(response_data, ensure_ascii=False)}")
+        except Exception as json_error:
+            print(f"[student-scores/get] 打印 JSON 时出错: {json_error}")
+            app_logger.warning(f"[student-scores/get] 打印 JSON 时出错: {json_error}")
+        
+        print("=" * 80)
+        
+        return safe_json_response(response_data)
+        
+    except mysql.connector.Error as e:
+        print(f"[student-scores/get] 数据库错误: {e}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        app_logger.error(f"[student-scores/get] 数据库错误 - class_id: {class_id}, exam_name: {exam_name}, term: {term}, error: {e}\n{traceback_str}")
+        return safe_json_response({'message': '数据库错误', 'code': 500}, status_code=500)
+    except Exception as e:
+        print(f"[student-scores/get] 未知错误: {e}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[student-scores/get] 错误堆栈: {traceback_str}")
+        app_logger.error(f"[student-scores/get] 未知错误 - class_id: {class_id}, exam_name: {exam_name}, term: {term}, error: {e}\n{traceback_str}")
+        return safe_json_response({'message': '未知错误', 'code': 500}, status_code=500)
+    finally:
+        if cursor:
+            cursor.close()
+            print("[student-scores/get] 游标已关闭")
+        if connection and connection.is_connected():
+            connection.close()
+            print("[student-scores/get] 数据库连接已关闭")
+            app_logger.info(f"[student-scores/get] 数据库连接已关闭 - class_id: {class_id}")
+
 # ===== 小组管理表 API =====
 def save_group_scores(
     class_id: str,
@@ -2872,6 +3045,7 @@ def get_groups_by_teacher(
                 "online_member_num": row.get("online_member_num"),
                 "classid": row.get("classid"),
                 "schoolid": row.get("schoolid"),
+                "is_class_group": row.get("is_class_group"),
                 # 成员信息
                 "member_info": {
                     "user_id": row.get("user_id"),
@@ -4442,6 +4616,15 @@ async def sync_groups(request: Request):
                         else:
                             print(f"[groups/sync] schoolid 为空，跳过更新")
                         
+                        # 处理 is_class_group 字段（如果客户端传过来则更新，否则使用默认值1）
+                        is_class_group = group.get('is_class_group')
+                        if is_class_group is not None:
+                            update_fields.append("is_class_group = %s")
+                            update_params.append(is_class_group)
+                            print(f"[groups/sync] 将更新 is_class_group: {is_class_group}")
+                        else:
+                            print(f"[groups/sync] is_class_group 未提供，使用数据库默认值")
+                        
                         update_params.append(group.get('group_id'))  # WHERE 条件参数
                         
                         update_group_sql = f"""
@@ -4494,11 +4677,11 @@ async def sync_groups(request: Request):
                                 is_shutup_all, next_msg_seq, latest_seq, last_msg_time,
                                 last_info_time, info_seq, detail_info_seq, detail_group_id,
                                 detail_group_name, detail_group_type, detail_is_shutup_all,
-                                online_member_num, classid, schoolid
+                                online_member_num, classid, schoolid, is_class_group
                             ) VALUES (
                                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s, %s, %s, %s, %s
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                             )
                         """
                         insert_params = (
@@ -4529,7 +4712,8 @@ async def sync_groups(request: Request):
                             group.get('detail_is_shutup_all'),
                             group.get('online_member_num'),
                             group_classid,  # 如果为空则为 None，插入 NULL
-                            group_schoolid  # 如果为空则为 None，插入 NULL
+                            group_schoolid,  # 如果为空则为 None，插入 NULL
+                            group.get('is_class_group', 1)  # 如果未提供则使用默认值1（班级群）
                         )
                         print(f"[groups/sync] 插入参数: {insert_params}")
                         cursor.execute(insert_group_sql, insert_params)
