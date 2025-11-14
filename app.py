@@ -16,8 +16,13 @@ import redis
 import json
 import uuid
 import struct
+import hmac
+import zlib
+import urllib.error
+import urllib.parse
+import urllib.request
 from fastapi import FastAPI, Query
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 #import session
 from logging.handlers import TimedRotatingFileHandler
 from typing import Dict
@@ -128,6 +133,17 @@ SMS_CONFIG = {
     'template_code': os.getenv("ALIYUN_SMS_TEMPLATE")
 }
 
+# ===== 腾讯 REST API 配置 =====
+TENCENT_API_URL = os.getenv("TENCENT_API_URL")
+TENCENT_API_BASE_URL = os.getenv("TENCENT_API_BASE_URL")
+TENCENT_API_PATH = os.getenv("TENCENT_API_PATH")
+TENCENT_API_SDK_APP_ID = os.getenv("TENCENT_API_SDK_APP_ID")
+TENCENT_API_IDENTIFIER = os.getenv("TENCENT_API_IDENTIFIER")
+TENCENT_API_USER_SIG = os.getenv("TENCENT_API_USER_SIG")
+TENCENT_API_TOKEN = os.getenv("TENCENT_API_TOKEN")
+TENCENT_API_TIMEOUT = float(os.getenv("TENCENT_API_TIMEOUT", "10"))
+TENCENT_API_SECRET_KEY = os.getenv("TENCENT_API_SECRET_KEY")
+
 # 验证码有效期 (秒)
 VERIFICATION_CODE_EXPIRY = 300 # 5分钟
 
@@ -165,6 +181,429 @@ def get_db_connection():
     except Error as e:
         app_logger.error(f"Error connecting to MySQL: {e}")
         return None
+
+
+def build_tencent_request_url(identifier: Optional[str] = None, usersig: Optional[str] = None) -> Optional[str]:
+    """
+    生成腾讯 REST API 的完整请求 URL。
+    优先使用 TENCENT_API_URL，其次使用 base + path + query 参数。
+    """
+    if TENCENT_API_URL:
+        parsed = urllib.parse.urlparse(TENCENT_API_URL)
+        existing_query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+
+        def pick_single(values):
+            if isinstance(values, list):
+                return values[0] if values else ""
+            return values
+
+        normalized_query: Dict[str, str] = {k: pick_single(v) for k, v in existing_query.items()}
+
+        def ensure_query_param(key: str, value: Optional[str]):
+            if value is not None and (key not in normalized_query or not normalized_query[key]):
+                normalized_query[key] = value
+
+        effective_identifier = identifier or TENCENT_API_IDENTIFIER
+        effective_usersig = usersig or TENCENT_API_USER_SIG
+
+        ensure_query_param("sdkappid", TENCENT_API_SDK_APP_ID)
+        ensure_query_param("identifier", effective_identifier)
+        ensure_query_param("usersig", effective_usersig)
+        ensure_query_param("contenttype", "json")
+        if "random" not in normalized_query or not normalized_query["random"]:
+            normalized_query["random"] = str(random.randint(1, 2**31 - 1))
+
+        if "sdkappid" not in normalized_query or not normalized_query["sdkappid"]:
+            app_logger.error("TENCENT_API_URL 缺少 sdkappid 且未配置 TENCENT_API_SDK_APP_ID，无法构建完整 URL。")
+            return None
+
+        rebuilt_query = urllib.parse.urlencode(normalized_query)
+        rebuilt_url = urllib.parse.urlunparse(parsed._replace(query=rebuilt_query))
+        return rebuilt_url
+
+    if not TENCENT_API_BASE_URL:
+        return None
+
+    path = (TENCENT_API_PATH or "").strip("/")
+    base = TENCENT_API_BASE_URL.rstrip("/")
+    url = f"{base}/{path}" if path else base
+
+    effective_identifier = identifier or TENCENT_API_IDENTIFIER
+    effective_usersig = usersig or TENCENT_API_USER_SIG
+
+    if not (TENCENT_API_SDK_APP_ID and effective_identifier and effective_usersig):
+        # 缺少拼装 query 所需的参数，则直接返回 base/path
+        return url
+
+    query_params = {
+        "sdkappid": TENCENT_API_SDK_APP_ID,
+        "identifier": effective_identifier,
+        "usersig": effective_usersig,
+        "random": random.randint(1, 2**31 - 1),
+        "contenttype": "json"
+    }
+    return f"{url}?{urllib.parse.urlencode(query_params)}"
+
+
+def build_tencent_headers() -> Dict[str, str]:
+    headers: Dict[str, str] = {
+        "Content-Type": "application/json; charset=utf-8"
+    }
+    if TENCENT_API_TOKEN:
+        headers["Authorization"] = f"Bearer {TENCENT_API_TOKEN}"
+
+    sanitized_headers: Dict[str, str] = {}
+    for key, value in headers.items():
+        try:
+            value.encode("latin-1")
+            sanitized_headers[key] = value
+        except UnicodeEncodeError:
+            app_logger.warning(f"Tencent REST API header {key} 包含非 Latin-1 字符，已跳过该字段。")
+    return sanitized_headers
+
+
+def normalize_tencent_group_type(raw_type: Optional[str]) -> str:
+    default_type = "ChatRoom"
+    if not raw_type:
+        return default_type
+
+    mapping = {
+        "private": "Private",
+        "public": "Public",
+        "chatroom": "ChatRoom",
+        "meeting": "ChatRoom",
+        "meetinggroup": "ChatRoom",
+        "会议": "ChatRoom",
+        "会议群": "ChatRoom",
+        "avchatroom": "AVChatRoom",
+        "bchatroom": "BChatRoom",
+        "community": "Community",
+        "work": "Work",
+        "class": "Work",
+        "group": "Work"
+    }
+
+    normalized_key = str(raw_type).strip().lower()
+    return mapping.get(normalized_key, default_type)
+
+
+def generate_tencent_user_sig(identifier: str, expire: int = 86400) -> str:
+    if not (TENCENT_API_SDK_APP_ID and TENCENT_API_SECRET_KEY):
+        raise ValueError("缺少 TENCENT_API_SDK_APP_ID 或 TENCENT_API_SECRET_KEY 配置，无法生成 UserSig。")
+
+    sdk_app_id = int(TENCENT_API_SDK_APP_ID)
+    current_time = int(time.time())
+
+    data_to_sign = [
+        f"TLS.identifier:{identifier}",
+        f"TLS.sdkappid:{sdk_app_id}",
+        f"TLS.time:{current_time}",
+        f"TLS.expire:{expire}",
+        ""
+    ]
+    content = "\n".join(data_to_sign)
+
+    digest = hmac.new(
+        TENCENT_API_SECRET_KEY.encode("utf-8"),
+        content.encode("utf-8"),
+        hashlib.sha256
+    ).digest()
+
+    signature = base64.b64encode(digest).decode("utf-8")
+
+    sig_doc = {
+        "TLS.ver": "2.0",
+        "TLS.identifier": identifier,
+        "TLS.sdkappid": sdk_app_id,
+        "TLS.expire": expire,
+        "TLS.time": current_time,
+        "TLS.sig": signature
+    }
+
+    json_data = json.dumps(sig_doc, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    compressed = zlib.compress(json_data)
+    return base64.b64encode(compressed).decode("utf-8")
+
+
+async def notify_tencent_group_sync(user_id: str, groups: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    将同步到本地数据库的群组数据推送到腾讯 REST API。
+    """
+    if not groups:
+        return {"status": "skipped", "reason": "empty_groups"}
+
+    identifier_to_use = user_id
+
+    usersig_to_use: Optional[str] = None
+    sig_error: Optional[str] = None
+    if TENCENT_API_SECRET_KEY:
+        try:
+            usersig_to_use = generate_tencent_user_sig(identifier_to_use)
+        except Exception as e:
+            sig_error = f"自动生成 UserSig 失败: {e}"
+            app_logger.error(sig_error)
+
+    if not usersig_to_use:
+        usersig_to_use = TENCENT_API_USER_SIG
+
+    if not usersig_to_use:
+        error_message = "缺少可用的 UserSig，已跳过腾讯 REST API 同步。"
+        app_logger.error(error_message)
+        return {
+            "status": "error",
+            "http_status": None,
+            "error": error_message
+        }
+
+    url = build_tencent_request_url(identifier=identifier_to_use, usersig=usersig_to_use)
+    if not url:
+        msg = "腾讯 REST API 未配置，跳过同步"
+        app_logger.warning(msg)
+        return {"status": "skipped", "reason": "missing_configuration", "message": msg}
+
+    if sig_error:
+        masked_error = sig_error.replace(usersig_to_use or "", "***")
+        app_logger.warning(masked_error)
+
+    def _prepare_group_for_tencent(group: Dict[str, Any]) -> Dict[str, Any]:
+        prepared = dict(group)
+        group_type = prepared.get("group_type") or prepared.get("Type")
+        normalized_type = normalize_tencent_group_type(group_type)
+        prepared["group_type"] = normalized_type
+        prepared["Type"] = normalized_type
+        prepared["Name"] = prepared.get("Name") or prepared.get("group_name") or prepared.get("name")
+        if not prepared["Name"]:
+            prepared["Name"] = f"group_{prepared.get('group_id') or random.randint(1, 2**31 - 1)}"
+
+        owner = prepared.get("Owner_Account") or prepared.get("owner_identifier") or identifier_to_use
+        if owner:
+            prepared["Owner_Account"] = owner
+
+        return prepared
+
+    payload_groups = [_prepare_group_for_tencent(group) for group in groups]
+
+    app_logger.info(f"Tencent REST API payload preview: {payload_groups}")
+
+    def validate_and_log_url(current_url: str) -> Dict[str, Any]:
+        parsed_url = urllib.parse.urlparse(current_url)
+        query_dict = urllib.parse.parse_qs(parsed_url.query, keep_blank_values=True)
+        sdkappid_values = query_dict.get("sdkappid", [])
+        if not sdkappid_values or not sdkappid_values[0]:
+            error_message = "腾讯 REST API 请求 URL 缺少 sdkappid，已跳过同步。"
+            app_logger.error(error_message + f" URL: {current_url}")
+            return {"error": error_message}
+
+        def mask_value(value: str, keep: int = 4) -> str:
+            if not value:
+                return value
+            if len(value) <= keep:
+                return "*" * len(value)
+            return value[:keep] + "*" * (len(value) - keep)
+
+        masked_query = {
+            key: [mask_value(val[0]) if key in {"usersig", "identifier", "Authorization"} else val[0]]
+            for key, val in query_dict.items()
+        }
+        app_logger.info(f"Tencent REST API 请求 URL: {parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}")
+        app_logger.info(f"Tencent REST API 请求 Query 参数: {masked_query}")
+        return {"query": query_dict}
+
+    def build_group_payload(group: Dict[str, Any]) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "Owner_Account": group.get("Owner_Account"),
+            "Type": normalize_tencent_group_type(group.get("Type") or group.get("group_type")),
+            "GroupId": group.get("GroupId") or group.get("group_id"),
+            "Name": group.get("Name")
+        }
+
+        optional_fields = {
+            "Introduction": ["introduction", "Introduction"],
+            "Notification": ["notification", "Notification"],
+            "FaceUrl": ["face_url", "FaceUrl"],
+            "ApplyJoinOption": ["add_option", "ApplyJoinOption"],
+            "MaxMemberCount": ["max_member_num", "MaxMemberCount"],
+            "AppDefinedData": ["AppDefinedData", "app_defined_data"]
+        }
+
+        for target_key, source_keys in optional_fields.items():
+            for source_key in source_keys:
+                value = group.get(source_key)
+                if value not in (None, "", []):
+                    payload[target_key] = value
+                    break
+
+        member_info = group.get("member_info") or group.get("MemberList")
+        member_list = []
+        if isinstance(member_info, dict):
+            member_account = member_info.get("user_id") or member_info.get("Member_Account")
+            if member_account:
+                member_entry = {"Member_Account": member_account}
+                role = member_info.get("self_role") or member_info.get("Role")
+                if role:
+                    member_entry["Role"] = str(role)
+                member_list.append(member_entry)
+        elif isinstance(member_info, list):
+            for member in member_info:
+                if not isinstance(member, dict):
+                    continue
+                member_account = member.get("user_id") or member.get("Member_Account")
+                if member_account:
+                    entry = {"Member_Account": member_account}
+                    role = member.get("self_role") or member.get("Role")
+                    if role:
+                        entry["Role"] = str(role)
+                    member_list.append(entry)
+
+        if member_list:
+            payload["MemberList"] = member_list
+        owner_account = payload.get("Owner_Account")
+        if owner_account:
+            owner_present = any(m.get("Member_Account") == owner_account for m in member_list)
+            if not owner_present:
+                payload.setdefault("MemberList", []).append({"Member_Account": owner_account, "Role": "Owner"})
+
+        return payload
+
+    headers = build_tencent_headers()
+
+    def send_single_group(group_payload: Dict[str, Any]) -> Dict[str, Any]:
+        current_url = build_tencent_request_url(identifier=identifier_to_use, usersig=usersig_to_use)
+        if not current_url:
+            return {
+                "status": "error",
+                "http_status": None,
+                "error": "腾讯 REST API 未配置有效 URL"
+            }
+
+        validation = validate_and_log_url(current_url)
+        if "error" in validation:
+            return {
+                "status": "error",
+                "http_status": None,
+                "error": validation["error"]
+            }
+
+        encoded_payload = json.dumps(group_payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            url=current_url,
+            data=encoded_payload,
+            headers=headers,
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=TENCENT_API_TIMEOUT) as response:
+                raw_body = response.read()
+                text_body = raw_body.decode("utf-8", errors="replace")
+                try:
+                    parsed_body = json.loads(text_body)
+                except json.JSONDecodeError:
+                    parsed_body = None
+
+                result: Dict[str, Any] = {
+                    "status": "success",
+                    "http_status": response.status,
+                    "response": parsed_body or text_body
+                }
+                app_logger.info(f"Tencent REST API 同步成功: {result}")
+                return result
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            app_logger.error(f"Tencent REST API 同步失败 (HTTP {e.code}): {body}")
+            return {
+                "status": "error",
+                "http_status": e.code,
+                "error": body
+            }
+        except urllib.error.URLError as e:
+            app_logger.error(f"Tencent REST API 调用异常: {e}")
+            return {
+                "status": "error",
+                "http_status": None,
+                "error": str(e)
+            }
+        except Exception as exc:
+            app_logger.exception(f"Tencent REST API 未知异常: {exc}")
+            return {
+                "status": "error",
+                "http_status": None,
+                "error": str(exc)
+            }
+
+    loop = asyncio.get_running_loop()
+    tasks = []
+    for group in payload_groups:
+        group_payload = build_group_payload(group)
+        app_logger.info(f"Tencent REST API 单群组请求 payload: {group_payload}")
+        task = loop.run_in_executor(None, send_single_group, group_payload)
+        tasks.append(task)
+
+    group_results = await asyncio.gather(*tasks)
+
+    success_count = sum(1 for result in group_results if result.get("status") == "success")
+    error_count = len(group_results) - success_count
+    overall_status = "success" if error_count == 0 else ("partial" if success_count > 0 else "error")
+
+    return {
+        "status": overall_status,
+        "success_count": success_count,
+        "error_count": error_count,
+        "results": group_results
+    }
+
+
+@app.post("/tencent/user_sig")
+async def create_tencent_user_sig(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {'data': {'message': '请求体必须为 JSON', 'code': 400}},
+            status_code=400
+        )
+
+    identifier = body.get("identifier") or body.get("user_id")
+    expire = body.get("expire", 86400)
+
+    if not identifier:
+        return JSONResponse(
+            {'data': {'message': '缺少 identifier 参数', 'code': 400}},
+            status_code=400
+        )
+
+    try:
+        expire_int = int(expire)
+        if expire_int <= 0:
+            raise ValueError("expire must be positive")
+    except (ValueError, TypeError):
+        return JSONResponse(
+            {'data': {'message': 'expire 参数必须为正整数', 'code': 400}},
+            status_code=400
+        )
+
+    try:
+        user_sig = generate_tencent_user_sig(identifier, expire_int)
+    except ValueError as config_error:
+        app_logger.error(f"生成 UserSig 配置错误: {config_error}")
+        return JSONResponse(
+            {'data': {'message': str(config_error), 'code': 500}},
+            status_code=500
+        )
+    except Exception as e:
+        app_logger.exception(f"生成 UserSig 时发生异常: {e}")
+        return JSONResponse(
+            {'data': {'message': f'生成 UserSig 失败: {e}', 'code': 500}},
+            status_code=500
+        )
+
+    response_data = {
+        'identifier': identifier,
+        'sdk_app_id': TENCENT_API_SDK_APP_ID,
+        'expire': expire_int,
+        'user_sig': user_sig
+    }
+    return JSONResponse({'data': response_data, 'code': 200})
+
 
 def insert_class_schedule(schedule_items: List[Dict], table_name: str = 'ta_class_schedule') -> Dict[str, object]:
     """
@@ -6034,12 +6473,16 @@ async def sync_groups(request: Request):
             app_logger.info(f"群组同步完成: 成功 {success_count} 个, 失败 {error_count} 个")
             print(f"[groups/sync] 群组同步完成: 成功 {success_count} 个, 失败 {error_count} 个")
             
+            tencent_sync_summary = await notify_tencent_group_sync(user_id, groups)
+            print(f"[groups/sync] 腾讯 REST API 同步结果: {tencent_sync_summary}")
+
             result = {
                 'data': {
                     'message': '群组同步完成',
                     'code': 200,
                     'success_count': success_count,
-                    'error_count': error_count
+                    'error_count': error_count,
+                    'tencent_sync': tencent_sync_summary
                 }
             }
             print(f"[groups/sync] 返回结果: {result}")
