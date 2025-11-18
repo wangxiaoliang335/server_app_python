@@ -2125,6 +2125,7 @@ async def updateUserInfo(request: Request):
 
     if not id_number or not avatar:
         app_logger.warning("UpdateUserInfo failed: Missing id_number or avatar.")
+        print(f"[updateUserInfo] Missing id_number or avatar -> id_number={id_number}, avatar_present={avatar is not None}")
         return JSONResponse({'data': {'message': '身份证号码和头像必须提供', 'code': 400}}, status_code=400)
 
     connection = get_db_connection()
@@ -2136,6 +2137,7 @@ async def updateUserInfo(request: Request):
         avatar_bytes = base64.b64decode(avatar)
     except Exception as e:
         app_logger.error(f"UpdateUserInfo failed: Avatar decode error for {id_number}: {e}")
+        print(f"[updateUserInfo] Avatar decode error for id_number={id_number}: {e}")
         return JSONResponse({'data': {'message': '头像数据解析失败', 'code': 400}}, status_code=400)
 
     filename = f"{id_number}_.png"
@@ -2349,6 +2351,94 @@ async def update_user_name(request: Request):
     app_logger.info(f"updateUserName: 腾讯接口返回 {tencent_sync_summary}")
 
     return JSONResponse({'data': {'message': '用户名更新成功', 'code': 200, 'tencent_sync': tencent_sync_summary}})
+
+
+async def _update_user_field(phone: Optional[str], field: str, value, field_label: str, id_number: Optional[str] = None):
+    if (not phone and not id_number) or value is None:
+        return JSONResponse(
+            {'data': {'message': f'手机号或身份证号以及{field_label}必须提供', 'code': 400}},
+            status_code=400
+        )
+
+    connection = get_db_connection()
+    if connection is None:
+        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500}}, status_code=500)
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+        if id_number:
+            update_query = f"UPDATE ta_user_details SET {field} = %s WHERE id_number = %s"
+            params = (value, id_number)
+            print(f"[{field_label}] SQL -> {update_query}, params={params}")
+            cursor.execute(update_query, params)
+        else:
+            cursor.execute("SELECT id_number FROM ta_user_details WHERE phone = %s", (phone,))
+            row = cursor.fetchone()
+            if row:
+                id_number = row.get("id_number")
+                print(f"[{field_label}] Resolved id_number={id_number} from phone={phone}")
+            update_query = f"UPDATE ta_user_details SET {field} = %s WHERE phone = %s"
+            params = (value, phone)
+            print(f"[{field_label}] SQL -> {update_query}, params={params}")
+            cursor.execute(update_query, params)
+        if cursor.rowcount == 0:
+            connection.commit()
+            print(f"[{field_label}] No ta_user_details record found for phone={phone}, id_number={id_number}")
+            return JSONResponse({'data': {'message': '未找到对应的用户信息', 'code': 404}}, status_code=404)
+
+        connection.commit()
+        print(f"[{field_label}] Update success for phone={phone}")
+        return JSONResponse({'data': {'message': f'{field_label}更新成功', 'code': 200}})
+    except Error as e:
+        connection.rollback()
+        app_logger.error(f"数据库错误: 更新{field_label}失败 phone={phone}: {e}")
+        return JSONResponse({'data': {'message': f'{field_label}更新失败', 'code': 500}}, status_code=500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+
+
+@app.post("/updateUserSex")
+async def update_user_sex(request: Request):
+    data = await request.json()
+    print(f"[updateUserSex] Received payload: {data}")
+    phone = data.get('phone')
+    id_number = data.get('id_number')
+    sex = data.get('sex')
+    return await _update_user_field(phone, "sex", sex, "性别", id_number=id_number)
+
+
+@app.post("/updateUserAddress")
+async def update_user_address(request: Request):
+    data = await request.json()
+    print(f"[updateUserAddress] Received payload: {data}")
+    phone = data.get('phone')
+    id_number = data.get('id_number')
+    address = data.get('address')
+    return await _update_user_field(phone, "address", address, "地址", id_number=id_number)
+
+
+@app.post("/updateUserSchoolName")
+async def update_user_school_name(request: Request):
+    data = await request.json()
+    print(f"[updateUserSchoolName] Received payload: {data}")
+    phone = data.get('phone')
+    id_number = data.get('id_number')
+    school_name = data.get('school_name')
+    return await _update_user_field(phone, "school_name", school_name, "学校名称", id_number=id_number)
+
+
+@app.post("/updateUserGradeLevel")
+async def update_user_grade_level(request: Request):
+    data = await request.json()
+    print(f"[updateUserGradeLevel] Received payload: {data}")
+    phone = data.get('phone')
+    id_number = data.get('id_number')
+    grade_level = data.get('grade_level')
+    return await _update_user_field(phone, "grade_level", grade_level, "学段", id_number=id_number)
 
 
 @app.get("/userInfo")
