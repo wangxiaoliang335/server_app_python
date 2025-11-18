@@ -22,7 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from fastapi import FastAPI, Query
-from typing import Any, List, Dict, Optional
+from typing import Any, List, Dict, Optional, Union
 #import session
 from logging.handlers import TimedRotatingFileHandler
 from typing import Dict
@@ -2399,6 +2399,52 @@ async def _update_user_field(phone: Optional[str], field: str, value, field_labe
             cursor.close()
         if connection and connection.is_connected():
             connection.close()
+
+
+def _normalize_is_administrator(value: Optional[Union[str, int, bool]]) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, int):
+        return "是" if value else "否"
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return None
+        lower_value = normalized.lower()
+        truthy = {"1", "true", "yes", "y", "管理员", "是"}
+        falsy = {"0", "false", "no", "n", "普通", "否"}
+        if lower_value in truthy:
+            return "是"
+        if lower_value in falsy:
+            return "否"
+        return normalized
+    return str(value)
+
+
+@app.post("/updateUserAdministrator")
+async def update_user_administrator(request: Request):
+    data = await request.json()
+    print(f"[updateUserAdministrator] Received payload: {data}")
+    phone = data.get("phone")
+    id_number = data.get("id_number")
+    is_administrator_raw = data.get("is_administrator")
+    normalized_value = _normalize_is_administrator(is_administrator_raw)
+
+    if normalized_value is None:
+        return JSONResponse(
+            {'data': {'message': '管理员状态不能为空', 'code': 400}},
+            status_code=400
+        )
+
+    return await _update_user_field(
+        phone,
+        "is_administrator",
+        normalized_value,
+        "管理员状态",
+        id_number=id_number
+    )
 
 
 @app.post("/updateUserSex")
