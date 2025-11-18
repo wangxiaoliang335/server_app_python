@@ -143,13 +143,15 @@ TENCENT_API_USER_SIG = os.getenv("TENCENT_API_USER_SIG")
 TENCENT_API_TOKEN = os.getenv("TENCENT_API_TOKEN")
 TENCENT_API_TIMEOUT = float(os.getenv("TENCENT_API_TIMEOUT", "10"))
 TENCENT_API_SECRET_KEY = os.getenv("TENCENT_API_SECRET_KEY")
+TENCENT_PROFILE_API_URL = os.getenv("TENCENT_PROFILE_API_URL")
+TENCENT_PROFILE_API_PATH = os.getenv("TENCENT_PROFILE_API_PATH", "v4/profile/portrait_set")
 
 # 验证码有效期 (秒)
 VERIFICATION_CODE_EXPIRY = 300 # 5分钟
 
 from werkzeug.utils import secure_filename
 
-IMAGE_DIR = "./group_images"  # 群组头像目录
+# IMAGE_DIR = "./group_images"  # 群组头像目录
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
 # 根上传目录
@@ -183,53 +185,94 @@ def get_db_connection():
         return None
 
 
-def build_tencent_request_url(identifier: Optional[str] = None, usersig: Optional[str] = None) -> Optional[str]:
+def build_tencent_request_url(
+    identifier: Optional[str] = None,
+    usersig: Optional[str] = None,
+    *,
+    url_override: Optional[str] = None,
+    path_override: Optional[str] = None,
+    base_override: Optional[str] = None
+) -> Optional[str]:
     """
     生成腾讯 REST API 的完整请求 URL。
     优先使用 TENCENT_API_URL，其次使用 base + path + query 参数。
     """
-    if TENCENT_API_URL:
-        parsed = urllib.parse.urlparse(TENCENT_API_URL)
-        existing_query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-
-        def pick_single(values):
-            if isinstance(values, list):
-                return values[0] if values else ""
-            return values
-
-        normalized_query: Dict[str, str] = {k: pick_single(v) for k, v in existing_query.items()}
-
-        def ensure_query_param(key: str, value: Optional[str]):
-            if value is not None and (key not in normalized_query or not normalized_query[key]):
-                normalized_query[key] = value
-
-        effective_identifier = identifier or TENCENT_API_IDENTIFIER
-        effective_usersig = usersig or TENCENT_API_USER_SIG
-
-        ensure_query_param("sdkappid", TENCENT_API_SDK_APP_ID)
-        ensure_query_param("identifier", effective_identifier)
-        ensure_query_param("usersig", effective_usersig)
-        ensure_query_param("contenttype", "json")
-        if "random" not in normalized_query or not normalized_query["random"]:
-            normalized_query["random"] = str(random.randint(1, 2**31 - 1))
-
-        if "sdkappid" not in normalized_query or not normalized_query["sdkappid"]:
-            app_logger.error("TENCENT_API_URL 缺少 sdkappid 且未配置 TENCENT_API_SDK_APP_ID，无法构建完整 URL。")
-            return None
-
-        rebuilt_query = urllib.parse.urlencode(normalized_query)
-        rebuilt_url = urllib.parse.urlunparse(parsed._replace(query=rebuilt_query))
-        return rebuilt_url
-
-    if not TENCENT_API_BASE_URL:
-        return None
-
-    path = (TENCENT_API_PATH or "").strip("/")
-    base = TENCENT_API_BASE_URL.rstrip("/")
-    url = f"{base}/{path}" if path else base
+    if url_override is not None:
+        selected_url = url_override
+    elif path_override is not None:
+        selected_url = None
+    else:
+        selected_url = TENCENT_API_URL
+    selected_base = base_override or TENCENT_API_BASE_URL
+    selected_path = path_override if path_override is not None else TENCENT_API_PATH
 
     effective_identifier = identifier or TENCENT_API_IDENTIFIER
     effective_usersig = usersig or TENCENT_API_USER_SIG
+
+    extra_query: Dict[str, str] = {}
+
+    if selected_url:
+        parsed = urllib.parse.urlparse(selected_url)
+        if parsed.scheme and parsed.netloc:
+            existing_query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+
+            def pick_single(values):
+                if isinstance(values, list):
+                    return values[0] if values else ""
+                return values
+
+            normalized_query: Dict[str, str] = {k: pick_single(v) for k, v in existing_query.items()}
+
+            def ensure_query_param(key: str, value: Optional[str]):
+                if value is not None and (key not in normalized_query or not normalized_query[key]):
+                    normalized_query[key] = value
+
+            ensure_query_param("sdkappid", TENCENT_API_SDK_APP_ID)
+            ensure_query_param("identifier", effective_identifier)
+            ensure_query_param("usersig", effective_usersig)
+            ensure_query_param("contenttype", "json")
+            if "random" not in normalized_query or not normalized_query["random"]:
+                normalized_query["random"] = str(random.randint(1, 2**31 - 1))
+
+            if "sdkappid" not in normalized_query or not normalized_query["sdkappid"]:
+                app_logger.error("腾讯 REST API URL 缺少 sdkappid 且未配置 TENCENT_API_SDK_APP_ID，无法构建完整 URL。")
+                return None
+
+            rebuilt_query = urllib.parse.urlencode(normalized_query)
+            rebuilt_url = urllib.parse.urlunparse(parsed._replace(query=rebuilt_query))
+            return rebuilt_url
+        else:
+            if parsed.path:
+                computed_path = parsed.path.lstrip("/")
+                if parsed.scheme and not parsed.netloc:
+                    combined = parsed.scheme
+                    if computed_path:
+                        combined = f"{parsed.scheme}/{computed_path}"
+                    selected_path = combined
+                else:
+                    selected_path = parsed.path
+            if parsed.netloc and not selected_base and parsed.scheme:
+                selected_base = f"{parsed.scheme}://{parsed.netloc}"
+            if parsed.query:
+                for key, values in urllib.parse.parse_qs(parsed.query, keep_blank_values=True).items():
+                    if values:
+                        extra_query[key] = values[0]
+
+    if not selected_base and TENCENT_API_URL:
+        parsed_base_source = urllib.parse.urlparse(TENCENT_API_URL)
+        if parsed_base_source.scheme and parsed_base_source.netloc:
+            selected_base = f"{parsed_base_source.scheme}://{parsed_base_source.netloc}"
+
+    if not selected_base:
+        app_logger.error(
+            "构建腾讯 REST API URL 失败：缺少 base URL。"
+            f" selected_url={selected_url}, selected_base={selected_base}, selected_path={selected_path}"
+        )
+        return None
+
+    path = (selected_path or "").strip("/")
+    base = selected_base.rstrip("/")
+    url = f"{base}/{path}" if path else base
 
     if not (TENCENT_API_SDK_APP_ID and effective_identifier and effective_usersig):
         # 缺少拼装 query 所需的参数，则直接返回 base/path
@@ -242,7 +285,15 @@ def build_tencent_request_url(identifier: Optional[str] = None, usersig: Optiona
         "random": random.randint(1, 2**31 - 1),
         "contenttype": "json"
     }
-    return f"{url}?{urllib.parse.urlencode(query_params)}"
+    for key, value in extra_query.items():
+        query_params.setdefault(key, value)
+
+    final_url = f"{url}?{urllib.parse.urlencode(query_params)}"
+    if not final_url.lower().startswith(("http://", "https://")):
+        app_logger.error(f"构建腾讯 REST API URL 失败，结果缺少协议: {final_url}")
+        return None
+    app_logger.debug(f"构建腾讯 REST API URL: base={base}, path={path}, final={final_url}")
+    return final_url
 
 
 def build_tencent_headers() -> Dict[str, str]:
@@ -260,6 +311,32 @@ def build_tencent_headers() -> Dict[str, str]:
         except UnicodeEncodeError:
             app_logger.warning(f"Tencent REST API header {key} 包含非 Latin-1 字符，已跳过该字段。")
     return sanitized_headers
+
+
+def resolve_tencent_identifier(connection, *, id_number: Optional[str] = None, phone: Optional[str] = None) -> Optional[str]:
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+        if id_number:
+            cursor.execute("SELECT teacher_unique_id FROM ta_teacher WHERE id_card = %s", (id_number,))
+            row = cursor.fetchone()
+            if row:
+                identifier = row.get("teacher_unique_id")
+                if identifier:
+                    return identifier
+        if phone:
+            cursor.execute("SELECT teacher_unique_id FROM ta_teacher WHERE phone = %s", (phone,))
+            row = cursor.fetchone()
+            if row:
+                identifier = row.get("teacher_unique_id")
+                if identifier:
+                    return identifier
+    except Exception as e:
+        app_logger.error(f"解析腾讯 Identifier 时发生错误: {e}")
+    finally:
+        if cursor:
+            cursor.close()
+    return id_number or phone
 
 
 def normalize_tencent_group_type(raw_type: Optional[str]) -> str:
@@ -323,6 +400,95 @@ def generate_tencent_user_sig(identifier: str, expire: int = 86400) -> str:
     json_data = json.dumps(sig_doc, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     compressed = zlib.compress(json_data)
     return base64.b64encode(compressed).decode("utf-8")
+
+
+async def notify_tencent_user_profile(identifier: str, *, name: Optional[str] = None, avatar_url: Optional[str] = None) -> Dict[str, Any]:
+    if not identifier:
+        return {"status": "error", "error": "缺少腾讯用户 Identifier"}
+
+    profile_items: List[Dict[str, Any]] = []
+    if name:
+        profile_items.append({"Tag": "Tag_Profile_IM_Nick", "Value": name})
+    if avatar_url:
+        profile_items.append({"Tag": "Tag_Profile_IM_Image", "Value": avatar_url})
+
+    if not profile_items:
+        return {"status": "skipped", "reason": "empty_profile_items"}
+
+    usersig_to_use: Optional[str] = None
+    sig_error: Optional[str] = None
+    if TENCENT_API_SECRET_KEY:
+        try:
+            usersig_to_use = generate_tencent_user_sig(identifier)
+        except Exception as e:
+            sig_error = f"自动生成用户 UserSig 失败: {e}"
+            app_logger.error(sig_error)
+
+    if not usersig_to_use:
+        usersig_to_use = TENCENT_API_USER_SIG
+
+    if not usersig_to_use:
+        error_message = "缺少可用的 UserSig，已跳过腾讯用户资料同步。"
+        app_logger.error(error_message)
+        return {"status": "error", "error": error_message}
+
+    url = build_tencent_request_url(
+        identifier=identifier,
+        usersig=usersig_to_use,
+        url_override=TENCENT_PROFILE_API_URL,
+        path_override=TENCENT_PROFILE_API_PATH
+    )
+    if not url:
+        msg = "腾讯用户资料接口未配置，跳过同步"
+        app_logger.warning(msg)
+        return {"status": "skipped", "reason": "missing_configuration", "message": msg}
+
+    headers = build_tencent_headers()
+    payload = {
+        "From_Account": identifier,
+        "ProfileItem": profile_items
+    }
+
+    if sig_error:
+        masked_error = sig_error.replace(usersig_to_use or "", "***")
+        app_logger.warning(masked_error)
+
+    def _send_request() -> Dict[str, Any]:
+        encoded_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            url=url,
+            data=encoded_payload,
+            headers=headers,
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=TENCENT_API_TIMEOUT) as response:
+                raw_body = response.read()
+                text_body = raw_body.decode("utf-8", errors="replace")
+                try:
+                    parsed_body = json.loads(text_body)
+                except json.JSONDecodeError:
+                    parsed_body = None
+
+                result = {
+                    "status": "success",
+                    "http_status": response.status,
+                    "response": parsed_body or text_body
+                }
+                app_logger.info(f"Tencent 用户资料同步成功: {result}")
+                return result
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            app_logger.error(f"Tencent 用户资料同步失败 (HTTP {e.code}): {body}")
+            return {"status": "error", "http_status": e.code, "error": body}
+        except urllib.error.URLError as e:
+            app_logger.error(f"Tencent 用户资料接口调用异常: {e}")
+            return {"status": "error", "http_status": None, "error": str(e)}
+        except Exception as exc:
+            app_logger.exception(f"Tencent 用户资料接口未知异常: {exc}")
+            return {"status": "error", "http_status": None, "error": str(exc)}
+
+    return await asyncio.to_thread(_send_request)
 
 
 async def notify_tencent_group_sync(user_id: str, groups: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1952,6 +2118,7 @@ async def list_schools(request: Request):
 @app.post("/updateUserInfo")
 async def updateUserInfo(request: Request):
     data = await request.json()
+    print(f"[updateUserInfo] Received payload: {data}")
     phone = data.get('phone')
     id_number = data.get('id_number')
     avatar = data.get('avatar')
@@ -1965,27 +2132,223 @@ async def updateUserInfo(request: Request):
         app_logger.error("UpdateUserInfo failed: Database connection error.")
         return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500}}, status_code=500)
 
-    avatar_bytes = base64.b64decode(avatar)
+    try:
+        avatar_bytes = base64.b64decode(avatar)
+    except Exception as e:
+        app_logger.error(f"UpdateUserInfo failed: Avatar decode error for {id_number}: {e}")
+        return JSONResponse({'data': {'message': '头像数据解析失败', 'code': 400}}, status_code=400)
+
     filename = f"{id_number}_.png"
     file_path = os.path.join(IMAGE_DIR, filename)
     with open(file_path, "wb") as f:
         f.write(avatar_bytes)
 
     cursor = None
+    user_details: Optional[Dict[str, Any]] = None
+    tencent_identifier: Optional[str] = None
     try:
         update_query = "UPDATE ta_user_details SET avatar = %s WHERE id_number = %s"
         cursor = connection.cursor(dictionary=True)
+        print(f"[updateUserInfo] SQL -> {update_query}, params=({file_path}, {id_number})")
         cursor.execute(update_query, (file_path, id_number))
-        connection.commit()
-        cursor.close()
-        return JSONResponse({'data': {'message': '更新成功', 'code': 200}})
+        if cursor.rowcount == 0:
+            cursor.execute(
+                "SELECT name, phone, id_number, avatar FROM ta_user_details WHERE id_number = %s",
+                (id_number,)
+            )
+            user_details = cursor.fetchone()
+            if not user_details and phone:
+                cursor.execute(
+                    "SELECT name, phone, id_number, avatar FROM ta_user_details WHERE phone = %s",
+                    (phone,)
+                )
+                user_details = cursor.fetchone()
+                print(f"[updateUserInfo] Fallback by phone={phone}, fetched user_details={user_details}")
+            else:
+                print(f"[updateUserInfo] Found user_details by id_number={id_number}: {user_details}")
+
+            if not user_details:
+                cursor.execute(
+                    "SELECT avatar FROM ta_user_details WHERE id_number = %s",
+                    (id_number,)
+                )
+                existing_avatar_row = cursor.fetchone()
+                existing_avatar = existing_avatar_row["avatar"] if existing_avatar_row else None
+                print(f"[updateUserInfo] No ta_user_details record affected for id_number={id_number}, "
+                      f"existing avatar in DB: {existing_avatar}")
+                connection.commit()
+                app_logger.warning(f"UpdateUserInfo: No user_details record found for id_number={id_number}")
+                return JSONResponse({'data': {'message': '未找到对应的用户信息', 'code': 404}}, status_code=404)
+        else:
+            connection.commit()
+            cursor.execute(
+                "SELECT name, phone, id_number, avatar FROM ta_user_details WHERE id_number = %s",
+                (id_number,)
+            )
+            user_details = cursor.fetchone()
+            if not user_details and phone:
+                cursor.execute(
+                    "SELECT name, phone, id_number, avatar FROM ta_user_details WHERE phone = %s",
+                    (phone,)
+                )
+                user_details = cursor.fetchone()
+                print(f"[updateUserInfo] Fallback by phone={phone}, fetched user_details={user_details}")
+            else:
+                print(f"[updateUserInfo] Found user_details by id_number={id_number}: {user_details}")
+
+        tencent_identifier = resolve_tencent_identifier(connection, id_number=id_number, phone=phone)
+        print(f"[updateUserInfo] Resolved Tencent identifier={tencent_identifier}")
+
     except Error as e:
         app_logger.error(f"Database error during updateUserInfo for {phone}: {e}")
         return JSONResponse({'data': {'message': '更新失败', 'code': 500}}, status_code=500)
     finally:
+        if cursor:
+            cursor.close()
         if connection and connection.is_connected():
             connection.close()
             app_logger.info(f"Database connection closed after updating user info for {phone}.")
+
+    name_for_sync = None
+    avatar_for_sync = None
+    if user_details:
+        name_for_sync = user_details.get("name")
+        avatar_for_sync = user_details.get("avatar") or file_path
+    else:
+        avatar_for_sync = file_path
+
+    print(f"[updateUserInfo] Tencent sync request -> identifier={tencent_identifier or id_number}, "
+          f"name={name_for_sync}, avatar={avatar_for_sync}")
+    app_logger.info(
+        f"updateUserInfo: 准备同步腾讯用户资料 identifier={tencent_identifier or id_number}, "
+        f"name={name_for_sync}, avatar={avatar_for_sync}"
+    )
+    tencent_sync_summary = await notify_tencent_user_profile(
+        tencent_identifier or id_number,
+        name=name_for_sync,
+        avatar_url=avatar_for_sync
+    )
+    print(f"[updateUserInfo] Tencent sync response <- {tencent_sync_summary}")
+    app_logger.info(f"updateUserInfo: 腾讯接口返回 {tencent_sync_summary}")
+
+    return JSONResponse({'data': {'message': '更新成功', 'code': 200, 'tencent_sync': tencent_sync_summary}})
+
+
+@app.post("/updateUserName")
+async def update_user_name(request: Request):
+    data = await request.json()
+    print(f"[updateUserName] Received payload: {data}")
+    name = data.get('name')
+    id_number = data.get('id_number')
+    phone = data.get('phone')
+
+    if not name or (not id_number and not phone):
+        app_logger.warning("update_user_name failed: Missing name or identifier.")
+        return JSONResponse(
+            {'data': {'message': '姓名和身份证号码或手机号必须提供', 'code': 400}},
+            status_code=400
+        )
+
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("update_user_name failed: Database connection error.")
+        return JSONResponse(
+            {'data': {'message': '数据库连接失败', 'code': 500}},
+            status_code=500
+        )
+
+    cursor = None
+    user_details: Optional[Dict[str, Any]] = None
+    effective_id_number: Optional[str] = id_number
+    tencent_identifier: Optional[str] = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+
+        if id_number:
+            cursor.execute(
+                "UPDATE ta_user_details SET name = %s WHERE id_number = %s",
+                (name, id_number)
+            )
+        else:
+            cursor.execute(
+                "UPDATE ta_user_details SET name = %s WHERE phone = %s",
+                (name, phone)
+            )
+            cursor.execute(
+                "SELECT id_number FROM ta_user_details WHERE phone = %s",
+                (phone,)
+            )
+            row = cursor.fetchone()
+            if row:
+                effective_id_number = row.get("id_number")
+
+        if cursor.rowcount == 0:
+            app_logger.warning("update_user_name: No matching user_details record found.")
+            return JSONResponse(
+                {'data': {'message': '未找到对应的用户信息', 'code': 404}},
+                status_code=404
+            )
+
+        # 选填: 同步更新 ta_teacher 的姓名（如果存在）
+        if effective_id_number:
+            cursor.execute(
+                "UPDATE ta_teacher SET name = %s WHERE id_card = %s",
+                (name, effective_id_number)
+            )
+
+        connection.commit()
+
+        cursor.execute(
+            "SELECT name, phone, id_number, avatar FROM ta_user_details WHERE id_number = %s",
+            (effective_id_number,)
+        )
+        user_details = cursor.fetchone()
+        if not user_details and phone:
+            cursor.execute(
+                "SELECT name, phone, id_number, avatar FROM ta_user_details WHERE phone = %s",
+                (phone,)
+            )
+            user_details = cursor.fetchone()
+
+        tencent_identifier = resolve_tencent_identifier(
+            connection,
+            id_number=effective_id_number,
+            phone=phone
+        )
+
+    except Error as e:
+        connection.rollback()
+        app_logger.error(f"Database error during update_user_name for {id_number or phone}: {e}")
+        return JSONResponse(
+            {'data': {'message': '用户名更新失败', 'code': 500}},
+            status_code=500
+        )
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info(f"Database connection closed after update_user_name for {id_number or phone}.")
+
+    avatar_for_sync = None
+    if user_details:
+        avatar_for_sync = user_details.get("avatar")
+
+    print(f"[updateUserName] Tencent sync request -> identifier={tencent_identifier or effective_id_number or phone}, "
+          f"name={name}, avatar={avatar_for_sync}")
+    app_logger.info(
+        f"updateUserName: 准备同步腾讯用户资料 identifier={tencent_identifier or effective_id_number or phone}, "
+        f"name={name}, avatar={avatar_for_sync}"
+    )
+    tencent_sync_summary = await notify_tencent_user_profile(
+        tencent_identifier or effective_id_number or phone,
+        name=name,
+        avatar_url=avatar_for_sync
+    )
+    print(f"[updateUserName] Tencent sync response <- {tencent_sync_summary}")
+    app_logger.info(f"updateUserName: 腾讯接口返回 {tencent_sync_summary}")
+
+    return JSONResponse({'data': {'message': '用户名更新成功', 'code': 200, 'tencent_sync': tencent_sync_summary}})
 
 
 @app.get("/userInfo")
