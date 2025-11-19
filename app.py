@@ -52,6 +52,10 @@ from mysql.connector import Error
 # 加载 .env 文件
 load_dotenv()
 
+# 验证关键环境变量是否加载
+print(f"[启动检查] TENCENT_API_IDENTIFIER = {os.getenv('TENCENT_API_IDENTIFIER')}")
+print(f"[启动检查] TENCENT_API_SDK_APP_ID = {os.getenv('TENCENT_API_SDK_APP_ID')}")
+
 IMAGE_DIR = "/var/www/images"  # 存头像的目录
 
 # ===== 停止事件，用于控制心跳协程退出 =====
@@ -146,6 +150,10 @@ TENCENT_API_SECRET_KEY = os.getenv("TENCENT_API_SECRET_KEY")
 TENCENT_PROFILE_API_URL = os.getenv("TENCENT_PROFILE_API_URL")
 TENCENT_PROFILE_API_PATH = os.getenv("TENCENT_PROFILE_API_PATH", "v4/profile/portrait_set")
 
+# 打印关键配置（用于调试）
+print(f"[配置加载] TENCENT_API_IDENTIFIER = {TENCENT_API_IDENTIFIER}")
+print(f"[配置加载] TENCENT_API_SDK_APP_ID = {TENCENT_API_SDK_APP_ID}")
+
 # 验证码有效期 (秒)
 VERIFICATION_CODE_EXPIRY = 300 # 5分钟
 
@@ -223,13 +231,15 @@ def build_tencent_request_url(
 
             normalized_query: Dict[str, str] = {k: pick_single(v) for k, v in existing_query.items()}
 
-            def ensure_query_param(key: str, value: Optional[str]):
-                if value is not None and (key not in normalized_query or not normalized_query[key]):
-                    normalized_query[key] = value
+            def ensure_query_param(key: str, value: Optional[str], force: bool = False):
+                if value is not None:
+                    if force or (key not in normalized_query or not normalized_query[key]):
+                        normalized_query[key] = value
 
             ensure_query_param("sdkappid", TENCENT_API_SDK_APP_ID)
-            ensure_query_param("identifier", effective_identifier)
-            ensure_query_param("usersig", effective_usersig)
+            # 强制覆盖 identifier 和 usersig，确保使用传入的值
+            ensure_query_param("identifier", effective_identifier, force=True)
+            ensure_query_param("usersig", effective_usersig, force=True)
             ensure_query_param("contenttype", "json")
             if "random" not in normalized_query or not normalized_query["random"]:
                 normalized_query["random"] = str(random.randint(1, 2**31 - 1))
@@ -364,6 +374,22 @@ def normalize_tencent_group_type(raw_type: Optional[str]) -> str:
     return mapping.get(normalized_key, default_type)
 
 
+def normalize_tencent_group_id(group_id: Optional[str]) -> Optional[str]:
+    """
+    清理群组ID，移除腾讯IM不允许的 @TGS# 前缀。
+    腾讯 REST API 不允许群组ID包含 @TGS# 前缀，需要移除。
+    """
+    if not group_id:
+        return group_id
+    
+    group_id_str = str(group_id).strip()
+    # 移除 @TGS# 前缀（如果存在）
+    if group_id_str.startswith("@TGS#"):
+        group_id_str = group_id_str[5:]  # 移除 "@TGS#" 这5个字符
+    
+    return group_id_str if group_id_str else None
+
+
 def generate_tencent_user_sig(identifier: str, expire: int = 86400) -> str:
     if not (TENCENT_API_SDK_APP_ID and TENCENT_API_SECRET_KEY):
         raise ValueError("缺少 TENCENT_API_SDK_APP_ID 或 TENCENT_API_SECRET_KEY 配置，无法生成 UserSig。")
@@ -494,26 +520,53 @@ async def notify_tencent_user_profile(identifier: str, *, name: Optional[str] = 
 async def notify_tencent_group_sync(user_id: str, groups: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     将同步到本地数据库的群组数据推送到腾讯 REST API。
+    注意：腾讯 REST API 要求使用管理员账号作为 identifier，而不是普通用户账号。
     """
+    print(f"[notify_tencent_group_sync] 函数被调用: user_id={user_id}, groups数量={len(groups) if groups else 0}")
+    app_logger.info(f"notify_tencent_group_sync 被调用: user_id={user_id}, groups数量={len(groups) if groups else 0}")
+    
     if not groups:
         return {"status": "skipped", "reason": "empty_groups"}
 
-    identifier_to_use = user_id
+    # 使用管理员账号作为 identifier（腾讯 REST API 要求）
+    admin_identifier = TENCENT_API_IDENTIFIER
+    print(f"[notify_tencent_group_sync] TENCENT_API_IDENTIFIER 值: {admin_identifier}")
+    app_logger.info(f"TENCENT_API_IDENTIFIER 环境变量值: {admin_identifier}")
+    
+    if not admin_identifier:
+        error_message = "缺少腾讯 REST API 管理员账号配置 (TENCENT_API_IDENTIFIER)，已跳过同步。"
+        app_logger.error(error_message)
+        return {
+            "status": "error",
+            "http_status": None,
+            "error": error_message
+        }
+
+    # 确保 identifier 是字符串类型
+    identifier_to_use = str(admin_identifier) if admin_identifier else None
+    print(f"[notify_tencent_group_sync] 最终使用的 identifier: {identifier_to_use}, 类型: {type(identifier_to_use)}")
+    app_logger.info(f"群组同步使用管理员账号作为 identifier: {identifier_to_use} (原始 user_id: {user_id})")
 
     usersig_to_use: Optional[str] = None
     sig_error: Optional[str] = None
     if TENCENT_API_SECRET_KEY:
         try:
+            # 为管理员账号生成 UserSig
+            print(f"[notify_tencent_group_sync] 准备为管理员账号生成 UserSig: identifier={identifier_to_use}, type={type(identifier_to_use)}")
             usersig_to_use = generate_tencent_user_sig(identifier_to_use)
+            print(f"[notify_tencent_group_sync] UserSig 生成成功，长度: {len(usersig_to_use) if usersig_to_use else 0}")
+            app_logger.info(f"为管理员账号 {identifier_to_use} 生成 UserSig 成功")
         except Exception as e:
-            sig_error = f"自动生成 UserSig 失败: {e}"
+            sig_error = f"自动生成管理员 UserSig 失败: {e}"
+            print(f"[notify_tencent_group_sync] UserSig 生成失败: {sig_error}")
             app_logger.error(sig_error)
 
     if not usersig_to_use:
+        print(f"[notify_tencent_group_sync] 使用配置的 TENCENT_API_USER_SIG")
         usersig_to_use = TENCENT_API_USER_SIG
 
     if not usersig_to_use:
-        error_message = "缺少可用的 UserSig，已跳过腾讯 REST API 同步。"
+        error_message = "缺少可用的管理员 UserSig，已跳过腾讯 REST API 同步。"
         app_logger.error(error_message)
         return {
             "status": "error",
@@ -541,7 +594,10 @@ async def notify_tencent_group_sync(user_id: str, groups: List[Dict[str, Any]]) 
         if not prepared["Name"]:
             prepared["Name"] = f"group_{prepared.get('group_id') or random.randint(1, 2**31 - 1)}"
 
-        owner = prepared.get("Owner_Account") or prepared.get("owner_identifier") or identifier_to_use
+        # Owner_Account 应该使用实际的群主账号，而不是管理员账号
+        # identifier_to_use 现在是管理员账号，用于 REST API 认证
+        # 但群主应该是从 group 数据中获取，或者使用传入的 user_id
+        owner = prepared.get("Owner_Account") or prepared.get("owner_identifier") or user_id
         if owner:
             prepared["Owner_Account"] = owner
 
@@ -576,10 +632,18 @@ async def notify_tencent_group_sync(user_id: str, groups: List[Dict[str, Any]]) 
         return {"query": query_dict}
 
     def build_group_payload(group: Dict[str, Any]) -> Dict[str, Any]:
+        # 获取原始群组ID并清理 @TGS# 前缀
+        raw_group_id = group.get("GroupId") or group.get("group_id")
+        cleaned_group_id = normalize_tencent_group_id(raw_group_id)
+        
+        # 记录群组ID清理过程（如果发生了清理）
+        if raw_group_id and raw_group_id != cleaned_group_id:
+            app_logger.info(f"群组ID已清理: 原始ID='{raw_group_id}' -> 清理后ID='{cleaned_group_id}'")
+        
         payload: Dict[str, Any] = {
             "Owner_Account": group.get("Owner_Account"),
             "Type": normalize_tencent_group_type(group.get("Type") or group.get("group_type")),
-            "GroupId": group.get("GroupId") or group.get("group_id"),
+            "GroupId": cleaned_group_id,
             "Name": group.get("Name")
         }
 
@@ -633,26 +697,11 @@ async def notify_tencent_group_sync(user_id: str, groups: List[Dict[str, Any]]) 
 
     headers = build_tencent_headers()
 
-    def send_single_group(group_payload: Dict[str, Any]) -> Dict[str, Any]:
-        current_url = build_tencent_request_url(identifier=identifier_to_use, usersig=usersig_to_use)
-        if not current_url:
-            return {
-                "status": "error",
-                "http_status": None,
-                "error": "腾讯 REST API 未配置有效 URL"
-            }
-
-        validation = validate_and_log_url(current_url)
-        if "error" in validation:
-            return {
-                "status": "error",
-                "http_status": None,
-                "error": validation["error"]
-            }
-
-        encoded_payload = json.dumps(group_payload, ensure_ascii=False).encode("utf-8")
+    def send_http_request(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """发送 HTTP 请求到腾讯 REST API"""
+        encoded_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
-            url=current_url,
+            url=url,
             data=encoded_payload,
             headers=headers,
             method="POST"
@@ -671,7 +720,6 @@ async def notify_tencent_group_sync(user_id: str, groups: List[Dict[str, Any]]) 
                     "http_status": response.status,
                     "response": parsed_body or text_body
                 }
-                app_logger.info(f"Tencent REST API 同步成功: {result}")
                 return result
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
@@ -695,6 +743,121 @@ async def notify_tencent_group_sync(user_id: str, groups: List[Dict[str, Any]]) 
                 "http_status": None,
                 "error": str(exc)
             }
+
+    def build_update_group_payload(group_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """构建更新群组信息的 payload（只包含可更新的字段）"""
+        update_payload = {
+            "GroupId": group_payload.get("GroupId"),
+            "Name": group_payload.get("Name"),
+        }
+        
+        # 添加可选字段
+        optional_fields = {
+            "Introduction": group_payload.get("Introduction"),
+            "Notification": group_payload.get("Notification"),
+            "FaceUrl": group_payload.get("FaceUrl"),
+            "MaxMemberCount": group_payload.get("MaxMemberCount"),
+            "ApplyJoinOption": group_payload.get("ApplyJoinOption"),
+        }
+        
+        for key, value in optional_fields.items():
+            if value is not None:
+                update_payload[key] = value
+        
+        return update_payload
+
+    def send_single_group(group_payload: Dict[str, Any]) -> Dict[str, Any]:
+        group_id = group_payload.get("GroupId", "unknown")
+        print(f"[send_single_group] 准备同步群组: group_id={group_id}, 使用 identifier={identifier_to_use}")
+        app_logger.info(f"准备同步群组到腾讯 REST API: group_id={group_id}, 使用 identifier={identifier_to_use}")
+        
+        # 构建导入群组的 URL（默认 API）
+        current_url = build_tencent_request_url(identifier=identifier_to_use, usersig=usersig_to_use)
+        print(f"[send_single_group] 构建的 URL (前100字符): {current_url[:100] if current_url else 'None'}...")
+        if not current_url:
+            return {
+                "status": "error",
+                "http_status": None,
+                "error": "腾讯 REST API 未配置有效 URL"
+            }
+
+        validation = validate_and_log_url(current_url)
+        if "error" in validation:
+            return {
+                "status": "error",
+                "http_status": None,
+                "error": validation["error"]
+            }
+        
+        # 从 URL 中提取实际使用的 identifier，用于验证
+        parsed_url = urllib.parse.urlparse(current_url)
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+        actual_identifier = query_params.get("identifier", [None])[0]
+        print(f"[send_single_group] 实际使用的 identifier (从 URL 提取): {actual_identifier}, 期望的管理员账号: {identifier_to_use}")
+        app_logger.info(f"实际使用的 identifier (从 URL 提取): {actual_identifier}, 期望的管理员账号: {identifier_to_use}")
+
+        # 先尝试导入群组
+        app_logger.info(f"发送群组导入请求: group_id={group_id}, payload_keys={list(group_payload.keys())}")
+        result = send_http_request(current_url, group_payload)
+        
+        # 检查响应中的错误信息
+        if result.get("status") == "success" and isinstance(result.get("response"), dict):
+            parsed_body = result.get("response")
+            action_status = parsed_body.get("ActionStatus")
+            error_code = parsed_body.get("ErrorCode")
+            error_info = parsed_body.get("ErrorInfo")
+            
+            if action_status == "FAIL":
+                print(f"[send_single_group] 腾讯 API 返回错误: ErrorCode={error_code}, ErrorInfo={error_info}")
+                print(f"[send_single_group] 请求使用的 identifier: {actual_identifier}, group_id: {group_id}")
+                
+                # 如果是群组已存在的错误（10021），尝试使用更新 API
+                if error_code == 10021:
+                    print(f"[send_single_group] 群组 {group_id} 已存在，尝试使用更新 API")
+                    app_logger.info(f"群组 {group_id} 已存在，切换到更新群组信息 API")
+                    
+                    # 构建更新群组的 URL
+                    # 将 import_group 替换为 modify_group_base_info
+                    if "/import_group" in current_url:
+                        update_path = current_url.replace("/import_group", "/modify_group_base_info")
+                    elif "/group_open_http_svc/import_group" in current_url:
+                        # 如果 URL 中包含 group_open_http_svc/import_group，替换路径
+                        update_path = current_url.replace("/group_open_http_svc/import_group", "/group_open_http_svc/modify_group_base_info")
+                    else:
+                        # 如果 URL 中没有找到 import_group，尝试从路径构建
+                        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                        query_str = parsed_url.query
+                        update_path = f"{base_url}/v4/group_open_http_svc/modify_group_base_info" + (f"?{query_str}" if query_str else "")
+                    
+                    # 构建更新群组的 payload
+                    update_payload = build_update_group_payload(group_payload)
+                    print(f"[send_single_group] 使用更新 API，URL: {update_path[:100]}..., payload: {list(update_payload.keys())}")
+                    app_logger.info(f"使用更新群组信息 API: group_id={group_id}")
+                    
+                    # 发送更新请求
+                    update_result = send_http_request(update_path, update_payload)
+                    
+                    # 检查更新结果
+                    if update_result.get("status") == "success" and isinstance(update_result.get("response"), dict):
+                        update_body = update_result.get("response")
+                        update_action_status = update_body.get("ActionStatus")
+                        if update_action_status == "OK":
+                            print(f"[send_single_group] 群组 {group_id} 更新成功")
+                            app_logger.info(f"群组 {group_id} 更新成功")
+                            return update_result
+                        else:
+                            print(f"[send_single_group] 群组 {group_id} 更新失败: {update_body.get('ErrorInfo')}")
+                            app_logger.warning(f"群组 {group_id} 更新失败: {update_body.get('ErrorInfo')}")
+                            # 返回更新结果，即使失败也记录
+                            return update_result
+                    else:
+                        print(f"[send_single_group] 群组 {group_id} 更新请求失败")
+                        app_logger.error(f"群组 {group_id} 更新请求失败: {update_result.get('error')}")
+                        # 返回原始导入结果
+                        return result
+        
+        app_logger.info(f"Tencent REST API 同步完成: group_id={group_id}")
+        return result
 
     loop = asyncio.get_running_loop()
     tasks = []
