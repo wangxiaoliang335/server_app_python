@@ -934,6 +934,83 @@ async def create_tencent_user_sig(request: Request):
     return JSONResponse({'data': response_data, 'code': 200})
 
 
+@app.post("/getUserSig")
+async def get_user_sig(request: Request):
+    """
+    获取腾讯 IM UserSig 接口
+    客户端调用：POST /getUserSig
+    支持 JSON 格式：{"user_id": "xxx"} 或表单格式：user_id=xxx
+    返回格式：{"data": {"user_sig": "...", "usersig": "...", "sig": "..."}, "code": 200}
+    """
+    user_id = None
+    expire = 86400
+    
+    # 尝试解析 JSON
+    try:
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = await request.json()
+            user_id = body.get("user_id") or body.get("identifier")
+            expire = body.get("expire", 86400)
+        else:
+            # 尝试解析表单数据
+            form_data = await request.form()
+            user_id_val = form_data.get("user_id") or form_data.get("identifier")
+            if user_id_val:
+                user_id = str(user_id_val) if not isinstance(user_id_val, str) else user_id_val
+            if form_data.get("expire"):
+                expire_val = form_data.get("expire")
+                expire = str(expire_val) if not isinstance(expire_val, str) else expire_val
+    except Exception as e:
+        print(f"[getUserSig] 解析请求失败: {e}")
+        app_logger.error(f"解析请求失败: {e}")
+        return JSONResponse(
+            {'data': {'message': '请求格式错误', 'code': 400}},
+            status_code=400
+        )
+
+    if not user_id:
+        return JSONResponse(
+            {'data': {'message': '缺少 user_id 参数', 'code': 400}},
+            status_code=400
+        )
+
+    try:
+        expire_int = int(expire)
+        if expire_int <= 0:
+            raise ValueError("expire must be positive")
+    except (ValueError, TypeError):
+        return JSONResponse(
+            {'data': {'message': 'expire 参数必须为正整数', 'code': 400}},
+            status_code=400
+        )
+
+    try:
+        user_sig = generate_tencent_user_sig(user_id, expire_int)
+        print(f"[getUserSig] 为 user_id={user_id} 生成 UserSig 成功，长度: {len(user_sig)}")
+        app_logger.info(f"为 user_id={user_id} 生成 UserSig 成功")
+    except ValueError as config_error:
+        app_logger.error(f"生成 UserSig 配置错误: {config_error}")
+        return JSONResponse(
+            {'data': {'message': str(config_error), 'code': 500}},
+            status_code=500
+        )
+    except Exception as e:
+        app_logger.exception(f"生成 UserSig 时发生异常: {e}")
+        return JSONResponse(
+            {'data': {'message': f'生成 UserSig 失败: {e}', 'code': 500}},
+            status_code=500
+        )
+
+    # 返回客户端期望的格式，支持多种字段名
+    response_data = {
+        'user_sig': user_sig,  # 主要字段
+        'usersig': user_sig,   # 备用字段
+        'sig': user_sig        # 备用字段
+    }
+    return JSONResponse({'data': response_data, 'code': 200})
+
+
 def insert_class_schedule(schedule_items: List[Dict], table_name: str = 'ta_class_schedule') -> Dict[str, object]:
     """
     批量插入课程表数据到指定表。
