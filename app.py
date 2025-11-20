@@ -766,6 +766,70 @@ async def notify_tencent_group_sync(user_id: str, groups: List[Dict[str, Any]]) 
         
         return update_payload
 
+    def send_group_welcome_message(group_payload: Dict[str, Any]) -> None:
+        """调用腾讯 REST API 发送欢迎群消息"""
+        group_id = group_payload.get("GroupId")
+        if not group_id:
+            app_logger.warning("send_group_welcome_message: 缺少 GroupId，跳过发送欢迎消息")
+            return
+
+        group_name = (
+            group_payload.get("Name")
+            or group_payload.get("group_name")
+            or f"{group_id}"
+        )
+        welcome_text = f"欢迎大家来到{group_name}里面"
+
+        message_url = build_tencent_request_url(
+            identifier=identifier_to_use,
+            usersig=usersig_to_use,
+            path_override="v4/group_open_http_svc/send_group_msg"
+        )
+        if not message_url:
+            app_logger.error(f"[send_group_welcome_message] 构建 send_group_msg URL 失败，group_id={group_id}")
+            print(f"[send_group_welcome_message] FAILED -> url missing, group_id={group_id}")
+            return
+
+        random_value = random.randint(1, 2**31 - 1)
+        message_payload: Dict[str, Any] = {
+            "GroupId": group_id,
+            "Random": random_value,
+            "From_Account": identifier_to_use,
+            "MsgBody": [
+                {
+                    "MsgType": "TIMTextElem",
+                    "MsgContent": {"Text": welcome_text}
+                }
+            ]
+        }
+
+        print(f"[send_group_welcome_message] READY -> group_id={group_id}, random={random_value}, text={welcome_text}")
+        app_logger.info(
+            f"[send_group_welcome_message] 准备发送欢迎消息 group_id={group_id}, random={random_value}, text={welcome_text}"
+        )
+        app_logger.debug(f"[send_group_welcome_message] payload={message_payload}")
+
+        welcome_result = send_http_request(message_url, message_payload)
+        app_logger.info(f"[send_group_welcome_message] 响应: {welcome_result}")
+
+        if welcome_result.get("status") == "success" and isinstance(welcome_result.get("response"), dict):
+            resp = welcome_result.get("response")
+            action_status = resp.get("ActionStatus")
+            if action_status == "OK":
+                print(f"[send_group_welcome_message] SUCCESS -> group_id={group_id}")
+                app_logger.info(f"[send_group_welcome_message] 群 {group_id} 欢迎消息发送成功 resp={resp}")
+            else:
+                error_info = resp.get("ErrorInfo")
+                error_code = resp.get("ErrorCode")
+                print(f"[send_group_welcome_message] FAIL -> group_id={group_id}, error={error_info}, code={error_code}")
+                app_logger.warning(
+                    f"[send_group_welcome_message] 群 {group_id} 欢迎消息失败 code={error_code}, info={error_info}, resp={resp}"
+                )
+        else:
+            error_detail = welcome_result.get("error")
+            print(f"[send_group_welcome_message] REQUEST FAIL -> group_id={group_id}, error={error_detail}")
+            app_logger.error(f"[send_group_welcome_message] 群 {group_id} 欢迎消息请求失败: {welcome_result}")
+
     def send_single_group(group_payload: Dict[str, Any]) -> Dict[str, Any]:
         group_id = group_payload.get("GroupId", "unknown")
         print(f"[send_single_group] 准备同步群组: group_id={group_id}, 使用 identifier={identifier_to_use}")
@@ -806,8 +870,14 @@ async def notify_tencent_group_sync(user_id: str, groups: List[Dict[str, Any]]) 
             action_status = parsed_body.get("ActionStatus")
             error_code = parsed_body.get("ErrorCode")
             error_info = parsed_body.get("ErrorInfo")
-            
-            if action_status == "FAIL":
+            print(f"[send_single_group] import_group 响应: group_id={group_id}, ActionStatus={action_status}, ErrorCode={error_code}, ErrorInfo={error_info}")
+            app_logger.info(f"[send_single_group] import_group 响应 group_id={group_id}: {parsed_body}")
+            if action_status == "OK":
+                print(f"[send_single_group] import_group 成功，准备发送欢迎消息 group_id={group_id}")
+                app_logger.info(f"[send_single_group] import_group 成功，准备发送欢迎消息 group_id={group_id}")
+                # 创建群成功，发送欢迎消息
+                send_group_welcome_message(group_payload)
+            elif action_status == "FAIL":
                 print(f"[send_single_group] 腾讯 API 返回错误: ErrorCode={error_code}, ErrorInfo={error_info}")
                 print(f"[send_single_group] 请求使用的 identifier: {actual_identifier}, group_id: {group_id}")
                 
@@ -855,7 +925,10 @@ async def notify_tencent_group_sync(user_id: str, groups: List[Dict[str, Any]]) 
                         app_logger.error(f"群组 {group_id} 更新请求失败: {update_result.get('error')}")
                         # 返回原始导入结果
                         return result
-        
+            else:
+                print(f"[send_single_group] import_group 返回未知状态: {parsed_body}")
+                app_logger.warning(f"[send_single_group] import_group 返回未知状态 group_id={group_id}: {parsed_body}")
+
         app_logger.info(f"Tencent REST API 同步完成: group_id={group_id}")
         return result
 
