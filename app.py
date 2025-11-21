@@ -1550,6 +1550,9 @@ async def api_save_student_scores(request: Request):
     """
     try:
         data = await request.json()
+        # 打印接收到的 JSON 数据
+        print(f"[student-scores/save] 收到请求数据:")
+        print(json.dumps(data, ensure_ascii=False, indent=2))
     except Exception:
         return safe_json_response({'message': '无效的 JSON 请求体', 'code': 400}, status_code=400)
 
