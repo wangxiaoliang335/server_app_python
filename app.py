@@ -1256,6 +1256,97 @@ def save_course_schedule(
             connection.close()
             app_logger.info("Database connection closed after saving course schedule.")
 
+def save_seat_arrangement(
+    class_id: str,
+    seats: List[Dict]
+) -> Dict[str, object]:
+    """
+    写入/更新座位安排：
+    1) 依据 class_id 在 seat_arrangement 中插入或更新；
+    2) 批量写入/更新 seat_arrangement_item（依据唯一键 arrangement_id + row + col）。
+
+    参数说明：
+    - class_id: 班级ID
+    - seats: 座位列表，每个元素包含: { row:int, col:int, student_name:str, name:str, student_id:str }
+
+    返回：
+    - { success, arrangement_id, upserted_seats, message }
+    """
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("Save seat arrangement failed: Database connection error.")
+        return { 'success': False, 'arrangement_id': None, 'upserted_seats': 0, 'message': '数据库连接失败' }
+
+    try:
+        connection.start_transaction()
+        cursor = connection.cursor(dictionary=True)
+
+        # 先尝试获取是否已存在该 class_id
+        cursor.execute(
+            "SELECT id FROM seat_arrangement WHERE class_id = %s LIMIT 1",
+            (class_id,)
+        )
+        row = cursor.fetchone()
+
+        if row is None:
+            # 插入主表
+            insert_header_sql = (
+                "INSERT INTO seat_arrangement (class_id) "
+                "VALUES (%s)"
+            )
+            cursor.execute(insert_header_sql, (class_id,))
+            arrangement_id = cursor.lastrowid
+        else:
+            arrangement_id = row['id']
+            # 更新主表（更新时间戳）
+            update_header_sql = (
+                "UPDATE seat_arrangement SET updated_at = NOW() "
+                "WHERE id = %s"
+            )
+            cursor.execute(update_header_sql, (arrangement_id,))
+
+        upsert_count = 0
+        if seats:
+            # 先删除该班级的所有旧座位数据
+            delete_old_sql = "DELETE FROM seat_arrangement_item WHERE arrangement_id = %s"
+            cursor.execute(delete_old_sql, (arrangement_id,))
+            
+            # 批量插入新座位数据
+            insert_seat_sql = (
+                "INSERT INTO seat_arrangement_item (arrangement_id, `row`, `col`, student_name, name, student_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s)"
+            )
+            values = []
+            for seat in seats:
+                values.append((
+                    arrangement_id,
+                    int(seat.get('row', 0)),
+                    int(seat.get('col', 0)),
+                    str(seat.get('student_name', '')),
+                    str(seat.get('name', '')),
+                    str(seat.get('student_id', '')),
+                ))
+            if values:
+                cursor.executemany(insert_seat_sql, values)
+                upsert_count = len(values)
+
+        connection.commit()
+        return { 'success': True, 'arrangement_id': arrangement_id, 'upserted_seats': upsert_count, 'message': '保存成功' }
+    except mysql.connector.Error as e:
+        if connection and connection.is_connected():
+            connection.rollback()
+        app_logger.error(f"Database error during save_seat_arrangement: {e}")
+        return { 'success': False, 'arrangement_id': None, 'upserted_seats': 0, 'message': f'数据库错误: {e}' }
+    except Exception as e:
+        if connection and connection.is_connected():
+            connection.rollback()
+        app_logger.error(f"Unexpected error during save_seat_arrangement: {e}")
+        return { 'success': False, 'arrangement_id': None, 'upserted_seats': 0, 'message': f'未知错误: {e}' }
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info("Database connection closed after saving seat arrangement.")
+
 # ===== 课程表 API =====
 @app.post("/course-schedule/save")
 async def api_save_course_schedule(request: Request):
@@ -1303,6 +1394,137 @@ async def api_save_course_schedule(request: Request):
         return safe_json_response({'message': '保存成功', 'code': 200, 'data': result})
     else:
         return safe_json_response({'message': result.get('message', '保存失败'), 'code': 500}, status_code=500)
+
+# ===== 座位安排 API =====
+@app.post("/seat-arrangement/save")
+async def api_save_seat_arrangement(request: Request):
+    """
+    保存学生座位信息到数据库
+    请求体 JSON:
+    {
+      "class_id": "班级ID",
+      "seats": [
+        {
+          "row": 1,
+          "col": 1,
+          "student_name": "刘峻源8-4",
+          "name": "刘峻源",
+          "student_id": "8-4"
+        },
+        ...
+      ]
+    }
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return safe_json_response({'message': '无效的 JSON 请求体', 'code': 400}, status_code=400)
+
+    class_id = data.get('class_id')
+    seats = data.get('seats', [])
+
+    if not class_id:
+        return safe_json_response({'message': '缺少必要参数 class_id', 'code': 400}, status_code=400)
+
+    if not isinstance(seats, list):
+        return safe_json_response({'message': 'seats 必须是数组', 'code': 400}, status_code=400)
+
+    result = save_seat_arrangement(
+        class_id=class_id,
+        seats=seats if isinstance(seats, list) else []
+    )
+
+    if result.get('success'):
+        return safe_json_response({'message': '保存成功', 'code': 200, 'data': result})
+    else:
+        return safe_json_response({'message': result.get('message', '保存失败'), 'code': 500}, status_code=500)
+
+@app.get("/seat-arrangement")
+async def api_get_seat_arrangement(
+    request: Request,
+    class_id: str = Query(..., description="班级ID")
+):
+    """
+    获取学生座位信息
+    查询参数:
+    - class_id: 班级ID
+    
+    返回 JSON:
+    {
+      "message": "查询成功",
+      "code": 200,
+      "data": {
+        "class_id": "班级ID",
+        "seats": [
+          {
+            "row": 1,
+            "col": 1,
+            "student_name": "刘峻源8-4",
+            "name": "刘峻源",
+            "student_id": "8-4"
+          },
+          ...
+        ]
+      }
+    }
+    """
+    connection = get_db_connection()
+    if connection is None:
+        return safe_json_response({'message': '数据库连接失败', 'code': 500}, status_code=500)
+
+    try:
+        cursor = connection.cursor(dictionary=True)
+        # 查询座位安排主表
+        cursor.execute(
+            "SELECT id, class_id, created_at, updated_at "
+            "FROM seat_arrangement WHERE class_id = %s LIMIT 1",
+            (class_id,)
+        )
+        arrangement = cursor.fetchone()
+        
+        if not arrangement:
+            return safe_json_response({'message': '未找到座位信息', 'code': 404}, status_code=404)
+
+        arrangement_id = arrangement['id']
+        
+        # 查询座位详细数据
+        cursor.execute(
+            "SELECT `row`, `col`, student_name, name, student_id "
+            "FROM seat_arrangement_item WHERE arrangement_id = %s "
+            "ORDER BY `row`, `col`",
+            (arrangement_id,)
+        )
+        seat_items = cursor.fetchall()
+        
+        # 转换为前端需要的格式
+        seats = []
+        for item in seat_items:
+            seats.append({
+                "row": item['row'],
+                "col": item['col'],
+                "student_name": item['student_name'] or '',
+                "name": item['name'] or '',
+                "student_id": item['student_id'] or ''
+            })
+        
+        return safe_json_response({
+            'message': '查询成功',
+            'code': 200,
+            'data': {
+                'class_id': class_id,
+                'seats': seats
+            }
+        })
+    except mysql.connector.Error as e:
+        app_logger.error(f"Database error during api_get_seat_arrangement: {e}")
+        return safe_json_response({'message': f'数据库错误: {e}', 'code': 500}, status_code=500)
+    except Exception as e:
+        app_logger.error(f"Unexpected error during api_get_seat_arrangement: {e}")
+        return safe_json_response({'message': f'查询失败: {e}', 'code': 500}, status_code=500)
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info("Database connection closed after getting seat arrangement.")
 
 @app.get("/course-schedule")
 async def api_get_course_schedule(
