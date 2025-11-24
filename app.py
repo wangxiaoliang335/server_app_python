@@ -6098,67 +6098,25 @@ async def leave_group(request: Request):
 @app.post("/groups/remove-member")
 async def remove_member(request: Request):
     """
-    群主移除群成员
-    接收客户端发送的 group_id, user_id
-    从 group_members 表中删除该用户，并更新群组的成员数量
+    群主踢出群成员
+    接收客户端发送的 group_id 和 members 数组
+    1. 调用腾讯接口踢出成员
+    2. 成功后，从数据库删除成员并更新群组成员数量
+    请求体 JSON:
+    {
+      "group_id": "群组ID",
+      "members": ["成员ID1", "成员ID2", ...]
+    }
     """
     print("=" * 80)
-    print("[groups/remove-member] 收到移除成员请求")
-    
-    # 打印请求头信息用于调试
-    content_type = request.headers.get("content-type", "")
-    content_length = request.headers.get("content-length", "")
-    print(f"[groups/remove-member] 请求头 - Content-Type: {content_type}, Content-Length: {content_length}")
+    print("[groups/remove-member] 收到踢出成员请求")
     
     try:
-        # 解析请求体JSON数据
-        try:
-            # 先尝试读取原始body
-            body_bytes = await request.body()
-            print(f"[groups/remove-member] 读取到请求体长度: {len(body_bytes)} 字节")
-            
-            if not body_bytes:
-                print("[groups/remove-member] 错误: 请求体为空")
-                return JSONResponse({
-                    "code": 400,
-                    "message": "请求体不能为空"
-                }, status_code=400)
-            
-            # 解析JSON
-            try:
-                data = json.loads(body_bytes.decode('utf-8'))
-            except json.JSONDecodeError as e:
-                print(f"[groups/remove-member] 错误: JSON解析失败 - {e}")
-                print(f"[groups/remove-member] 请求体内容: {body_bytes.decode('utf-8', errors='ignore')}")
-                return JSONResponse({
-                    "code": 400,
-                    "message": "请求数据格式错误，无法解析JSON"
-                }, status_code=400)
-                
-        except ClientDisconnect:
-            print("[groups/remove-member] 错误: 客户端断开连接")
-            print(f"[groups/remove-member] 调试信息 - Content-Type: {content_type}, Content-Length: {content_length}")
-            app_logger.warning("[groups/remove-member] 客户端在请求完成前断开连接")
-            return JSONResponse({
-                "code": 400,
-                "message": "客户端断开连接，请检查请求数据是否正确发送"
-            }, status_code=400)
-        except Exception as e:
-            print(f"[groups/remove-member] 读取请求体时发生异常: {type(e).__name__} - {e}")
-            import traceback
-            traceback_str = traceback.format_exc()
-            print(f"[groups/remove-member] 错误堆栈: {traceback_str}")
-            return JSONResponse({
-                "code": 400,
-                "message": f"读取请求数据失败: {str(e)}"
-            }, status_code=400)
-        
+        data = await request.json()
         print(f"[groups/remove-member] 原始数据: {json.dumps(data, ensure_ascii=False, indent=2)}")
         
         group_id = data.get('group_id')
-        user_id = data.get('user_id')
-        
-        print(f"[groups/remove-member] 解析结果 - group_id: {group_id}, user_id: {user_id}")
+        members = data.get('members', [])
         
         # 参数验证
         if not group_id:
@@ -6168,11 +6126,18 @@ async def remove_member(request: Request):
                 "message": "缺少必需参数 group_id"
             }, status_code=400)
         
-        if not user_id:
-            print("[groups/remove-member] 错误: 缺少 user_id")
+        if not members or not isinstance(members, list):
+            print("[groups/remove-member] 错误: 缺少或无效的 members")
             return JSONResponse({
                 "code": 400,
-                "message": "缺少必需参数 user_id"
+                "message": "缺少必需参数 members 或 members 必须是数组"
+            }, status_code=400)
+        
+        if len(members) == 0:
+            print("[groups/remove-member] 错误: members 数组为空")
+            return JSONResponse({
+                "code": 400,
+                "message": "members 数组不能为空"
             }, status_code=400)
         
         print("[groups/remove-member] 开始连接数据库...")
@@ -6188,15 +6153,22 @@ async def remove_member(request: Request):
         
         cursor = None
         try:
+            # 开始事务（在开始时就启动，确保所有操作在一个事务中）
+            connection.start_transaction()
             cursor = connection.cursor(dictionary=True)
             
             # 1. 检查群组是否存在
             print(f"[groups/remove-member] 检查群组 {group_id} 是否存在...")
-            cursor.execute("SELECT group_id, group_name, member_num FROM `groups` WHERE group_id = %s", (group_id,))
+            cursor.execute(
+                "SELECT group_id, group_name, member_num FROM `groups` WHERE group_id = %s",
+                (group_id,)
+            )
             group_info = cursor.fetchone()
             
             if not group_info:
                 print(f"[groups/remove-member] 错误: 群组 {group_id} 不存在")
+                if connection and connection.is_connected():
+                    connection.rollback()
                 return JSONResponse({
                     "code": 404,
                     "message": "群组不存在"
@@ -6204,57 +6176,256 @@ async def remove_member(request: Request):
             
             print(f"[groups/remove-member] 群组信息: {group_info}")
             
-            # 2. 检查要删除的成员是否在群组中
-            print(f"[groups/remove-member] 检查用户 {user_id} 是否在群组 {group_id} 中...")
-            cursor.execute(
-                "SELECT group_id, user_id, self_role FROM `group_members` WHERE group_id = %s AND user_id = %s",
-                (group_id, user_id)
-            )
-            member_info = cursor.fetchone()
+            # 2. 检查要删除的成员是否在群组中，并过滤掉群主
+            print(f"[groups/remove-member] 检查成员是否在群组中...")
+            valid_members = []
+            owner_members = []
             
-            if not member_info:
-                print(f"[groups/remove-member] 错误: 用户 {user_id} 不在群组 {group_id} 中")
+            for member_id in members:
+                cursor.execute(
+                    "SELECT group_id, user_id, self_role FROM `group_members` WHERE group_id = %s AND user_id = %s",
+                    (group_id, member_id)
+                )
+                member_info = cursor.fetchone()
+                
+                if not member_info:
+                    print(f"[groups/remove-member] 警告: 成员 {member_id} 不在群组中，跳过")
+                    continue
+                
+                self_role = member_info.get('self_role', 200)
+                if self_role == 400:  # 群主不能被踢出
+                    print(f"[groups/remove-member] 警告: 成员 {member_id} 是群主，不允许被踢出")
+                    owner_members.append(member_id)
+                    continue
+                
+                valid_members.append(member_id)
+            
+            if owner_members:
+                print(f"[groups/remove-member] 警告: 以下成员是群主，无法踢出: {owner_members}")
+            
+            if not valid_members:
+                print(f"[groups/remove-member] 错误: 没有可踢出的成员")
+                if connection and connection.is_connected():
+                    connection.rollback()
                 return JSONResponse({
                     "code": 400,
-                    "message": "该用户不在群组中"
+                    "message": "没有可踢出的成员（可能是群主或不在群组中）"
                 }, status_code=400)
             
-            print(f"[groups/remove-member] 成员信息: {member_info}")
-            self_role = member_info.get('self_role', 200)
+            print(f"[groups/remove-member] 准备踢出 {len(valid_members)} 个成员: {valid_members}")
             
-            # 3. 检查要删除的成员是否是群主（self_role = 400 表示群主）
-            if self_role == 400:
-                print(f"[groups/remove-member] 错误: 用户 {user_id} 是群主，不允许被踢出")
-                return JSONResponse({
-                    "code": 400,
-                    "message": "群主不能被踢出群组"
-                }, status_code=400)
+            # 3. 调用腾讯接口踢出成员
+            print(f"[groups/remove-member] 准备调用腾讯接口踢出 {len(valid_members)} 个成员...")
             
-            # 4. 从群组中删除该成员
-            print(f"[groups/remove-member] 从群组 {group_id} 中删除用户 {user_id}...")
-            cursor.execute(
-                "DELETE FROM `group_members` WHERE group_id = %s AND user_id = %s",
-                (group_id, user_id)
-            )
-            affected_rows = cursor.rowcount
-            print(f"[groups/remove-member] 删除成员完成, 影响行数: {affected_rows}")
+            # 使用管理员账号作为 identifier（与群组同步保持一致）
+            identifier_to_use = TENCENT_API_IDENTIFIER
             
-            if affected_rows == 0:
-                print(f"[groups/remove-member] 警告: 删除操作未影响任何行")
+            # 检查必需的配置
+            if not TENCENT_API_SDK_APP_ID:
+                print("[groups/remove-member] 错误: TENCENT_API_SDK_APP_ID 未配置")
+                if connection and connection.is_connected():
+                    connection.rollback()
                 return JSONResponse({
                     "code": 500,
-                    "message": "移除成员失败"
+                    "message": "腾讯接口配置错误: 缺少 SDKAppID"
+                }, status_code=500)
+            
+            if not identifier_to_use:
+                print("[groups/remove-member] 错误: TENCENT_API_IDENTIFIER 未配置")
+                if connection and connection.is_connected():
+                    connection.rollback()
+                return JSONResponse({
+                    "code": 500,
+                    "message": "腾讯接口配置错误: 缺少 Identifier"
+                }, status_code=500)
+            
+            # 尝试生成或使用配置的 UserSig（与群组同步逻辑一致）
+            usersig_to_use: Optional[str] = None
+            sig_error: Optional[str] = None
+            if TENCENT_API_SECRET_KEY:
+                try:
+                    # 为管理员账号生成 UserSig
+                    print(f"[groups/remove-member] 准备为管理员账号生成 UserSig: identifier={identifier_to_use}")
+                    usersig_to_use = generate_tencent_user_sig(identifier_to_use)
+                    print(f"[groups/remove-member] UserSig 生成成功，长度: {len(usersig_to_use) if usersig_to_use else 0}")
+                    app_logger.info(f"为管理员账号 {identifier_to_use} 生成 UserSig 成功")
+                except Exception as e:
+                    sig_error = f"自动生成管理员 UserSig 失败: {e}"
+                    print(f"[groups/remove-member] UserSig 生成失败: {sig_error}")
+                    app_logger.error(sig_error)
+            
+            if not usersig_to_use:
+                print(f"[groups/remove-member] 使用配置的 TENCENT_API_USER_SIG")
+                usersig_to_use = TENCENT_API_USER_SIG
+            
+            if not usersig_to_use:
+                error_message = "缺少可用的管理员 UserSig，无法调用腾讯接口。"
+                print(f"[groups/remove-member] 错误: {error_message}")
+                app_logger.error(f"[groups/remove-member] {error_message}")
+                if connection and connection.is_connected():
+                    connection.rollback()
+                return JSONResponse({
+                    "code": 500,
+                    "message": error_message
+                }, status_code=500)
+            
+            print(f"[groups/remove-member] 使用 identifier: {identifier_to_use}, SDKAppID: {TENCENT_API_SDK_APP_ID}")
+            
+            # 构建腾讯接口 URL
+            delete_url = build_tencent_request_url(
+                identifier=identifier_to_use,
+                usersig=usersig_to_use,
+                path_override="v4/group_open_http_svc/delete_group_member"
+            )
+            
+            if not delete_url:
+                print("[groups/remove-member] 错误: 无法构建腾讯接口 URL")
+                app_logger.error("[groups/remove-member] 无法构建腾讯接口 URL")
+                if connection and connection.is_connected():
+                    connection.rollback()
+                return JSONResponse({
+                    "code": 500,
+                    "message": "腾讯接口配置错误"
+                }, status_code=500)
+            
+            # 验证 URL 中是否包含 sdkappid
+            if "sdkappid" not in delete_url:
+                print(f"[groups/remove-member] 警告: URL 中缺少 sdkappid，完整 URL: {delete_url}")
+                app_logger.warning(f"[groups/remove-member] URL 中缺少 sdkappid: {delete_url}")
+                # 手动添加 sdkappid（如果 URL 构建失败）
+                parsed_url = urllib.parse.urlparse(delete_url)
+                query_params = urllib.parse.parse_qs(parsed_url.query)
+                query_params['sdkappid'] = [TENCENT_API_SDK_APP_ID]
+                query_params['identifier'] = [identifier_to_use]
+                query_params['usersig'] = [usersig_to_use]
+                query_params['contenttype'] = ['json']
+                if 'random' not in query_params:
+                    query_params['random'] = [str(random.randint(1, 2**31 - 1))]
+                new_query = urllib.parse.urlencode(query_params, doseq=True)
+                delete_url = urllib.parse.urlunparse(parsed_url._replace(query=new_query))
+                print(f"[groups/remove-member] 已手动添加参数，新 URL: {delete_url[:200]}...")
+            
+            # 构建踢出成员的 payload
+            delete_payload = {
+                "GroupId": group_id,
+                "MemberToDel_Account": valid_members,
+                "Reason": "群主踢出"  # 可选：踢出原因
+            }
+            
+            print(f"[groups/remove-member] 腾讯接口 URL: {delete_url[:100]}...")
+            print(f"[groups/remove-member] 踢出 payload: {json.dumps(delete_payload, ensure_ascii=False, indent=2)}")
+            
+            # 调用腾讯接口
+            def _delete_tencent_members() -> Dict[str, Any]:
+                """调用腾讯接口踢出成员"""
+                headers = {
+                    "Content-Type": "application/json; charset=utf-8"
+                }
+                encoded_payload = json.dumps(delete_payload, ensure_ascii=False).encode("utf-8")
+                request_obj = urllib.request.Request(
+                    url=delete_url,
+                    data=encoded_payload,
+                    headers=headers,
+                    method="POST"
+                )
+                try:
+                    with urllib.request.urlopen(request_obj, timeout=TENCENT_API_TIMEOUT) as response:
+                        raw_body = response.read()
+                        text_body = raw_body.decode("utf-8", errors="replace")
+                        try:
+                            parsed_body = json.loads(text_body)
+                        except json.JSONDecodeError:
+                            parsed_body = None
+                        
+                        result = {
+                            "status": "success",
+                            "http_status": response.status,
+                            "response": parsed_body or text_body
+                        }
+                        return result
+                except urllib.error.HTTPError as e:
+                    body = e.read().decode("utf-8", errors="replace")
+                    app_logger.error(f"[groups/remove-member] 腾讯接口调用失败 (HTTP {e.code}): {body}")
+                    return {"status": "error", "http_status": e.code, "error": body}
+                except urllib.error.URLError as e:
+                    app_logger.error(f"[groups/remove-member] 腾讯接口调用异常: {e}")
+                    return {"status": "error", "http_status": None, "error": str(e)}
+                except Exception as exc:
+                    app_logger.exception(f"[groups/remove-member] 腾讯接口未知异常: {exc}")
+                    return {"status": "error", "http_status": None, "error": str(exc)}
+            
+            tencent_result = await asyncio.to_thread(_delete_tencent_members)
+            
+            # 打印腾讯接口响应详情
+            print(f"[groups/remove-member] 腾讯接口响应状态: {tencent_result.get('status')}")
+            print(f"[groups/remove-member] 腾讯接口HTTP状态码: {tencent_result.get('http_status')}")
+            tencent_response = tencent_result.get('response', {})
+            print(f"[groups/remove-member] 腾讯接口响应内容: {json.dumps(tencent_response, ensure_ascii=False, indent=2) if isinstance(tencent_response, dict) else tencent_response}")
+            
+            # 检查腾讯接口调用结果
+            if tencent_result.get('status') != 'success':
+                error_msg = tencent_result.get('error', '腾讯接口调用失败')
+                print(f"[groups/remove-member] 腾讯接口调用失败: {error_msg}")
+                app_logger.error(f"[groups/remove-member] 腾讯接口调用失败: group_id={group_id}, error={error_msg}")
+                if connection and connection.is_connected():
+                    connection.rollback()
+                return JSONResponse({
+                    "code": 500,
+                    "message": f"踢出成员失败: {error_msg}"
+                }, status_code=500)
+            
+            if isinstance(tencent_response, dict):
+                action_status = tencent_response.get('ActionStatus')
+                error_code = tencent_response.get('ErrorCode')
+                error_info = tencent_response.get('ErrorInfo')
+                
+                print(f"[groups/remove-member] 腾讯接口响应解析: ActionStatus={action_status}, ErrorCode={error_code}, ErrorInfo={error_info}")
+                
+                if action_status != 'OK' or error_code != 0:
+                    print(f"[groups/remove-member] 腾讯接口返回错误: ErrorCode={error_code}, ErrorInfo={error_info}")
+                    app_logger.error(f"[groups/remove-member] 腾讯接口返回错误: group_id={group_id}, ErrorCode={error_code}, ErrorInfo={error_info}")
+                    if connection and connection.is_connected():
+                        connection.rollback()
+                    return JSONResponse({
+                        "code": 500,
+                        "message": f"踢出成员失败: {error_info or '未知错误'}"
+                    }, status_code=500)
+            else:
+                print(f"[groups/remove-member] 警告: 腾讯接口响应不是JSON格式: {type(tencent_response)}")
+                app_logger.warning(f"[groups/remove-member] 腾讯接口响应格式异常: group_id={group_id}, response_type={type(tencent_response)}")
+            
+            print(f"[groups/remove-member] 腾讯接口调用成功，准备更新数据库")
+            app_logger.info(f"[groups/remove-member] 腾讯接口调用成功: group_id={group_id}, members={valid_members}")
+            
+            # 4. 踢出成功后，从数据库删除成员
+            print(f"[groups/remove-member] 开始从数据库删除成员...")
+            
+            deleted_count = 0
+            for member_id in valid_members:
+                cursor.execute(
+                    "DELETE FROM `group_members` WHERE group_id = %s AND user_id = %s",
+                    (group_id, member_id)
+                )
+                if cursor.rowcount > 0:
+                    deleted_count += 1
+                    print(f"[groups/remove-member] 成功删除成员: {member_id}")
+            
+            if deleted_count == 0:
+                print(f"[groups/remove-member] 警告: 数据库删除操作未影响任何行")
+                if connection and connection.is_connected():
+                    connection.rollback()
+                return JSONResponse({
+                    "code": 500,
+                    "message": "删除成员失败"
                 }, status_code=500)
             
             # 5. 更新群组的成员数量（确保不会小于0）
             print(f"[groups/remove-member] 更新群组 {group_id} 的成员数量...")
-            # 使用 CASE 语句避免 UNSIGNED 类型溢出问题
-            # 当 member_num 为 0 时，member_num - 1 会导致 UNSIGNED 溢出错误
             cursor.execute(
-                "UPDATE `groups` SET member_num = CASE WHEN member_num > 0 THEN member_num - 1 ELSE 0 END WHERE group_id = %s",
-                (group_id,)
+                "UPDATE `groups` SET member_num = CASE WHEN member_num >= %s THEN member_num - %s ELSE 0 END WHERE group_id = %s",
+                (deleted_count, deleted_count, group_id)
             )
-            print(f"[groups/remove-member] 群组成员数量已更新")
+            print(f"[groups/remove-member] 群组成员数量已更新，减少 {deleted_count} 人")
             
             # 提交事务
             connection.commit()
@@ -6262,10 +6433,12 @@ async def remove_member(request: Request):
             
             result = {
                 "code": 200,
-                "message": "成功移除成员",
+                "message": "成功踢出成员",
                 "data": {
                     "group_id": group_id,
-                    "user_id": user_id
+                    "deleted_count": deleted_count,
+                    "total_requested": len(members),
+                    "owner_members": owner_members if owner_members else None
                 }
             }
             
@@ -7189,6 +7362,9 @@ def get_group_members_by_group_id(
 
     cursor = None
     try:
+        import time
+        start_time = time.time()
+        
         cursor = connection.cursor(dictionary=True)
         
         # 查询该群组的所有成员信息
@@ -7209,19 +7385,44 @@ def get_group_members_by_group_id(
         """
         print(f"[groups/members] 执行SQL查询: {sql}")
         print(f"[groups/members] 查询参数: group_id={group_id}")
+        app_logger.info(f"[groups/members] 开始查询群组成员: group_id={group_id}")
         
+        query_start = time.time()
         cursor.execute(sql, (group_id,))
         members = cursor.fetchall()
+        query_time = time.time() - query_start
         
+        print(f"[groups/members] 查询完成，耗时: {query_time:.3f}秒")
         print(f"[groups/members] 查询结果: 找到 {len(members)} 个成员")
+        app_logger.info(f"[groups/members] 查询完成: group_id={group_id}, member_count={len(members)}, query_time={query_time:.3f}s")
+        
+        # 统计成员角色分布
+        role_stats = {}
+        for member in members:
+            role = member.get('self_role', 200)
+            role_name = {200: "普通成员", 300: "管理员", 400: "群主"}.get(role, f"未知角色({role})")
+            role_stats[role_name] = role_stats.get(role_name, 0) + 1
+        
+        print(f"[groups/members] 成员角色统计: {role_stats}")
+        app_logger.info(f"[groups/members] 成员角色统计: group_id={group_id}, stats={role_stats}")
         
         # 转换 datetime 为字符串
         for idx, member in enumerate(members):
-            print(f"[groups/members] 处理第 {idx+1} 个成员: user_id={member.get('user_id')}, self_role={member.get('self_role')}")
+            user_id = member.get('user_id')
+            user_name = member.get('user_name')
+            self_role = member.get('self_role')
+            role_name = {200: "普通成员", 300: "管理员", 400: "群主"}.get(self_role, f"未知({self_role})")
+            
+            print(f"[groups/members] 处理第 {idx+1}/{len(members)} 个成员: user_id={user_id}, user_name={user_name}, role={role_name}")
+            
             for key, value in member.items():
                 if isinstance(value, datetime.datetime):
+                    old_value = value
                     member[key] = value.strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"[groups/members] 转换时间字段 {key}: {member[key]}")
+                    print(f"[groups/members]   转换时间字段 {key}: {old_value} -> {member[key]}")
+        
+        total_time = time.time() - start_time
+        print(f"[groups/members] 数据处理完成，总耗时: {total_time:.3f}秒")
         
         result = {
             "data": {
@@ -7229,22 +7430,27 @@ def get_group_members_by_group_id(
                 "code": 200,
                 "group_id": group_id,
                 "members": members,
-                "member_count": len(members)
+                "member_count": len(members),
+                "role_stats": role_stats
             }
         }
         
-        print(f"[groups/members] 返回结果: group_id={group_id}, member_count={len(members)}")
+        print(f"[groups/members] 返回结果: group_id={group_id}, member_count={len(members)}, role_stats={role_stats}")
+        print(f"[groups/members] 总耗时: {total_time:.3f}秒")
+        app_logger.info(f"[groups/members] 查询成功: group_id={group_id}, member_count={len(members)}, total_time={total_time:.3f}s")
         print("=" * 80)
         
         return JSONResponse(result, status_code=200)
 
     except mysql.connector.Error as e:
-        error_msg = f"查询群成员错误: {e}"
+        error_msg = f"查询群成员数据库错误: {e}"
+        error_code = e.errno if hasattr(e, 'errno') else None
         print(f"[groups/members] {error_msg}")
+        print(f"[groups/members] MySQL错误代码: {error_code}")
         import traceback
         traceback_str = traceback.format_exc()
         print(f"[groups/members] 错误堆栈: {traceback_str}")
-        app_logger.error(f"[groups/members] {error_msg}\n{traceback_str}")
+        app_logger.error(f"[groups/members] 数据库错误: group_id={group_id}, error={error_msg}, errno={error_code}\n{traceback_str}")
         return JSONResponse({
             "data": {
                 "message": f"查询失败: {str(e)}",
@@ -7253,11 +7459,13 @@ def get_group_members_by_group_id(
         }, status_code=500)
     except Exception as e:
         error_msg = f"查询群成员时发生异常: {e}"
+        error_type = type(e).__name__
         print(f"[groups/members] {error_msg}")
+        print(f"[groups/members] 异常类型: {error_type}")
         import traceback
         traceback_str = traceback.format_exc()
         print(f"[groups/members] 错误堆栈: {traceback_str}")
-        app_logger.error(f"[groups/members] {error_msg}\n{traceback_str}")
+        app_logger.error(f"[groups/members] 未知异常: group_id={group_id}, error_type={error_type}, error={error_msg}\n{traceback_str}")
         return JSONResponse({
             "data": {
                 "message": f"查询失败: {str(e)}",
