@@ -5431,6 +5431,442 @@ async def join_group(request: Request):
     finally:
         print("=" * 80)
 
+@app.post("/groups/invite")
+async def invite_group_members(request: Request):
+    """
+    群主邀请成员加入群组
+    接收客户端发送的 group_id 和 members 列表
+    1. 调用腾讯接口邀请成员
+    2. 邀请成功后，将相关信息插入数据库
+    请求体 JSON:
+    {
+      "group_id": "群组ID",
+      "members": [
+        {
+          "unique_member_id": "成员ID",
+          "member_name": "成员名称",
+          "group_role": 300
+        }
+      ]
+    }
+    """
+    print("=" * 80)
+    print("[groups/invite] 收到邀请成员请求")
+    
+    try:
+        data = await request.json()
+        print(f"[groups/invite] 原始数据: {json.dumps(data, ensure_ascii=False, indent=2)}")
+        
+        group_id = data.get('group_id')
+        members = data.get('members', [])
+        
+        # 参数验证
+        if not group_id:
+            print("[groups/invite] 错误: 缺少 group_id")
+            return JSONResponse({
+                "code": 400,
+                "message": "缺少必需参数 group_id"
+            }, status_code=400)
+        
+        if not members or not isinstance(members, list):
+            print("[groups/invite] 错误: 缺少或无效的 members")
+            return JSONResponse({
+                "code": 400,
+                "message": "缺少必需参数 members 或 members 必须是数组"
+            }, status_code=400)
+        
+        # 验证每个成员的必要字段
+        for idx, member in enumerate(members):
+            if not member.get('unique_member_id'):
+                print(f"[groups/invite] 错误: 成员 {idx} 缺少 unique_member_id")
+                return JSONResponse({
+                    "code": 400,
+                    "message": f"成员 {idx} 缺少必需参数 unique_member_id"
+                }, status_code=400)
+        
+        print("[groups/invite] 开始连接数据库...")
+        connection = get_db_connection()
+        if connection is None or not connection.is_connected():
+            print("[groups/invite] 错误: 数据库连接失败")
+            app_logger.error("[groups/invite] 数据库连接失败")
+            return JSONResponse({
+                "code": 500,
+                "message": "数据库连接失败"
+            }, status_code=500)
+        print("[groups/invite] 数据库连接成功")
+        
+        cursor = None
+        try:
+            # 开始事务（在开始时就启动，确保所有操作在一个事务中）
+            connection.start_transaction()
+            cursor = connection.cursor(dictionary=True)
+            
+            # 1. 检查群组是否存在
+            print(f"[groups/invite] 检查群组 {group_id} 是否存在...")
+            cursor.execute(
+                "SELECT group_id, group_name, max_member_num, member_num FROM `groups` WHERE group_id = %s",
+                (group_id,)
+            )
+            group_info = cursor.fetchone()
+            
+            if not group_info:
+                print(f"[groups/invite] 错误: 群组 {group_id} 不存在")
+                return JSONResponse({
+                    "code": 404,
+                    "message": "群组不存在"
+                }, status_code=404)
+            
+            print(f"[groups/invite] 群组信息: {group_info}")
+            max_member_num = group_info.get('max_member_num') if group_info.get('max_member_num') else 0
+            member_num = group_info.get('member_num') if group_info.get('member_num') else 0
+            
+            # 检查群组是否已满
+            if max_member_num > 0 and member_num + len(members) > max_member_num:
+                print(f"[groups/invite] 错误: 群组已满 (当前: {member_num}, 最大: {max_member_num}, 邀请: {len(members)})")
+                return JSONResponse({
+                    "code": 400,
+                    "message": f"群组已满，无法邀请 {len(members)} 个成员（当前: {member_num}/{max_member_num}）"
+                }, status_code=400)
+            
+            # 2. 检查哪些成员已经在群组中
+            existing_members = []
+            for member in members:
+                unique_member_id = member.get('unique_member_id')
+                cursor.execute(
+                    "SELECT user_id FROM `group_members` WHERE group_id = %s AND user_id = %s",
+                    (group_id, unique_member_id)
+                )
+                if cursor.fetchone():
+                    existing_members.append(unique_member_id)
+            
+            if existing_members:
+                print(f"[groups/invite] 警告: 以下成员已在群组中: {existing_members}")
+                # 可以选择跳过已存在的成员，或者返回错误
+                # 这里选择跳过已存在的成员，只邀请新成员
+                members = [m for m in members if m.get('unique_member_id') not in existing_members]
+                if not members:
+                    return JSONResponse({
+                        "code": 400,
+                        "message": "所有成员已在群组中"
+                    }, status_code=400)
+            
+            # 3. 调用腾讯接口邀请成员
+            print(f"[groups/invite] 准备调用腾讯接口邀请 {len(members)} 个成员...")
+            
+            # 使用管理员账号作为 identifier（与群组同步保持一致）
+            identifier_to_use = TENCENT_API_IDENTIFIER
+            
+            # 检查必需的配置
+            if not TENCENT_API_SDK_APP_ID:
+                print("[groups/invite] 错误: TENCENT_API_SDK_APP_ID 未配置")
+                app_logger.error("[groups/invite] TENCENT_API_SDK_APP_ID 未配置")
+                return JSONResponse({
+                    "code": 500,
+                    "message": "腾讯接口配置错误: 缺少 SDKAppID"
+                }, status_code=500)
+            
+            if not identifier_to_use:
+                print("[groups/invite] 错误: TENCENT_API_IDENTIFIER 未配置")
+                app_logger.error("[groups/invite] TENCENT_API_IDENTIFIER 未配置")
+                return JSONResponse({
+                    "code": 500,
+                    "message": "腾讯接口配置错误: 缺少 Identifier"
+                }, status_code=500)
+            
+            # 尝试生成或使用配置的 UserSig（与群组同步逻辑一致）
+            usersig_to_use: Optional[str] = None
+            sig_error: Optional[str] = None
+            if TENCENT_API_SECRET_KEY:
+                try:
+                    # 为管理员账号生成 UserSig
+                    print(f"[groups/invite] 准备为管理员账号生成 UserSig: identifier={identifier_to_use}")
+                    usersig_to_use = generate_tencent_user_sig(identifier_to_use)
+                    print(f"[groups/invite] UserSig 生成成功，长度: {len(usersig_to_use) if usersig_to_use else 0}")
+                    app_logger.info(f"为管理员账号 {identifier_to_use} 生成 UserSig 成功")
+                except Exception as e:
+                    sig_error = f"自动生成管理员 UserSig 失败: {e}"
+                    print(f"[groups/invite] UserSig 生成失败: {sig_error}")
+                    app_logger.error(sig_error)
+            
+            if not usersig_to_use:
+                print(f"[groups/invite] 使用配置的 TENCENT_API_USER_SIG")
+                usersig_to_use = TENCENT_API_USER_SIG
+            
+            if not usersig_to_use:
+                error_message = "缺少可用的管理员 UserSig，无法调用腾讯接口。"
+                print(f"[groups/invite] 错误: {error_message}")
+                app_logger.error(f"[groups/invite] {error_message}")
+                return JSONResponse({
+                    "code": 500,
+                    "message": error_message
+                }, status_code=500)
+            
+            print(f"[groups/invite] 使用 identifier: {identifier_to_use}, SDKAppID: {TENCENT_API_SDK_APP_ID}")
+            
+            # 构建腾讯接口 URL
+            invite_url = build_tencent_request_url(
+                identifier=identifier_to_use,
+                usersig=usersig_to_use,
+                path_override="v4/group_open_http_svc/add_group_member"
+            )
+            
+            if not invite_url:
+                print("[groups/invite] 错误: 无法构建腾讯接口 URL")
+                app_logger.error("[groups/invite] 无法构建腾讯接口 URL")
+                return JSONResponse({
+                    "code": 500,
+                    "message": "腾讯接口配置错误"
+                }, status_code=500)
+            
+            # 验证 URL 中是否包含 sdkappid
+            if "sdkappid" not in invite_url:
+                print(f"[groups/invite] 警告: URL 中缺少 sdkappid，完整 URL: {invite_url}")
+                app_logger.warning(f"[groups/invite] URL 中缺少 sdkappid: {invite_url}")
+                # 手动添加 sdkappid（如果 URL 构建失败）
+                parsed_url = urllib.parse.urlparse(invite_url)
+                query_params = urllib.parse.parse_qs(parsed_url.query)
+                query_params['sdkappid'] = [TENCENT_API_SDK_APP_ID]
+                query_params['identifier'] = [identifier_to_use]
+                query_params['usersig'] = [usersig_to_use]
+                query_params['contenttype'] = ['json']
+                if 'random' not in query_params:
+                    query_params['random'] = [str(random.randint(1, 2**31 - 1))]
+                new_query = urllib.parse.urlencode(query_params, doseq=True)
+                invite_url = urllib.parse.urlunparse(parsed_url._replace(query=new_query))
+                print(f"[groups/invite] 已手动添加参数，新 URL: {invite_url[:200]}...")
+            
+            # 构建邀请成员的 payload
+            member_list = []
+            for member in members:
+                member_entry = {
+                    "Member_Account": member.get('unique_member_id')
+                }
+                # 如果有角色信息，添加到 payload（腾讯接口支持 Role 字段）
+                group_role = member.get('group_role')
+                if group_role:
+                    # 腾讯接口角色：Admin=300, Member=200, Owner=400
+                    role_map = {
+                        300: "Admin",
+                        200: "Member",
+                        400: "Owner"
+                    }
+                    if group_role in role_map:
+                        member_entry["Role"] = role_map[group_role]
+                member_list.append(member_entry)
+            
+            invite_payload = {
+                "GroupId": group_id,
+                "MemberList": member_list,
+                "Silence": 0  # 0表示邀请时发送系统消息
+            }
+            
+            print(f"[groups/invite] 腾讯接口 URL: {invite_url[:100]}...")
+            print(f"[groups/invite] 邀请 payload: {json.dumps(invite_payload, ensure_ascii=False, indent=2)}")
+            
+            # 调用腾讯接口
+            def _invite_tencent_members() -> Dict[str, Any]:
+                """调用腾讯接口邀请成员"""
+                headers = {
+                    "Content-Type": "application/json; charset=utf-8"
+                }
+                encoded_payload = json.dumps(invite_payload, ensure_ascii=False).encode("utf-8")
+                request_obj = urllib.request.Request(
+                    url=invite_url,
+                    data=encoded_payload,
+                    headers=headers,
+                    method="POST"
+                )
+                try:
+                    with urllib.request.urlopen(request_obj, timeout=TENCENT_API_TIMEOUT) as response:
+                        raw_body = response.read()
+                        text_body = raw_body.decode("utf-8", errors="replace")
+                        try:
+                            parsed_body = json.loads(text_body)
+                        except json.JSONDecodeError:
+                            parsed_body = None
+                        
+                        result = {
+                            "status": "success",
+                            "http_status": response.status,
+                            "response": parsed_body or text_body
+                        }
+                        return result
+                except urllib.error.HTTPError as e:
+                    body = e.read().decode("utf-8", errors="replace")
+                    app_logger.error(f"[groups/invite] 腾讯接口调用失败 (HTTP {e.code}): {body}")
+                    return {"status": "error", "http_status": e.code, "error": body}
+                except urllib.error.URLError as e:
+                    app_logger.error(f"[groups/invite] 腾讯接口调用异常: {e}")
+                    return {"status": "error", "http_status": None, "error": str(e)}
+                except Exception as exc:
+                    app_logger.exception(f"[groups/invite] 腾讯接口未知异常: {exc}")
+                    return {"status": "error", "http_status": None, "error": str(exc)}
+            
+            tencent_result = await asyncio.to_thread(_invite_tencent_members)
+            
+            # 检查腾讯接口调用结果
+            if tencent_result.get('status') != 'success':
+                error_msg = tencent_result.get('error', '腾讯接口调用失败')
+                print(f"[groups/invite] 腾讯接口调用失败: {error_msg}")
+                if connection and connection.is_connected():
+                    connection.rollback()
+                return JSONResponse({
+                    "code": 500,
+                    "message": f"邀请成员失败: {error_msg}"
+                }, status_code=500)
+            
+            tencent_response = tencent_result.get('response', {})
+            if isinstance(tencent_response, dict):
+                action_status = tencent_response.get('ActionStatus')
+                error_code = tencent_response.get('ErrorCode')
+                error_info = tencent_response.get('ErrorInfo')
+                
+                if action_status != 'OK' or error_code != 0:
+                    print(f"[groups/invite] 腾讯接口返回错误: ErrorCode={error_code}, ErrorInfo={error_info}")
+                    if connection and connection.is_connected():
+                        connection.rollback()
+                    return JSONResponse({
+                        "code": 500,
+                        "message": f"邀请成员失败: {error_info or '未知错误'}"
+                    }, status_code=500)
+            
+            print(f"[groups/invite] 腾讯接口调用成功")
+            
+            # 4. 邀请成功后，插入数据库（事务已在开始时启动）
+            print(f"[groups/invite] 开始插入数据库...")
+            
+            current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            inserted_count = 0
+            failed_members = []
+            
+            for member in members:
+                unique_member_id = member.get('unique_member_id')
+                member_name = member.get('member_name', '')
+                group_role = member.get('group_role', 200)  # 默认200（普通成员），300是管理员，400是群主
+                
+                # 再次检查是否已存在（防止并发）
+                cursor.execute(
+                    "SELECT user_id FROM `group_members` WHERE group_id = %s AND user_id = %s",
+                    (group_id, unique_member_id)
+                )
+                if cursor.fetchone():
+                    print(f"[groups/invite] 成员 {unique_member_id} 已在群组中，跳过")
+                    failed_members.append({
+                        "unique_member_id": unique_member_id,
+                        "reason": "已在群组中"
+                    })
+                    continue
+                
+                try:
+                    insert_member_sql = """
+                        INSERT INTO `group_members` (
+                            group_id, user_id, user_name, self_role, join_time, msg_flag,
+                            self_msg_flag, readed_seq, unread_num
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        )
+                    """
+                    insert_params = (
+                        group_id,
+                        unique_member_id,  # user_id 使用 unique_member_id
+                        member_name if member_name else None,
+                        group_role,  # self_role: 200=普通成员, 300=管理员, 400=群主
+                        current_time,
+                        0,  # msg_flag
+                        0,  # self_msg_flag
+                        0,  # readed_seq
+                        0   # unread_num
+                    )
+                    
+                    cursor.execute(insert_member_sql, insert_params)
+                    inserted_count += 1
+                    print(f"[groups/invite] 成功插入成员: {unique_member_id}")
+                    
+                except mysql.connector.Error as e:
+                    print(f"[groups/invite] 插入成员 {unique_member_id} 失败: {e}")
+                    failed_members.append({
+                        "unique_member_id": unique_member_id,
+                        "reason": f"数据库错误: {str(e)}"
+                    })
+                    # 继续处理其他成员
+            
+            # 更新群组的成员数量
+            if inserted_count > 0:
+                cursor.execute(
+                    "UPDATE `groups` SET member_num = member_num + %s WHERE group_id = %s",
+                    (inserted_count, group_id)
+                )
+                print(f"[groups/invite] 群组成员数量已更新，新增 {inserted_count} 人")
+            
+            # 提交事务
+            connection.commit()
+            print(f"[groups/invite] 事务提交成功")
+            
+            result = {
+                "code": 200,
+                "message": "邀请成功",
+                "data": {
+                    "group_id": group_id,
+                    "invited_count": inserted_count,
+                    "total_requested": len(members),
+                    "failed_members": failed_members if failed_members else None
+                }
+            }
+            
+            print(f"[groups/invite] 返回结果: {result}")
+            print("=" * 80)
+            
+            return JSONResponse(result, status_code=200)
+            
+        except mysql.connector.Error as e:
+            if connection and connection.is_connected():
+                connection.rollback()
+            error_msg = f"数据库错误: {e}"
+            print(f"[groups/invite] {error_msg}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[groups/invite] 错误堆栈: {traceback_str}")
+            app_logger.error(f"[groups/invite] {error_msg}\n{traceback_str}")
+            return JSONResponse({
+                "code": 500,
+                "message": f"数据库操作失败: {str(e)}"
+            }, status_code=500)
+        except Exception as e:
+            if connection and connection.is_connected():
+                connection.rollback()
+            error_msg = f"邀请成员时发生异常: {e}"
+            print(f"[groups/invite] {error_msg}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[groups/invite] 错误堆栈: {traceback_str}")
+            app_logger.error(f"[groups/invite] {error_msg}\n{traceback_str}")
+            return JSONResponse({
+                "code": 500,
+                "message": f"操作失败: {str(e)}"
+            }, status_code=500)
+        finally:
+            if cursor:
+                cursor.close()
+                print("[groups/invite] 游标已关闭")
+            if connection and connection.is_connected():
+                connection.close()
+                print("[groups/invite] 数据库连接已关闭")
+                app_logger.info("[groups/invite] Database connection closed after invite members attempt.")
+    
+    except Exception as e:
+        error_msg = f"解析请求数据时出错: {e}"
+        print(f"[groups/invite] {error_msg}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[groups/invite] 错误堆栈: {traceback_str}")
+        app_logger.error(f"[groups/invite] {error_msg}\n{traceback_str}")
+        return JSONResponse({
+            "code": 400,
+            "message": "请求数据格式错误"
+        }, status_code=400)
+    finally:
+        print("=" * 80)
+
 @app.post("/groups/leave")
 async def leave_group(request: Request):
     """
