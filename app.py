@@ -35,6 +35,10 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import ClientDisconnect
 from fastapi.encoders import jsonable_encoder
 from dotenv import load_dotenv
+try:
+    import oss2
+except ImportError:
+    oss2 = None
 #from datetime import datetime
 import jwt
 import asyncio
@@ -137,6 +141,13 @@ SMS_CONFIG = {
     'template_code': os.getenv("ALIYUN_SMS_TEMPLATE")
 }
 
+# ===== 阿里云 OSS 配置 =====
+ALIYUN_OSS_ENDPOINT = os.getenv("ALIYUN_OSS_ENDPOINT")
+ALIYUN_OSS_BUCKET = os.getenv("ALIYUN_OSS_BUCKET")
+ALIYUN_OSS_ACCESS_KEY_ID = os.getenv("ALIYUN_OSS_ACCESS_KEY_ID")
+ALIYUN_OSS_ACCESS_KEY_SECRET = os.getenv("ALIYUN_OSS_ACCESS_KEY_SECRET")
+ALIYUN_OSS_BASE_URL = os.getenv("ALIYUN_OSS_BASE_URL")  # 可选，自定义 CDN 或访问域名
+
 # ===== 腾讯 REST API 配置 =====
 TENCENT_API_URL = os.getenv("TENCENT_API_URL")
 TENCENT_API_BASE_URL = os.getenv("TENCENT_API_BASE_URL")
@@ -178,6 +189,40 @@ def get_daily_upload_folder():
     daily_folder = os.path.join(UPLOAD_FOLDER, today)
     os.makedirs(daily_folder, exist_ok=True)
     return daily_folder
+
+
+def upload_avatar_to_oss(avatar_bytes: bytes, object_name: str) -> Optional[str]:
+    """
+    上传头像文件到阿里云 OSS，返回可访问的 URL。
+    """
+    if not avatar_bytes:
+        app_logger.error("upload_avatar_to_oss: avatar_bytes 为空")
+        return None
+
+    if oss2 is None:
+        app_logger.error("upload_avatar_to_oss: oss2 模块未安装，无法上传到 OSS")
+        return None
+
+    if not all([ALIYUN_OSS_ENDPOINT, ALIYUN_OSS_BUCKET, ALIYUN_OSS_ACCESS_KEY_ID, ALIYUN_OSS_ACCESS_KEY_SECRET]):
+        app_logger.error("upload_avatar_to_oss: OSS 配置缺失，请检查环境变量")
+        return None
+
+    normalized_object_name = object_name.lstrip("/")
+
+    try:
+        auth = oss2.Auth(ALIYUN_OSS_ACCESS_KEY_ID, ALIYUN_OSS_ACCESS_KEY_SECRET)
+        bucket = oss2.Bucket(auth, ALIYUN_OSS_ENDPOINT, ALIYUN_OSS_BUCKET)
+        bucket.put_object(normalized_object_name, avatar_bytes)
+
+        if ALIYUN_OSS_BASE_URL:
+            base = ALIYUN_OSS_BASE_URL.rstrip("/")
+            return f"{base}/{normalized_object_name}"
+
+        endpoint_host = ALIYUN_OSS_ENDPOINT.replace("https://", "").replace("http://", "").strip("/")
+        return f"https://{ALIYUN_OSS_BUCKET}.{endpoint_host}/{normalized_object_name}"
+    except Exception as exc:
+        app_logger.error(f"upload_avatar_to_oss: 上传失败 object={normalized_object_name}, error={exc}")
+        return None
 
 def safe_json_response(data: dict, status_code: int = 200):
     return JSONResponse(jsonable_encoder(data), status_code=status_code)
@@ -2678,10 +2723,11 @@ async def updateUserInfo(request: Request):
         print(f"[updateUserInfo] Avatar decode error for id_number={id_number}: {e}")
         return JSONResponse({'data': {'message': '头像数据解析失败', 'code': 400}}, status_code=400)
 
-    filename = f"{id_number}_.png"
-    file_path = os.path.join(IMAGE_DIR, filename)
-    with open(file_path, "wb") as f:
-        f.write(avatar_bytes)
+    object_name = f"avatars/{id_number}_{int(time.time())}.png"
+    avatar_url = upload_avatar_to_oss(avatar_bytes, object_name)
+    if not avatar_url:
+        app_logger.error("UpdateUserInfo failed: 上传头像到 OSS 失败")
+        return JSONResponse({'data': {'message': '头像上传失败，请稍后再试', 'code': 500}}, status_code=500)
 
     cursor = None
     user_details: Optional[Dict[str, Any]] = None
@@ -2689,8 +2735,8 @@ async def updateUserInfo(request: Request):
     try:
         update_query = "UPDATE ta_user_details SET avatar = %s WHERE id_number = %s"
         cursor = connection.cursor(dictionary=True)
-        print(f"[updateUserInfo] SQL -> {update_query}, params=({file_path}, {id_number})")
-        cursor.execute(update_query, (file_path, id_number))
+        print(f"[updateUserInfo] SQL -> {update_query}, params=({avatar_url}, {id_number})")
+        cursor.execute(update_query, (avatar_url, id_number))
         if cursor.rowcount == 0:
             cursor.execute(
                 "SELECT name, phone, id_number, avatar FROM ta_user_details WHERE id_number = %s",
@@ -2753,9 +2799,9 @@ async def updateUserInfo(request: Request):
     avatar_for_sync = None
     if user_details:
         name_for_sync = user_details.get("name")
-        avatar_for_sync = user_details.get("avatar") or file_path
+        avatar_for_sync = user_details.get("avatar") or avatar_url
     else:
-        avatar_for_sync = file_path
+        avatar_for_sync = avatar_url
 
     print(f"[updateUserInfo] Tencent sync request -> identifier={tencent_identifier or id_number}, "
           f"name={name_for_sync}, avatar={avatar_for_sync}")
