@@ -9,6 +9,7 @@ import datetime
 import random
 import string
 import logging
+import traceback
 import time
 import base64
 import os
@@ -148,6 +149,9 @@ ALIYUN_OSS_ACCESS_KEY_ID = os.getenv("ALIYUN_OSS_ACCESS_KEY_ID")
 ALIYUN_OSS_ACCESS_KEY_SECRET = os.getenv("ALIYUN_OSS_ACCESS_KEY_SECRET")
 ALIYUN_OSS_BASE_URL = os.getenv("ALIYUN_OSS_BASE_URL")  # 可选，自定义 CDN 或访问域名
 
+# ===== 本地头像访问配置（用于OSS失败时兜底）=====
+LOCAL_AVATAR_BASE_URL = os.getenv("LOCAL_AVATAR_BASE_URL")  # 例如 https://cdn.xxx.com/images
+
 # ===== 腾讯 REST API 配置 =====
 TENCENT_API_URL = os.getenv("TENCENT_API_URL")
 TENCENT_API_BASE_URL = os.getenv("TENCENT_API_BASE_URL")
@@ -195,34 +199,135 @@ def upload_avatar_to_oss(avatar_bytes: bytes, object_name: str) -> Optional[str]
     """
     上传头像文件到阿里云 OSS，返回可访问的 URL。
     """
+    print(f"[upload_avatar_to_oss] 开始上传头像到OSS")
+    print(f"[upload_avatar_to_oss] object_name: {object_name}")
+    print(f"[upload_avatar_to_oss] avatar_bytes大小: {len(avatar_bytes) if avatar_bytes else 0} bytes")
+    
     if not avatar_bytes:
-        app_logger.error("upload_avatar_to_oss: avatar_bytes 为空")
+        error_msg = "upload_avatar_to_oss: avatar_bytes 为空"
+        app_logger.error(error_msg)
+        print(f"[upload_avatar_to_oss] 错误: {error_msg}")
         return None
 
+    print(f"[upload_avatar_to_oss] 检查oss2模块... oss2={oss2}")
     if oss2 is None:
-        app_logger.error("upload_avatar_to_oss: oss2 模块未安装，无法上传到 OSS")
+        error_msg = "upload_avatar_to_oss: oss2 模块未安装，无法上传到 OSS"
+        app_logger.error(error_msg)
+        print(f"[upload_avatar_to_oss] 错误: {error_msg}")
         return None
 
+    print(f"[upload_avatar_to_oss] 检查OSS配置...")
+    print(f"[upload_avatar_to_oss]   ALIYUN_OSS_ENDPOINT: {ALIYUN_OSS_ENDPOINT}")
+    print(f"[upload_avatar_to_oss]   ALIYUN_OSS_BUCKET: {ALIYUN_OSS_BUCKET}")
+    print(f"[upload_avatar_to_oss]   ALIYUN_OSS_ACCESS_KEY_ID: {'已设置' if ALIYUN_OSS_ACCESS_KEY_ID else '未设置'}")
+    print(f"[upload_avatar_to_oss]   ALIYUN_OSS_ACCESS_KEY_SECRET: {'已设置' if ALIYUN_OSS_ACCESS_KEY_SECRET else '未设置'}")
+    print(f"[upload_avatar_to_oss]   ALIYUN_OSS_BASE_URL: {ALIYUN_OSS_BASE_URL}")
+    
     if not all([ALIYUN_OSS_ENDPOINT, ALIYUN_OSS_BUCKET, ALIYUN_OSS_ACCESS_KEY_ID, ALIYUN_OSS_ACCESS_KEY_SECRET]):
-        app_logger.error("upload_avatar_to_oss: OSS 配置缺失，请检查环境变量")
+        error_msg = "upload_avatar_to_oss: OSS 配置缺失，请检查环境变量"
+        app_logger.error(error_msg)
+        print(f"[upload_avatar_to_oss] 错误: {error_msg}")
+        print(f"[upload_avatar_to_oss] 配置检查结果:")
+        print(f"[upload_avatar_to_oss]   - ALIYUN_OSS_ENDPOINT存在: {bool(ALIYUN_OSS_ENDPOINT)}")
+        print(f"[upload_avatar_to_oss]   - ALIYUN_OSS_BUCKET存在: {bool(ALIYUN_OSS_BUCKET)}")
+        print(f"[upload_avatar_to_oss]   - ALIYUN_OSS_ACCESS_KEY_ID存在: {bool(ALIYUN_OSS_ACCESS_KEY_ID)}")
+        print(f"[upload_avatar_to_oss]   - ALIYUN_OSS_ACCESS_KEY_SECRET存在: {bool(ALIYUN_OSS_ACCESS_KEY_SECRET)}")
         return None
 
     normalized_object_name = object_name.lstrip("/")
+    print(f"[upload_avatar_to_oss] 标准化对象名称: {normalized_object_name}")
 
     try:
+        print(f"[upload_avatar_to_oss] 创建OSS认证对象...")
         auth = oss2.Auth(ALIYUN_OSS_ACCESS_KEY_ID, ALIYUN_OSS_ACCESS_KEY_SECRET)
+        print(f"[upload_avatar_to_oss] 创建OSS Bucket对象...")
         bucket = oss2.Bucket(auth, ALIYUN_OSS_ENDPOINT, ALIYUN_OSS_BUCKET)
+        print(f"[upload_avatar_to_oss] 开始上传文件到OSS...")
         bucket.put_object(normalized_object_name, avatar_bytes)
+        print(f"[upload_avatar_to_oss] 文件上传成功！")
 
         if ALIYUN_OSS_BASE_URL:
             base = ALIYUN_OSS_BASE_URL.rstrip("/")
-            return f"{base}/{normalized_object_name}"
+            url = f"{base}/{normalized_object_name}"
+            print(f"[upload_avatar_to_oss] 使用自定义BASE_URL生成URL: {url}")
+            return url
 
         endpoint_host = ALIYUN_OSS_ENDPOINT.replace("https://", "").replace("http://", "").strip("/")
-        return f"https://{ALIYUN_OSS_BUCKET}.{endpoint_host}/{normalized_object_name}"
+        url = f"https://{ALIYUN_OSS_BUCKET}.{endpoint_host}/{normalized_object_name}"
+        print(f"[upload_avatar_to_oss] 使用默认格式生成URL: {url}")
+        return url
     except Exception as exc:
-        app_logger.error(f"upload_avatar_to_oss: 上传失败 object={normalized_object_name}, error={exc}")
+        error_msg = f"upload_avatar_to_oss: 上传失败 object={normalized_object_name}, error={exc}"
+        app_logger.error(error_msg)
+        print(f"[upload_avatar_to_oss] 异常: {error_msg}")
+        print(f"[upload_avatar_to_oss] 异常类型: {type(exc).__name__}")
+        print(f"[upload_avatar_to_oss] 异常堆栈:\n{traceback.format_exc()}")
         return None
+
+
+def save_avatar_locally(avatar_bytes: bytes, object_name: str) -> Optional[str]:
+    """
+    OSS 上传失败时，将头像保存到本地 IMAGE_DIR/avatars 下，返回相对路径。
+    """
+    print("[save_avatar_locally] 开始执行本地保存逻辑")
+    if not avatar_bytes:
+        print("[save_avatar_locally] avatar_bytes 为空，无法保存")
+        return None
+
+    filename = os.path.basename(object_name) or f"{int(time.time())}.png"
+    local_dir = os.path.join(IMAGE_DIR, "avatars")
+    os.makedirs(local_dir, exist_ok=True)
+    file_path = os.path.join(local_dir, filename)
+
+    try:
+        with open(file_path, "wb") as f:
+            f.write(avatar_bytes)
+        relative_path = os.path.join("avatars", filename).replace("\\", "/")
+        print(f"[save_avatar_locally] 保存成功 -> {file_path}, relative_path={relative_path}")
+        return relative_path
+    except Exception as exc:
+        error_msg = f"save_avatar_locally: 保存失败 path={file_path}, error={exc}"
+        app_logger.error(error_msg)
+        print(f"[save_avatar_locally] 异常: {error_msg}")
+        print(f"[save_avatar_locally] 异常堆栈:\n{traceback.format_exc()}")
+        return None
+
+
+def build_public_url_from_local_path(relative_path: Optional[str]) -> Optional[str]:
+    """
+    如果配置了 LOCAL_AVATAR_BASE_URL，则根据本地相对路径拼接可访问的 HTTP 地址。
+    """
+    if not relative_path:
+        return None
+    if not LOCAL_AVATAR_BASE_URL:
+        return None
+    base = LOCAL_AVATAR_BASE_URL.rstrip("/")
+    cleaned = relative_path.lstrip("/")
+    public_url = f"{base}/{cleaned}"
+    print(f"[build_public_url_from_local_path] 生成URL: {public_url}")
+    return public_url
+
+
+def resolve_local_avatar_file_path(avatar_path: Optional[str]) -> Optional[str]:
+    """
+    根据数据库中存储的 avatar 字段推断本地文件路径。
+    当 avatar 已经是 URL 时返回 None。
+    """
+    if not avatar_path:
+        return None
+
+    path_str = str(avatar_path).strip()
+    if not path_str:
+        return None
+
+    lowered = path_str.lower()
+    if lowered.startswith("http://") or lowered.startswith("https://"):
+        return None
+
+    if os.path.isabs(path_str):
+        return path_str
+
+    return os.path.join(IMAGE_DIR, path_str)
 
 def safe_json_response(data: dict, status_code: int = 200):
     return JSONResponse(jsonable_encoder(data), status_code=status_code)
@@ -2700,124 +2805,339 @@ async def list_schools(request: Request):
 
 @app.post("/updateUserInfo")
 async def updateUserInfo(request: Request):
-    data = await request.json()
-    print(f"[updateUserInfo] Received payload: {data}")
-    phone = data.get('phone')
-    id_number = data.get('id_number')
-    avatar = data.get('avatar')
-
-    if not id_number or not avatar:
-        app_logger.warning("UpdateUserInfo failed: Missing id_number or avatar.")
-        print(f"[updateUserInfo] Missing id_number or avatar -> id_number={id_number}, avatar_present={avatar is not None}")
-        return JSONResponse({'data': {'message': '身份证号码和头像必须提供', 'code': 400}}, status_code=400)
-
-    connection = get_db_connection()
-    if connection is None:
-        app_logger.error("UpdateUserInfo failed: Database connection error.")
-        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500}}, status_code=500)
-
-    try:
-        avatar_bytes = base64.b64decode(avatar)
-    except Exception as e:
-        app_logger.error(f"UpdateUserInfo failed: Avatar decode error for {id_number}: {e}")
-        print(f"[updateUserInfo] Avatar decode error for id_number={id_number}: {e}")
-        return JSONResponse({'data': {'message': '头像数据解析失败', 'code': 400}}, status_code=400)
-
-    object_name = f"avatars/{id_number}_{int(time.time())}.png"
-    avatar_url = upload_avatar_to_oss(avatar_bytes, object_name)
-    if not avatar_url:
-        app_logger.error("UpdateUserInfo failed: 上传头像到 OSS 失败")
-        return JSONResponse({'data': {'message': '头像上传失败，请稍后再试', 'code': 500}}, status_code=500)
-
+    print("=" * 80)
+    print("[updateUserInfo] 收到更新用户信息请求")
+    print(f"[updateUserInfo] 请求方法: {request.method}")
+    print(f"[updateUserInfo] 请求URL: {request.url}")
+    print(f"[updateUserInfo] 请求头: {dict(request.headers)}")
+    connection = None
     cursor = None
     user_details: Optional[Dict[str, Any]] = None
     tencent_identifier: Optional[str] = None
+    avatar_url = None  # 存入数据库的值（可能是URL或相对路径）
+    avatar_sync_url = None  # 发给腾讯或前端的可访问URL
+    
     try:
-        update_query = "UPDATE ta_user_details SET avatar = %s WHERE id_number = %s"
-        cursor = connection.cursor(dictionary=True)
-        print(f"[updateUserInfo] SQL -> {update_query}, params=({avatar_url}, {id_number})")
-        cursor.execute(update_query, (avatar_url, id_number))
-        if cursor.rowcount == 0:
-            cursor.execute(
-                "SELECT name, phone, id_number, avatar FROM ta_user_details WHERE id_number = %s",
-                (id_number,)
-            )
-            user_details = cursor.fetchone()
-            if not user_details and phone:
-                cursor.execute(
-                    "SELECT name, phone, id_number, avatar FROM ta_user_details WHERE phone = %s",
-                    (phone,)
-                )
-                user_details = cursor.fetchone()
-                print(f"[updateUserInfo] Fallback by phone={phone}, fetched user_details={user_details}")
-            else:
-                print(f"[updateUserInfo] Found user_details by id_number={id_number}: {user_details}")
+        # 步骤1: 解析请求数据
+        print("[updateUserInfo] 步骤1: 开始解析请求JSON数据...")
+        print(f"[updateUserInfo] 步骤1: 请求内容类型: {request.headers.get('content-type', '未指定')}")
+        try:
+            body = await request.body()
+            print(f"[updateUserInfo] 步骤1: 原始请求体大小: {len(body)} bytes")
+            if body:
+                print(f"[updateUserInfo] 步骤1: 原始请求体前200字符: {body[:200]}")
+            
+            data = await request.json()
+            print(f"[updateUserInfo] 步骤1完成: 成功解析JSON, payload keys: {list(data.keys()) if data else 'None'}")
+            print(f"[updateUserInfo] 步骤1: 完整payload: {data}")
+        except Exception as e:
+            print(f"[updateUserInfo] 步骤1失败: JSON解析错误 - {type(e).__name__}: {str(e)}")
+            app_logger.error(f"UpdateUserInfo failed: JSON parse error - {type(e).__name__}: {str(e)}")
+            print(f"[updateUserInfo] 异常堆栈:\n{traceback.format_exc()}")
+            return JSONResponse({'data': {'message': f'请求数据解析失败: {str(e)}', 'code': 400}}, status_code=400)
+        
+        print(f"[updateUserInfo] Received payload: {data}")
+        try:
+            phone = data.get('phone')
+            id_number = data.get('id_number')
+            avatar = data.get('avatar')
+            print(f"[updateUserInfo] 提取的字段 - phone: {phone}, id_number: {id_number}, avatar_length: {len(avatar) if avatar else 0}, avatar_type: {type(avatar)}")
+            print(f"[updateUserInfo] 所有字段列表: {list(data.keys())}")
+            for key, value in data.items():
+                if key != 'avatar':  # 头像数据太长，不完整打印
+                    print(f"[updateUserInfo]   - {key}: {value} (type: {type(value).__name__})")
+        except Exception as e:
+            print(f"[updateUserInfo] 提取字段时出错: {type(e).__name__}: {str(e)}")
+            print(f"[updateUserInfo] 异常堆栈:\n{traceback.format_exc()}")
+            raise
 
-            if not user_details:
+        # 步骤2: 验证必需字段
+        print("[updateUserInfo] 步骤2: 验证必需字段...")
+        print(f"[updateUserInfo] 步骤2: id_number检查 - 值: {id_number}, 类型: {type(id_number).__name__}, 是否为空: {not id_number}")
+        print(f"[updateUserInfo] 步骤2: avatar检查 - 值长度: {len(avatar) if avatar else 0}, 类型: {type(avatar).__name__}, 是否为空: {not avatar}")
+        if not id_number or not avatar:
+            app_logger.warning("UpdateUserInfo failed: Missing id_number or avatar.")
+            print(f"[updateUserInfo] 步骤2失败: Missing id_number or avatar -> id_number={id_number}, avatar_present={avatar is not None}")
+            return JSONResponse({'data': {'message': '身份证号码和头像必须提供', 'code': 400}}, status_code=400)
+        print("[updateUserInfo] 步骤2完成: 必需字段验证通过")
+
+        # 步骤3: 连接数据库
+        print("[updateUserInfo] 步骤3: 连接数据库...")
+        try:
+            connection = get_db_connection()
+            print(f"[updateUserInfo] 步骤3: get_db_connection返回: {connection}, 类型: {type(connection).__name__}")
+            if connection:
+                print(f"[updateUserInfo] 步骤3: connection.is_connected() = {connection.is_connected()}")
+            if connection is None or not connection.is_connected():
+                app_logger.error("UpdateUserInfo failed: Database connection error.")
+                print("[updateUserInfo] 步骤3失败: 数据库连接失败或未连接")
+                return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500}}, status_code=500)
+            print("[updateUserInfo] 步骤3完成: 数据库连接成功")
+        except Exception as e:
+            print(f"[updateUserInfo] 步骤3异常: 连接数据库时出错 - {type(e).__name__}: {str(e)}")
+            print(f"[updateUserInfo] 异常堆栈:\n{traceback.format_exc()}")
+            app_logger.error(f"UpdateUserInfo failed: Database connection exception - {type(e).__name__}: {str(e)}")
+            raise
+
+        # 步骤4: 解码头像数据
+        print("[updateUserInfo] 步骤4: 解码Base64头像数据...")
+        print(f"[updateUserInfo] 步骤4: avatar前100字符: {avatar[:100] if avatar else 'None'}...")
+        try:
+            # 确保avatar是字符串
+            if not isinstance(avatar, str):
+                print(f"[updateUserInfo] 步骤4: avatar不是字符串类型，当前类型: {type(avatar).__name__}, 值: {avatar}")
+                avatar = str(avatar)
+            # 移除可能的前缀
+            if avatar.startswith('data:image'):
+                print("[updateUserInfo] 步骤4: 检测到data URL前缀，移除前缀...")
+                avatar = avatar.split(',', 1)[1]
+            avatar_bytes = base64.b64decode(avatar)
+            print(f"[updateUserInfo] 步骤4完成: 头像解码成功, 大小: {len(avatar_bytes)} bytes")
+        except Exception as e:
+            app_logger.error(f"UpdateUserInfo failed: Avatar decode error for {id_number}: {e}")
+            print(f"[updateUserInfo] 步骤4失败: Avatar decode error for id_number={id_number}: {type(e).__name__}: {str(e)}")
+            print(f"[updateUserInfo] avatar字符串长度: {len(avatar) if avatar else 0}")
+            print(f"[updateUserInfo] avatar字符串类型: {type(avatar).__name__}")
+            print(f"[updateUserInfo] 异常堆栈:\n{traceback.format_exc()}")
+            return JSONResponse({'data': {'message': f'头像数据解析失败: {str(e)}', 'code': 400}}, status_code=400)
+
+        # 步骤5: 上传头像到OSS
+        print("[updateUserInfo] 步骤5: 上传头像到OSS...")
+        print(f"[updateUserInfo] 步骤5: avatar_bytes类型: {type(avatar_bytes).__name__}, 大小: {len(avatar_bytes) if avatar_bytes else 0} bytes")
+        object_name = f"avatars/{id_number}_{int(time.time())}.png"
+        print(f"[updateUserInfo] 步骤5: OSS对象名称: {object_name}")
+        print(f"[updateUserInfo] 步骤5: 检查upload_avatar_to_oss函数是否可用...")
+        try:
+            print(f"[updateUserInfo] 步骤5: 调用upload_avatar_to_oss(avatar_bytes长度={len(avatar_bytes)}, object_name={object_name})...")
+            avatar_url = upload_avatar_to_oss(avatar_bytes, object_name)
+            avatar_sync_url = avatar_url
+            print(f"[updateUserInfo] 步骤5: upload_avatar_to_oss返回: {avatar_url}, 类型: {type(avatar_url).__name__}")
+            if not avatar_url:
+                print("[updateUserInfo] 步骤5: OSS 上传失败，尝试本地兜底存储...")
+                local_path = save_avatar_locally(avatar_bytes, object_name)
+                if not local_path:
+                    app_logger.error("UpdateUserInfo failed: OSS 和本地保存均失败")
+                    print("[updateUserInfo] 步骤5失败: save_avatar_locally返回None")
+                    return JSONResponse({'data': {'message': '头像上传失败，请稍后再试', 'code': 500}}, status_code=500)
+                avatar_url = local_path
+                avatar_sync_url = build_public_url_from_local_path(local_path) or local_path
+                print(f"[updateUserInfo] 步骤5: 本地兜底成功, relative_path={local_path}, sync_url={avatar_sync_url}")
+            else:
+                print(f"[updateUserInfo] 步骤5完成: 头像上传成功, URL: {avatar_url}")
+        except Exception as e:
+            app_logger.error(f"UpdateUserInfo failed: OSS upload error for {id_number}: {e}")
+            print(f"[updateUserInfo] 步骤5失败: OSS上传异常 - {type(e).__name__}: {str(e)}")
+            print(f"[updateUserInfo] 步骤5: 异常参数: {e.args}")
+            print(f"[updateUserInfo] 步骤5异常堆栈:\n{traceback.format_exc()}")
+            return JSONResponse({'data': {'message': f'头像上传失败: {str(e)}', 'code': 500}}, status_code=500)
+
+        # 步骤6: 更新数据库
+        print("[updateUserInfo] 步骤6: 更新数据库中的头像URL...")
+        print(f"[updateUserInfo] 步骤6: 准备更新，avatar_url={avatar_url}, id_number={id_number}")
+        try:
+            if not cursor:
+                print("[updateUserInfo] 步骤6: 创建数据库游标...")
+                cursor = connection.cursor(dictionary=True)
+                print(f"[updateUserInfo] 步骤6: 游标创建成功: {cursor}")
+            else:
+                print("[updateUserInfo] 步骤6: 使用现有游标")
+            update_query = "UPDATE ta_user_details SET avatar = %s WHERE id_number = %s"
+            print(f"[updateUserInfo] 步骤6: 执行SQL: {update_query}")
+            print(f"[updateUserInfo] 步骤6: SQL参数 - avatar_url类型: {type(avatar_url).__name__}, 值: {avatar_url}")
+            print(f"[updateUserInfo] 步骤6: SQL参数 - id_number类型: {type(id_number).__name__}, 值: {id_number}")
+            cursor.execute(update_query, (avatar_url, id_number))
+            affected_rows = cursor.rowcount
+            print(f"[updateUserInfo] 步骤6: SQL执行完成, 受影响行数: {affected_rows}")
+            
+            if affected_rows == 0:
+                print("[updateUserInfo] 未更新任何行, 尝试通过id_number查询用户...")
                 cursor.execute(
-                    "SELECT avatar FROM ta_user_details WHERE id_number = %s",
+                    "SELECT name, phone, id_number, avatar FROM ta_user_details WHERE id_number = %s",
                     (id_number,)
                 )
-                existing_avatar_row = cursor.fetchone()
-                existing_avatar = existing_avatar_row["avatar"] if existing_avatar_row else None
-                print(f"[updateUserInfo] No ta_user_details record affected for id_number={id_number}, "
-                      f"existing avatar in DB: {existing_avatar}")
+                user_details = cursor.fetchone()
+                print(f"[updateUserInfo] 通过id_number查询结果: {user_details}")
+                
+                if not user_details and phone:
+                    print(f"[updateUserInfo] 通过id_number未找到, 尝试通过phone查询: {phone}")
+                    cursor.execute(
+                        "SELECT name, phone, id_number, avatar FROM ta_user_details WHERE phone = %s",
+                        (phone,)
+                    )
+                    user_details = cursor.fetchone()
+                    print(f"[updateUserInfo] 通过phone查询结果: {user_details}")
+
+                if not user_details:
+                    cursor.execute(
+                        "SELECT avatar FROM ta_user_details WHERE id_number = %s",
+                        (id_number,)
+                    )
+                    existing_avatar_row = cursor.fetchone()
+                    existing_avatar = existing_avatar_row["avatar"] if existing_avatar_row else None
+                    print(f"[updateUserInfo] 最终未找到用户记录, id_number={id_number}, existing_avatar={existing_avatar}")
+                    connection.commit()
+                    app_logger.warning(f"UpdateUserInfo: No user_details record found for id_number={id_number}")
+                    return JSONResponse({'data': {'message': '未找到对应的用户信息', 'code': 404}}, status_code=404)
+                else:
+                    print("[updateUserInfo] 找到用户记录但UPDATE未影响行, 继续处理...")
+            else:
+                print("[updateUserInfo] UPDATE成功, 提交事务并查询用户详情...")
                 connection.commit()
-                app_logger.warning(f"UpdateUserInfo: No user_details record found for id_number={id_number}")
-                return JSONResponse({'data': {'message': '未找到对应的用户信息', 'code': 404}}, status_code=404)
-        else:
-            connection.commit()
-            cursor.execute(
-                "SELECT name, phone, id_number, avatar FROM ta_user_details WHERE id_number = %s",
-                (id_number,)
-            )
-            user_details = cursor.fetchone()
-            if not user_details and phone:
                 cursor.execute(
-                    "SELECT name, phone, id_number, avatar FROM ta_user_details WHERE phone = %s",
-                    (phone,)
+                    "SELECT name, phone, id_number, avatar FROM ta_user_details WHERE id_number = %s",
+                    (id_number,)
                 )
                 user_details = cursor.fetchone()
-                print(f"[updateUserInfo] Fallback by phone={phone}, fetched user_details={user_details}")
+                print(f"[updateUserInfo] 更新后查询结果: {user_details}")
+                
+                if not user_details and phone:
+                    print(f"[updateUserInfo] 更新后通过id_number未找到, 尝试通过phone查询: {phone}")
+                    cursor.execute(
+                        "SELECT name, phone, id_number, avatar FROM ta_user_details WHERE phone = %s",
+                        (phone,)
+                    )
+                    user_details = cursor.fetchone()
+                    print(f"[updateUserInfo] 通过phone查询结果: {user_details}")
+
+            print("[updateUserInfo] 步骤6完成: 数据库更新成功")
+        except Error as e:
+            app_logger.error(f"Database error during updateUserInfo for {phone}: {type(e).__name__}: {str(e)}")
+            print(f"[updateUserInfo] 步骤6失败: 数据库错误 - {type(e).__name__}: {str(e)}")
+            if connection:
+                try:
+                    connection.rollback()
+                    print("[updateUserInfo] 已回滚事务")
+                except Exception as rollback_e:
+                    print(f"[updateUserInfo] 回滚失败: {str(rollback_e)}")
+            print(f"[updateUserInfo] 异常堆栈:\n{traceback.format_exc()}")
+            return JSONResponse({'data': {'message': f'数据库更新失败: {str(e)}', 'code': 500}}, status_code=500)
+        except Exception as e:
+            app_logger.error(f"Unexpected error during database update for {phone}: {type(e).__name__}: {str(e)}")
+            print(f"[updateUserInfo] 步骤6失败: 意外错误 - {type(e).__name__}: {str(e)}")
+            if connection:
+                try:
+                    connection.rollback()
+                    print("[updateUserInfo] 已回滚事务")
+                except Exception as rollback_e:
+                    print(f"[updateUserInfo] 回滚失败: {str(rollback_e)}")
+            print(f"[updateUserInfo] 异常堆栈:\n{traceback.format_exc()}")
+            return JSONResponse({'data': {'message': f'数据库操作失败: {str(e)}', 'code': 500}}, status_code=500)
+
+        # 步骤7: 解析腾讯标识符
+        print("[updateUserInfo] 步骤7: 解析腾讯用户标识符...")
+        print(f"[updateUserInfo] 步骤7: 调用参数 - connection={connection}, id_number={id_number}, phone={phone}")
+        try:
+            tencent_identifier = resolve_tencent_identifier(connection, id_number=id_number, phone=phone)
+            print(f"[updateUserInfo] 步骤7完成: Tencent identifier={tencent_identifier}, 类型: {type(tencent_identifier).__name__}")
+        except Exception as e:
+            app_logger.error(f"UpdateUserInfo failed: resolve_tencent_identifier error for {id_number}: {type(e).__name__}: {str(e)}")
+            print(f"[updateUserInfo] 步骤7失败: resolve_tencent_identifier异常 - {type(e).__name__}: {str(e)}")
+            import traceback
+            print(f"[updateUserInfo] 步骤7异常堆栈:\n{traceback.format_exc()}")
+            tencent_identifier = None  # 确保变量被设置
+            print(f"[updateUserInfo] 步骤7: 使用None作为fallback，将继续使用id_number")
+            # 继续执行，使用id_number作为fallback
+
+        # 步骤8: 准备同步数据
+        print("[updateUserInfo] 步骤8: 准备腾讯同步数据...")
+        print(f"[updateUserInfo] 步骤8: user_details状态: {user_details}")
+        print(f"[updateUserInfo] 步骤8: avatar_url状态: {avatar_url}")
+        name_for_sync = None
+        avatar_for_sync = None
+        try:
+            if user_details:
+                name_for_sync = user_details.get("name")
+                avatar_from_db = user_details.get("avatar")
+                avatar_for_sync = avatar_sync_url or avatar_from_db or avatar_url
+                print(f"[updateUserInfo] 步骤8: 从user_details获取 - name={name_for_sync}, avatar_db={avatar_from_db}, avatar_for_sync={avatar_for_sync}")
             else:
-                print(f"[updateUserInfo] Found user_details by id_number={id_number}: {user_details}")
+                avatar_for_sync = avatar_sync_url or avatar_url
+                print(f"[updateUserInfo] 步骤8: user_details为空，使用上传的头像URL: {avatar_for_sync}")
+            print(f"[updateUserInfo] 步骤8: 最终同步数据 - name_for_sync={name_for_sync}, avatar_for_sync={avatar_for_sync}")
+            print("[updateUserInfo] 步骤8完成")
+        except Exception as e:
+            print(f"[updateUserInfo] 步骤8异常: 准备同步数据时出错 - {type(e).__name__}: {str(e)}")
+            print(f"[updateUserInfo] 步骤8异常堆栈:\n{traceback.format_exc()}")
+            raise
 
-        tencent_identifier = resolve_tencent_identifier(connection, id_number=id_number, phone=phone)
-        print(f"[updateUserInfo] Resolved Tencent identifier={tencent_identifier}")
+        # 步骤9: 同步到腾讯
+        print("[updateUserInfo] 步骤9: 同步用户信息到腾讯...")
+        final_identifier = tencent_identifier or id_number
+        print(f"[updateUserInfo] 步骤9: 最终使用的identifier={final_identifier} (tencent_identifier={tencent_identifier}, id_number={id_number})")
+        print(f"[updateUserInfo] 步骤9: 同步参数 - identifier={final_identifier}, name={name_for_sync}, avatar_url={avatar_for_sync}")
+        print(f"[updateUserInfo] Tencent sync request -> identifier={final_identifier}, "
+              f"name={name_for_sync}, avatar={avatar_for_sync}")
+        app_logger.info(
+            f"updateUserInfo: 准备同步腾讯用户资料 identifier={final_identifier}, "
+            f"name={name_for_sync}, avatar={avatar_for_sync}"
+        )
+        tencent_sync_summary = None
+        try:
+            print(f"[updateUserInfo] 步骤9: 调用notify_tencent_user_profile...")
+            tencent_sync_summary = await notify_tencent_user_profile(
+                final_identifier,
+                name=name_for_sync,
+                avatar_url=avatar_for_sync
+            )
+            print(f"[updateUserInfo] 步骤9完成: 腾讯同步成功")
+            print(f"[updateUserInfo] Tencent sync response <- {tencent_sync_summary}, 类型: {type(tencent_sync_summary).__name__}")
+            app_logger.info(f"updateUserInfo: 腾讯接口返回 {tencent_sync_summary}")
+        except Exception as e:
+            app_logger.error(f"UpdateUserInfo failed: notify_tencent_user_profile error: {type(e).__name__}: {str(e)}")
+            print(f"[updateUserInfo] 步骤9失败: 腾讯同步异常 - {type(e).__name__}: {str(e)}")
+            import traceback
+            print(f"[updateUserInfo] 步骤9异常堆栈:\n{traceback.format_exc()}")
+            tencent_sync_summary = {'success': False, 'error': str(e)}
+            print(f"[updateUserInfo] 步骤9: 设置tencent_sync_summary为: {tencent_sync_summary}")
+            # 继续执行，不阻止返回成功响应
 
-    except Error as e:
-        app_logger.error(f"Database error during updateUserInfo for {phone}: {e}")
-        return JSONResponse({'data': {'message': '更新失败', 'code': 500}}, status_code=500)
+        print("[updateUserInfo] 所有步骤完成, 准备返回成功响应")
+        response_data = {'data': {'message': '更新成功', 'code': 200, 'tencent_sync': tencent_sync_summary}}
+        print(f"[updateUserInfo] 响应数据: {response_data}")
+        try:
+            response = JSONResponse(response_data)
+            print(f"[updateUserInfo] JSONResponse创建成功: {response}")
+            return response
+        except Exception as e:
+            print(f"[updateUserInfo] 创建响应时出错: {type(e).__name__}: {str(e)}")
+            print(f"[updateUserInfo] 异常堆栈:\n{traceback.format_exc()}")
+            raise
+    
+    except Exception as e:
+        app_logger.error(f"UpdateUserInfo failed: Unexpected error - {type(e).__name__}: {str(e)}")
+        print(f"[updateUserInfo] ========== 未预期的异常 ==========")
+        print(f"[updateUserInfo] 异常类型: {type(e).__name__}")
+        print(f"[updateUserInfo] 异常消息: {str(e)}")
+        print(f"[updateUserInfo] 异常参数: {e.args}")
+        import traceback
+        exc_tb = traceback.format_exc()
+        print(f"[updateUserInfo] 完整异常堆栈:\n{exc_tb}")
+        print(f"[updateUserInfo] 当前变量状态:")
+        print(f"[updateUserInfo]   - connection: {connection}")
+        print(f"[updateUserInfo]   - cursor: {cursor}")
+        print(f"[updateUserInfo]   - avatar_url: {avatar_url}")
+        print(f"[updateUserInfo]   - user_details: {user_details}")
+        print(f"[updateUserInfo]   - tencent_identifier: {tencent_identifier}")
+        print(f"[updateUserInfo] ==================================")
+        return JSONResponse({'data': {'message': f'更新失败: {str(e)}', 'code': 500}}, status_code=500)
+    
     finally:
+        print("[updateUserInfo] 清理资源...")
         if cursor:
-            cursor.close()
+            try:
+                cursor.close()
+                print("[updateUserInfo] 游标已关闭")
+            except Exception as e:
+                print(f"[updateUserInfo] 关闭游标时出错: {str(e)}")
         if connection and connection.is_connected():
-            connection.close()
-            app_logger.info(f"Database connection closed after updating user info for {phone}.")
-
-    name_for_sync = None
-    avatar_for_sync = None
-    if user_details:
-        name_for_sync = user_details.get("name")
-        avatar_for_sync = user_details.get("avatar") or avatar_url
-    else:
-        avatar_for_sync = avatar_url
-
-    print(f"[updateUserInfo] Tencent sync request -> identifier={tencent_identifier or id_number}, "
-          f"name={name_for_sync}, avatar={avatar_for_sync}")
-    app_logger.info(
-        f"updateUserInfo: 准备同步腾讯用户资料 identifier={tencent_identifier or id_number}, "
-        f"name={name_for_sync}, avatar={avatar_for_sync}"
-    )
-    tencent_sync_summary = await notify_tencent_user_profile(
-        tencent_identifier or id_number,
-        name=name_for_sync,
-        avatar_url=avatar_for_sync
-    )
-    print(f"[updateUserInfo] Tencent sync response <- {tencent_sync_summary}")
-    app_logger.info(f"updateUserInfo: 腾讯接口返回 {tencent_sync_summary}")
-
-    return JSONResponse({'data': {'message': '更新成功', 'code': 200, 'tencent_sync': tencent_sync_summary}})
+            try:
+                connection.close()
+                print("[updateUserInfo] 数据库连接已关闭")
+                app_logger.info(f"Database connection closed after updating user info.")
+            except Exception as e:
+                print(f"[updateUserInfo] 关闭数据库连接时出错: {str(e)}")
+        print("[updateUserInfo] 资源清理完成")
+        print("=" * 80)
 
 
 @app.post("/updateUserName")
@@ -3114,16 +3434,13 @@ async def list_userInfo(request: Request):
         # 附加头像Base64字段
         for user in userinfo:
             avatar_path = user.get("avatar")
-            if avatar_path:
-                full_path = os.path.join(IMAGE_DIR, avatar_path)
-                if os.path.exists(full_path):
-                    try:
-                        with open(full_path, "rb") as img:
-                            user["avatar_base64"] = base64.b64encode(img.read()).decode("utf-8")
-                    except Exception as e:
-                        app_logger.error(f"读取图片失败 {full_path}: {e}")
-                        user["avatar_base64"] = None
-                else:
+            local_avatar_file = resolve_local_avatar_file_path(avatar_path)
+            if local_avatar_file and os.path.exists(local_avatar_file):
+                try:
+                    with open(local_avatar_file, "rb") as img:
+                        user["avatar_base64"] = base64.b64encode(img.read()).decode("utf-8")
+                except Exception as e:
+                    app_logger.error(f"读取图片失败 {local_avatar_file}: {e}")
                     user["avatar_base64"] = None
             else:
                 user["avatar_base64"] = None
@@ -4854,18 +5171,13 @@ def get_groups_by_admin(group_admin_id: str = Query(..., description="群管理�
         groups = cursor.fetchall()
         for group in groups:
             avatar_path = group.get("headImage_path")
-            if avatar_path:
-                #full_path = os.path.join(IMAGE_DIR, avatar_path)
-                full_path = avatar_path
-                print(full_path)
-                if os.path.exists(full_path):
-                    try:
-                        with open(full_path, "rb") as img:
-                            group["avatar_base64"] = base64.b64encode(img.read()).decode("utf-8")
-                    except Exception as e:
-                        app_logger.error(f"读取图片失败 {full_path}: {e}")
-                        group["avatar_base64"] = None
-                else:
+            local_avatar_file = resolve_local_avatar_file_path(avatar_path)
+            if local_avatar_file and os.path.exists(local_avatar_file):
+                try:
+                    with open(local_avatar_file, "rb") as img:
+                        group["avatar_base64"] = base64.b64encode(img.read()).decode("utf-8")
+                except Exception as e:
+                    app_logger.error(f"读取图片失败 {local_avatar_file}: {e}")
                     group["avatar_base64"] = None
             else:
                 group["avatar_base64"] = None
@@ -4936,18 +5248,13 @@ def get_member_groups(
 
         for group in groups:
             avatar_path = group.get("headImage_path")
-            if avatar_path:
-                #full_path = os.path.join(IMAGE_DIR, avatar_path)
-                full_path = avatar_path
-                print(full_path)
-                if os.path.exists(full_path):
-                    try:
-                        with open(full_path, "rb") as img:
-                            group["avatar_base64"] = base64.b64encode(img.read()).decode("utf-8")
-                    except Exception as e:
-                        app_logger.error(f"读取图片失败 {full_path}: {e}")
-                        group["avatar_base64"] = None
-                else:
+            local_avatar_file = resolve_local_avatar_file_path(avatar_path)
+            if local_avatar_file and os.path.exists(local_avatar_file):
+                try:
+                    with open(local_avatar_file, "rb") as img:
+                        group["avatar_base64"] = base64.b64encode(img.read()).decode("utf-8")
+                except Exception as e:
+                    app_logger.error(f"读取图片失败 {local_avatar_file}: {e}")
                     group["avatar_base64"] = None
             else:
                 group["avatar_base64"] = None
@@ -5280,6 +5587,174 @@ def search_groups(
             connection.close()
             print("[groups/search] 数据库连接已关闭")
             app_logger.info(f"[groups/search] Database connection closed after search groups attempt for schoolid={schoolid}.")
+
+@app.get("/teachers/search")
+def search_teachers(
+    schoolid: str = Query(..., description="学校ID，必需参数"),
+    teacher_id: str = Query(None, description="老师ID，与teacher_unique_id和name三选一"),
+    teacher_unique_id: str = Query(None, description="老师唯一ID，与teacher_id和name三选一"),
+    name: str = Query(None, description="老师姓名，与teacher_id和teacher_unique_id三选一，支持模糊查询")
+):
+    """
+    搜索同一学校的老师
+    根据 schoolid 和 teacher_id 或 teacher_unique_id 或 name 搜索 ta_teacher 表
+    - schoolid: 必需参数
+    - teacher_id、teacher_unique_id、name: 三选一，不会同时上传
+    """
+    print("=" * 80)
+    print("[teachers/search] 收到搜索老师请求")
+    print(f"[teachers/search] 请求参数 - schoolid: {schoolid}, teacher_id: {teacher_id}, teacher_unique_id: {teacher_unique_id}, name: {name}")
+    
+    # 参数验证
+    if not schoolid:
+        print("[teachers/search] 错误: 缺少必需参数 schoolid")
+        return JSONResponse({
+            "data": {
+                "message": "缺少必需参数 schoolid",
+                "code": 400
+            }
+        }, status_code=400)
+    
+    # teacher_id、teacher_unique_id 和 name 必须至少提供一个
+    search_params_count = sum([bool(teacher_id), bool(teacher_unique_id), bool(name)])
+    if search_params_count == 0:
+        print("[teachers/search] 错误: teacher_id、teacher_unique_id 和 name 必须至少提供一个")
+        return JSONResponse({
+            "data": {
+                "message": "teacher_id、teacher_unique_id 和 name 必须至少提供一个",
+                "code": 400
+            }
+        }, status_code=400)
+    
+    # 不能同时提供多个搜索参数
+    if search_params_count > 1:
+        print("[teachers/search] 错误: teacher_id、teacher_unique_id 和 name 不能同时提供")
+        return JSONResponse({
+            "data": {
+                "message": "teacher_id、teacher_unique_id 和 name 不能同时提供",
+                "code": 400
+            }
+        }, status_code=400)
+    
+    print("[teachers/search] 开始连接数据库...")
+    connection = get_db_connection()
+    if connection is None or not connection.is_connected():
+        print("[teachers/search] 错误: 数据库连接失败")
+        app_logger.error(f"[teachers/search] 数据库连接失败 for schoolid={schoolid}")
+        return JSONResponse({
+            "data": {
+                "message": "数据库连接失败",
+                "code": 500
+            }
+        }, status_code=500)
+    print("[teachers/search] 数据库连接成功")
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+        
+        # 构建查询条件
+        if teacher_id:
+            # 根据 teacher_id 精确查询
+            print(f"[teachers/search] 根据 teacher_id 精确查询: {teacher_id}")
+            sql = """
+                SELECT *
+                FROM `ta_teacher`
+                WHERE schoolId = %s AND id = %s
+            """
+            params = (schoolid, teacher_id)
+            search_key = teacher_id
+            search_type = "teacher_id"
+        elif teacher_unique_id:
+            # 根据 teacher_unique_id 精确查询
+            print(f"[teachers/search] 根据 teacher_unique_id 精确查询: {teacher_unique_id}")
+            sql = """
+                SELECT *
+                FROM `ta_teacher`
+                WHERE schoolId = %s AND teacher_unique_id = %s
+            """
+            params = (schoolid, teacher_unique_id)
+            search_key = teacher_unique_id
+            search_type = "teacher_unique_id"
+        else:
+            # 根据 name 模糊查询
+            print(f"[teachers/search] 根据 name 模糊查询: {name}")
+            sql = """
+                SELECT *
+                FROM `ta_teacher`
+                WHERE schoolId = %s AND name LIKE %s
+            """
+            params = (schoolid, f"%{name}%")
+            search_key = name
+            search_type = "name"
+        
+        print(f"[teachers/search] 执行SQL查询: {sql}")
+        print(f"[teachers/search] 查询参数: {params}")
+        
+        cursor.execute(sql, params)
+        teachers = cursor.fetchall()
+        
+        print(f"[teachers/search] 查询结果: 找到 {len(teachers)} 个老师")
+        
+        # 转换 datetime 为字符串
+        for idx, teacher in enumerate(teachers):
+            print(f"[teachers/search] 处理第 {idx+1} 个老师: id={teacher.get('id')}, name={teacher.get('name')}, teacher_unique_id={teacher.get('teacher_unique_id')}")
+            for key, value in teacher.items():
+                if isinstance(value, datetime.datetime):
+                    teacher[key] = value.strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"[teachers/search]   转换时间字段 {key}: {teacher[key]}")
+        
+        result = {
+            "data": {
+                "message": "查询成功",
+                "code": 200,
+                "schoolid": schoolid,
+                "search_key": search_key,
+                "search_type": search_type,
+                "teachers": teachers,
+                "count": len(teachers)
+            }
+        }
+        
+        print(f"[teachers/search] 返回结果: 找到 {len(teachers)} 个老师")
+        print("=" * 80)
+        
+        return JSONResponse(result, status_code=200)
+
+    except mysql.connector.Error as e:
+        error_msg = f"搜索老师错误: {e}"
+        print(f"[teachers/search] {error_msg}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[teachers/search] 错误堆栈: {traceback_str}")
+        app_logger.error(f"[teachers/search] {error_msg}\n{traceback_str}")
+        return JSONResponse({
+            "data": {
+                "message": f"查询失败: {str(e)}",
+                "code": 500
+            }
+        }, status_code=500)
+    except Exception as e:
+        error_msg = f"搜索老师时发生异常: {e}"
+        print(f"[teachers/search] {error_msg}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[teachers/search] 错误堆栈: {traceback_str}")
+        app_logger.error(f"[teachers/search] {error_msg}\n{traceback_str}")
+        return JSONResponse({
+            "data": {
+                "message": f"查询失败: {str(e)}",
+                "code": 500
+            }
+        }, status_code=500)
+    finally:
+        if cursor:
+            cursor.close()
+            print("[teachers/search] 游标已关闭")
+        if connection and connection.is_connected():
+            connection.close()
+            print("[teachers/search] 数据库连接已关闭")
+            app_logger.info(f"[teachers/search] Database connection closed after search teachers attempt for schoolid={schoolid}.")
 
 @app.post("/groups/join")
 async def join_group(request: Request):
@@ -8324,20 +8799,21 @@ def get_friends(id_card: str = Query(..., description="教师身份证号")):
                 app_logger.info(f"📌 Step4: ta_user_details for id_number={id_number} -> {user_rows}")
             user_details = user_rows[0] if user_rows else None
 
-            avatar_path = user_details.get("avatar")
-            if avatar_path:
-                full_path = os.path.join(IMAGE_DIR, avatar_path)
-                if os.path.exists(full_path):
-                    try:
-                        with open(full_path, "rb") as img:
-                            user_details["avatar_base64"] = base64.b64encode(img.read()).decode("utf-8")
-                    except Exception as e:
-                        app_logger.error(f"读取图片失败 {full_path}: {e}")
+            if user_details:
+                avatar_path = user_details.get("avatar")
+                if avatar_path:
+                    local_avatar_file = resolve_local_avatar_file_path(avatar_path)
+                    if local_avatar_file and os.path.exists(local_avatar_file):
+                        try:
+                            with open(local_avatar_file, "rb") as img:
+                                user_details["avatar_base64"] = base64.b64encode(img.read()).decode("utf-8")
+                        except Exception as e:
+                            app_logger.error(f"读取图片失败 {local_avatar_file}: {e}")
+                            user_details["avatar_base64"] = None
+                    else:
                         user_details["avatar_base64"] = None
                 else:
                     user_details["avatar_base64"] = None
-            else:
-                user_details["avatar_base64"] = None
 
             combined = {
                 "teacher_info": friend_teacher,
