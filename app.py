@@ -9233,6 +9233,87 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                             msg_data1.get("content", ""), msg_data1['type']
                                         ))
                                         connection.commit()
+                        
+                        # 创建临时房间: 群主创建临时房间，下发拉流地址给被邀请的人
+                        elif msg_data1['type'] == "6":
+                            print("创建临时房间")
+                            cursor = connection.cursor(dictionary=True)
+                            
+                            # 获取群主ID（发送者）
+                            owner_id = user_id
+                            
+                            # 获取被邀请人的唯一ID列表
+                            invited_users = msg_data1.get('invited_users', [])
+                            if not isinstance(invited_users, list):
+                                invited_users = [invited_users] if invited_users else []
+                            
+                            # 获取拉流地址
+                            stream_url = msg_data1.get('stream_url', '')
+                            
+                            if not stream_url:
+                                await websocket.send_text(json.dumps({
+                                    "type": "error",
+                                    "message": "拉流地址不能为空"
+                                }, ensure_ascii=False))
+                                continue
+                            
+                            if not invited_users:
+                                await websocket.send_text(json.dumps({
+                                    "type": "error",
+                                    "message": "被邀请人列表不能为空"
+                                }, ensure_ascii=False))
+                                continue
+                            
+                            # 获取群主信息：优先使用消息中的信息，如果没有则从数据库查询
+                            owner_name = msg_data1.get('owner_name', '')
+                            owner_icon = msg_data1.get('owner_icon', '')
+                            
+                            # 如果消息中没有用户信息，从数据库查询
+                            if not owner_name:
+                                cursor.execute(
+                                    "SELECT name, icon FROM ta_teacher WHERE teacher_unique_id = %s",
+                                    (owner_id,)
+                                )
+                                owner_info = cursor.fetchone()
+                                if owner_info:
+                                    owner_name = owner_info.get('name', '') or owner_name
+                                    owner_icon = owner_info.get('icon', '') or owner_icon
+                            
+                            # 创建临时房间ID
+                            room_id = str(uuid.uuid4())
+                            
+                            # 统计在线和离线的用户
+                            online_users = []
+                            offline_users = []
+                            
+                            # 遍历被邀请人，如果在线则发送拉流地址
+                            for invited_user_id in invited_users:
+                                target_conn = connections.get(invited_user_id)
+                                if target_conn:
+                                    print(f"用户 {invited_user_id} 在线，发送拉流地址")
+                                    online_users.append(invited_user_id)
+                                    await target_conn["ws"].send_text(json.dumps({
+                                        "type": "6",
+                                        "room_id": room_id,
+                                        "owner_id": owner_id,
+                                        "owner_name": owner_name,
+                                        "owner_icon": owner_icon,
+                                        "stream_url": stream_url,
+                                        "message": f"{owner_name or '群主'}邀请你加入临时房间"
+                                    }, ensure_ascii=False))
+                                else:
+                                    print(f"用户 {invited_user_id} 不在线")
+                                    offline_users.append(invited_user_id)
+                            
+                            # 给群主返回创建结果
+                            await websocket.send_text(json.dumps({
+                                "type": "6",
+                                "room_id": room_id,
+                                "status": "success",
+                                "message": f"临时房间创建成功，已邀请 {len(online_users)} 个在线用户，{len(offline_users)} 个离线用户",
+                                "online_users": online_users,
+                                "offline_users": offline_users
+                            }, ensure_ascii=False))
         
                     else:
                         print(" 格式错误")
