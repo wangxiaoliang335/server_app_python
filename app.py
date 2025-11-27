@@ -92,6 +92,7 @@ app = FastAPI(lifespan=lifespan)
 
 # 本机维护的客户端连接表
 connections: Dict[str, Dict] = {}  # {user_id: {"ws": WebSocket, "last_heartbeat": timestamp}}
+active_temp_rooms: Dict[str, Dict[str, Any]] = {}  # {group_id: {...room info...}}
 
 if not os.path.exists('logs'):
     os.makedirs('logs')
@@ -1455,12 +1456,15 @@ def save_seat_arrangement(
             )
             cursor.execute(update_header_sql, (arrangement_id,))
 
+        # 始终删除旧座位
+        delete_old_sql = "DELETE FROM seat_arrangement_item WHERE arrangement_id = %s"
+        cursor.execute(delete_old_sql, (arrangement_id,))
+        deleted_count = cursor.rowcount
+        app_logger.info(f"[seat_arrangement] 删除 class_id={class_id} 的旧座位数据，arrangement_id={arrangement_id}，删除行数={deleted_count}")
+        print(f"[seat_arrangement] 删除 class_id={class_id} 的旧座位数据，arrangement_id={arrangement_id}，删除行数={deleted_count}")
+
         upsert_count = 0
         if seats:
-            # 先删除该班级的所有旧座位数据
-            delete_old_sql = "DELETE FROM seat_arrangement_item WHERE arrangement_id = %s"
-            cursor.execute(delete_old_sql, (arrangement_id,))
-            
             # 批量插入新座位数据
             insert_seat_sql = (
                 "INSERT INTO seat_arrangement_item (arrangement_id, `row`, `col`, student_name, name, student_id) "
@@ -1468,17 +1472,29 @@ def save_seat_arrangement(
             )
             values = []
             for seat in seats:
+                seat_student_id = str(seat.get('student_id', '') or '')
+                seat_name = str(seat.get('name', '') or '')
+                seat_full_name = seat.get('student_name')
+                if not seat_full_name:
+                    if seat_name and seat_student_id:
+                        seat_full_name = f"{seat_name}{seat_student_id}"
+                    else:
+                        seat_full_name = seat_name or seat_student_id
+                seat_full_name = str(seat_full_name or '')
+
                 values.append((
                     arrangement_id,
                     int(seat.get('row', 0)),
                     int(seat.get('col', 0)),
-                    str(seat.get('student_name', '')),
-                    str(seat.get('name', '')),
-                    str(seat.get('student_id', '')),
+                    seat_full_name,
+                    seat_name,
+                    seat_student_id,
                 ))
             if values:
                 cursor.executemany(insert_seat_sql, values)
                 upsert_count = len(values)
+                app_logger.info(f"[seat_arrangement] 插入 class_id={class_id} 的新座位数据，arrangement_id={arrangement_id}，插入行数={upsert_count}")
+                print(f"[seat_arrangement] 插入 class_id={class_id} 的新座位数据，arrangement_id={arrangement_id}，插入行数={upsert_count}")
 
         connection.commit()
         return { 'success': True, 'arrangement_id': arrangement_id, 'upserted_seats': upsert_count, 'message': '保存成功' }
@@ -1546,6 +1562,27 @@ async def api_save_course_schedule(request: Request):
         return safe_json_response({'message': result.get('message', '保存失败'), 'code': 500}, status_code=500)
 
 # ===== 座位安排 API =====
+async def _handle_save_seat_arrangement_payload(data: Dict[str, Any]):
+    class_id = data.get('class_id')
+    seats = data.get('seats', [])
+
+    if not class_id:
+        return safe_json_response({'message': '缺少必要参数 class_id', 'code': 400}, status_code=400)
+
+    if not isinstance(seats, list):
+        return safe_json_response({'message': 'seats 必须是数组', 'code': 400}, status_code=400)
+
+    result = save_seat_arrangement(
+        class_id=class_id,
+        seats=seats if isinstance(seats, list) else []
+    )
+
+    if result.get('success'):
+        return safe_json_response({'message': '保存成功', 'code': 200, 'data': result})
+    else:
+        return safe_json_response({'message': result.get('message', '保存失败'), 'code': 500}, status_code=500)
+
+
 @app.post("/seat-arrangement/save")
 async def api_save_seat_arrangement(request: Request):
     """
@@ -1570,24 +1607,20 @@ async def api_save_seat_arrangement(request: Request):
     except Exception:
         return safe_json_response({'message': '无效的 JSON 请求体', 'code': 400}, status_code=400)
 
-    class_id = data.get('class_id')
-    seats = data.get('seats', [])
+    return await _handle_save_seat_arrangement_payload(data)
 
-    if not class_id:
-        return safe_json_response({'message': '缺少必要参数 class_id', 'code': 400}, status_code=400)
 
-    if not isinstance(seats, list):
-        return safe_json_response({'message': 'seats 必须是数组', 'code': 400}, status_code=400)
+@app.post("/seat-arrange")
+async def api_save_seat_arrangement_alias(request: Request):
+    """
+    兼容旧客户端的保存座位接口，与 /seat-arrangement/save 功能相同。
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return safe_json_response({'message': '无效的 JSON 请求体', 'code': 400}, status_code=400)
 
-    result = save_seat_arrangement(
-        class_id=class_id,
-        seats=seats if isinstance(seats, list) else []
-    )
-
-    if result.get('success'):
-        return safe_json_response({'message': '保存成功', 'code': 200, 'data': result})
-    else:
-        return safe_json_response({'message': result.get('message', '保存失败'), 'code': 500}, status_code=500)
+    return await _handle_save_seat_arrangement_payload(data)
 
 @app.get("/seat-arrangement")
 async def api_get_seat_arrangement(
@@ -8968,13 +9001,15 @@ async def safe_close(ws: WebSocket, code: int = 1000, reason: str = ""):
 
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    print(f"[websocket] 即将接受连接 user_id={user_id}, 当前在线={len(connections)}")
     await websocket.accept()
     connections[user_id] = {"ws": websocket, "last_heartbeat": time.time()}
-    print(f"用户 {user_id} 已连接")
+    print(f"用户 {user_id} 已连接，当前在线={len(connections)}")
 
     connection = get_db_connection()
     if connection is None or not connection.is_connected():
         app_logger.error("Database connection error in /friends API.")
+        print(f"[websocket][{user_id}] 数据库连接失败，立即关闭")
         return JSONResponse({
             'data': {
                 'message': '数据库连接失败',
@@ -8985,6 +9020,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     cursor = None
     try:
         # 查询条件改为：receiver_id = user_id 或 sender_id = user_id，并且 is_read = 0
+        print(" xxx SELECT ta_notification")
         update_query = """
             SELECT *
             FROM ta_notification
@@ -9001,12 +9037,131 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 "data": unread_notifications
             }, default=convert_datetime, ensure_ascii=False))
 
+        async def handle_temp_room_creation(msg_data1: Dict[str, Any]):
+            print(f"[temp_room] 创建请求 payload={msg_data1}")
+            local_cursor = connection.cursor(dictionary=True)
+
+            owner_id = user_id
+            invited_users = msg_data1.get('invited_users', []) or []
+            if not isinstance(invited_users, list):
+                invited_users = [invited_users]
+
+            stream_url = msg_data1.get('stream_url', '')
+            if not stream_url:
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "message": "拉流地址不能为空"
+                }, ensure_ascii=False))
+                return
+
+            group_id = msg_data1.get('group_id')
+            if not group_id:
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "message": "班级群唯一编号 group_id 不能为空"
+                }, ensure_ascii=False))
+                return
+
+            owner_name = msg_data1.get('owner_name', '') or ''
+            owner_icon = msg_data1.get('owner_icon', '') or ''
+
+            if not owner_name or not owner_icon:
+                local_cursor.execute(
+                    "SELECT name, icon FROM ta_teacher WHERE teacher_unique_id = %s",
+                    (owner_id,)
+                )
+                owner_info = local_cursor.fetchone()
+                if owner_info:
+                    if not owner_name:
+                        owner_name = owner_info.get('name', '') or owner_name
+                    if not owner_icon:
+                        owner_icon = owner_info.get('icon', '') or owner_icon
+
+            room_id = str(uuid.uuid4())
+            online_users: List[str] = []
+            offline_users: List[str] = []
+
+            for invited_user_id in invited_users:
+                target_conn = connections.get(invited_user_id)
+                if target_conn:
+                    print(f"用户 {invited_user_id} 在线，发送拉流地址")
+                    online_users.append(invited_user_id)
+                    await target_conn["ws"].send_text(json.dumps({
+                        "type": "6",
+                        "room_id": room_id,
+                        "owner_id": owner_id,
+                        "owner_name": owner_name,
+                        "owner_icon": owner_icon,
+                        "stream_url": stream_url,
+                        "group_id": group_id,
+                        "message": f"{owner_name or '群主'}邀请你加入临时房间"
+                    }, ensure_ascii=False))
+                else:
+                    print(f"用户 {invited_user_id} 不在线")
+                    offline_users.append(invited_user_id)
+
+            active_temp_rooms[group_id] = {
+                "room_id": room_id,
+                "owner_id": owner_id,
+                "owner_name": owner_name,
+                "owner_icon": owner_icon,
+                "stream_url": stream_url,
+                "group_id": group_id,
+                "timestamp": time.time()
+            }
+            print(f"[temp_room] 记录成功 group_id={group_id}, room_id={room_id}, invited={invited_users}, active_total={len(active_temp_rooms)}")
+
+            await websocket.send_text(json.dumps({
+                "type": "6",
+                "room_id": room_id,
+                "status": "success",
+                "message": f"临时房间创建成功，已邀请 {len(online_users)} 个在线用户，{len(offline_users)} 个离线用户",
+                "online_users": online_users,
+                "offline_users": offline_users
+            }, ensure_ascii=False))
+
+        async def handle_join_temp_room(request_group_id: str):
+            group_key = (request_group_id or "").strip()
+            if not group_key:
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "message": "group_id 不能为空"
+                }, ensure_ascii=False))
+                return
+
+            room_info = active_temp_rooms.get(group_key)
+            if not room_info:
+                await websocket.send_text(json.dumps({
+                    "type": "6",
+                    "status": "not_found",
+                    "group_id": group_key,
+                    "message": "未找到该班级的临时房间"
+                }, ensure_ascii=False))
+                print(f"[temp_room] group_id={group_key} 无匹配房间，active_total={len(active_temp_rooms)}")
+                return
+
+            await websocket.send_text(json.dumps({
+                "type": "6",
+                "room_id": room_info["room_id"],
+                "owner_id": room_info["owner_id"],
+                "owner_name": room_info["owner_name"],
+                "owner_icon": room_info["owner_icon"],
+                "stream_url": room_info["stream_url"],
+                "group_id": group_key,
+                "message": f"已加入临时房间（班级: {group_key}）"
+            }, ensure_ascii=False))
+            print(f"[temp_room] user_id={user_id} 加入 group_id={group_key}, room_id={room_info['room_id']}")
+
+        print(f"[websocket][{user_id}] 数据库连接成功，开始监听消息")
+
         while True:
             try:
+                print(f"[websocket][{user_id}] 等待消息... 当前在线={len(connections)}")
                 message = await websocket.receive()
-            except WebSocketDisconnect:
+                print(f"[websocket][{user_id}] receive() 返回: {message.get('type') if isinstance(message, dict) else type(message)}, 内容预览={str(message)[:200]}")
+            except WebSocketDisconnect as exc:
                 # 正常断开
-                print(f"用户 {user_id} 断开（WebSocketDisconnect）")
+                print(f"用户 {user_id} 断开（WebSocketDisconnect），详情: {exc}")
                 break
             except RuntimeError as e:
                 # 已收到 disconnect 后再次 receive 会到这里
@@ -9020,6 +9175,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             
             if "text" in message:
                 data = message["text"]
+                print(f"[websocket][{user_id}] recv text -> {data}")
                 if data == "ping":
                     if user_id in connections:
                         connections[user_id]["last_heartbeat"] = time.time()
@@ -9236,89 +9392,31 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         
                         # 创建临时房间: 群主创建临时房间，下发拉流地址给被邀请的人
                         elif msg_data1['type'] == "6":
-                            print("创建临时房间")
-                            cursor = connection.cursor(dictionary=True)
-                            
-                            # 获取群主ID（发送者）
-                            owner_id = user_id
-                            
-                            # 获取被邀请人的唯一ID列表
-                            invited_users = msg_data1.get('invited_users', [])
-                            if not isinstance(invited_users, list):
-                                invited_users = [invited_users] if invited_users else []
-                            
-                            # 获取拉流地址
-                            stream_url = msg_data1.get('stream_url', '')
-                            
-                            if not stream_url:
-                                await websocket.send_text(json.dumps({
-                                    "type": "error",
-                                    "message": "拉流地址不能为空"
-                                }, ensure_ascii=False))
-                                continue
-                            
-                            if not invited_users:
-                                await websocket.send_text(json.dumps({
-                                    "type": "error",
-                                    "message": "被邀请人列表不能为空"
-                                }, ensure_ascii=False))
-                                continue
-                            
-                            # 获取群主信息：优先使用消息中的信息，如果没有则从数据库查询
-                            owner_name = msg_data1.get('owner_name', '')
-                            owner_icon = msg_data1.get('owner_icon', '')
-                            
-                            # 如果消息中没有用户信息，从数据库查询
-                            if not owner_name:
-                                cursor.execute(
-                                    "SELECT name, icon FROM ta_teacher WHERE teacher_unique_id = %s",
-                                    (owner_id,)
-                                )
-                                owner_info = cursor.fetchone()
-                                if owner_info:
-                                    owner_name = owner_info.get('name', '') or owner_name
-                                    owner_icon = owner_info.get('icon', '') or owner_icon
-                            
-                            # 创建临时房间ID
-                            room_id = str(uuid.uuid4())
-                            
-                            # 统计在线和离线的用户
-                            online_users = []
-                            offline_users = []
-                            
-                            # 遍历被邀请人，如果在线则发送拉流地址
-                            for invited_user_id in invited_users:
-                                target_conn = connections.get(invited_user_id)
-                                if target_conn:
-                                    print(f"用户 {invited_user_id} 在线，发送拉流地址")
-                                    online_users.append(invited_user_id)
-                                    await target_conn["ws"].send_text(json.dumps({
-                                        "type": "6",
-                                        "room_id": room_id,
-                                        "owner_id": owner_id,
-                                        "owner_name": owner_name,
-                                        "owner_icon": owner_icon,
-                                        "stream_url": stream_url,
-                                        "message": f"{owner_name or '群主'}邀请你加入临时房间"
-                                    }, ensure_ascii=False))
-                                else:
-                                    print(f"用户 {invited_user_id} 不在线")
-                                    offline_users.append(invited_user_id)
-                            
-                            # 给群主返回创建结果
-                            await websocket.send_text(json.dumps({
-                                "type": "6",
-                                "room_id": room_id,
-                                "status": "success",
-                                "message": f"临时房间创建成功，已邀请 {len(online_users)} 个在线用户，{len(offline_users)} 个离线用户",
-                                "online_users": online_users,
-                                "offline_users": offline_users
-                            }, ensure_ascii=False))
+                            await handle_temp_room_creation(msg_data1)
+                            continue
         
                     else:
                         print(" 格式错误")
                         await websocket.send_text("格式错误: to:<target_id>:<消息>")
                 else:
+                    msg_data_raw = None
+                    try:
+                        msg_data_raw = json.loads(data)
+                    except Exception:
+                        msg_data_raw = None
+
+                    if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") == "6":
+                        await handle_temp_room_creation(msg_data_raw)
+                        continue
+                if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") in ("join_temp_room", "temp_room_join"):
+                    await handle_join_temp_room(msg_data_raw.get("group_id"))
+                    continue
+
+                stripped_data = (data or "").strip()
+                if stripped_data and stripped_data in active_temp_rooms:
+                    await handle_join_temp_room(stripped_data)
+                    continue
+
                     print(data)
                 # 广播
                 for uid, conn in connections.items():
@@ -9423,10 +9521,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 except Exception as e:
                     print(f"解析音频包失败: {e}")
 
-    except WebSocketDisconnect:
+    except WebSocketDisconnect as exc:
         if user_id in connections:
             connections.pop(user_id, None)
-            print(f"用户 {user_id} 离线")
+            print(f"用户 {user_id} 离线（外层捕获），当前在线={len(connections)}，详情: {exc}")
         if connection:
             connection.rollback()
     finally:
@@ -9434,8 +9532,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             cursor.close()
         if connection and connection.is_connected():
             connection.close()
-        await safe_close(websocket)
-        app_logger.info(f"WebSocket关闭，数据库连接已释放。")
+        closed = await safe_close(websocket)
+        print(f"[websocket][{user_id}] safe_close called, closed={closed}，当前在线={len(connections)}")
+        app_logger.info(f"WebSocket关闭，数据库连接已释放，user_id={user_id}。")
 
 # ====== 心跳检测任务 ======
 # @app.on_event("startup")
