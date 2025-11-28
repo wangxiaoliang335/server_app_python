@@ -9001,9 +9001,12 @@ async def safe_close(ws: WebSocket, code: int = 1000, reason: str = ""):
 
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
-    print(f"[websocket] 即将接受连接 user_id={user_id}, 当前在线={len(connections)}")
+    current_online = len(connections)
+    app_logger.info(f"[websocket] 即将接受连接 user_id={user_id}, 当前在线={current_online}")
+    print(f"[websocket] 即将接受连接 user_id={user_id}, 当前在线={current_online}")
     await websocket.accept()
     connections[user_id] = {"ws": websocket, "last_heartbeat": time.time()}
+    app_logger.info(f"[websocket] 用户 {user_id} 已连接，当前在线={len(connections)}")
     print(f"用户 {user_id} 已连接，当前在线={len(connections)}")
 
     connection = get_db_connection()
@@ -9016,6 +9019,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 'code': 500
             }
         }, status_code=500)
+    else:
+        app_logger.info(f"[websocket] 数据库连接成功，user_id={user_id}")
 
     cursor = None
     try:
@@ -9036,6 +9041,62 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 "type": "unread_notifications",
                 "data": unread_notifications
             }, default=convert_datetime, ensure_ascii=False))
+        
+        # 查询所有课前准备（包含已读与未读）
+        cursor.execute("""
+            SELECT 
+                cp.prepare_id, cp.group_id, cp.class_id, cp.subject, cp.content, cp.date, cp.time,
+                cp.sender_id, cp.sender_name, cp.created_at, g.group_name, cpr.is_read
+            FROM class_preparation cp
+            INNER JOIN class_preparation_receiver cpr ON cp.prepare_id = cpr.prepare_id
+            LEFT JOIN `groups` g ON cp.group_id = g.group_id
+            WHERE cpr.receiver_id = %s
+            ORDER BY cp.created_at DESC
+        """, (user_id,))
+        preparation_rows = cursor.fetchall()
+
+        if preparation_rows:
+            preparation_payload: Dict[str, Any] = {
+                "type": "prepare_class_history",
+                "count": len(preparation_rows),
+                "data": []
+            }
+            unread_updates: List[int] = []
+
+            for prep in preparation_rows:
+                message = {
+                    "class_id": prep.get("class_id"),
+                    "subject": prep.get("subject"),
+                    "content": prep.get("content"),
+                    "date": prep.get("date"),
+                    "time": prep.get("time"),
+                    "sender_id": prep.get("sender_id"),
+                    "sender_name": prep.get("sender_name"),
+                    "group_id": prep.get("group_id"),
+                    "group_name": prep.get("group_name") or "",
+                    "prepare_id": prep.get("prepare_id"),
+                    "is_read": int(prep.get("is_read", 0)),
+                    "created_at": convert_datetime(prep.get("created_at")) if prep.get("created_at") else None
+                }
+                preparation_payload["data"].append(message)
+
+                if not prep.get("is_read"):
+                    unread_updates.append(prep.get("prepare_id"))
+
+            payload_str = json.dumps(preparation_payload, ensure_ascii=False)
+            app_logger.info(f"[prepare_class] 用户 {user_id} 登录，推送课前准备数据: {payload_str}")
+            print(f"[prepare_class] 登录推送课前准备数据: {payload_str}")
+            await websocket.send_text(payload_str)
+
+            if unread_updates:
+                app_logger.info(f"[prepare_class] 标记 {len(unread_updates)} 条课前准备为已读，user_id={user_id}")
+                for prep_id in unread_updates:
+                    cursor.execute("""
+                        UPDATE class_preparation_receiver
+                        SET is_read = 1, read_at = NOW()
+                        WHERE prepare_id = %s AND receiver_id = %s
+                    """, (prep_id, user_id))
+                connection.commit()
 
         async def handle_temp_room_creation(msg_data1: Dict[str, Any]):
             print(f"[temp_room] 创建请求 payload={msg_data1}")
@@ -9393,6 +9454,164 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         # 创建临时房间: 群主创建临时房间，下发拉流地址给被邀请的人
                         elif msg_data1['type'] == "6":
                             await handle_temp_room_creation(msg_data1)
+                            continue
+                        # 课前准备消息: 发送给群组所有成员
+                        elif msg_data1['type'] == "prepare_class":
+                            app_logger.info(f"[prepare_class] 收到课前准备消息，user_id={user_id}, target_id={target_id}")
+                            print(f"[prepare_class] 收到课前准备消息，user_id={user_id}, target_id={target_id}")
+                            cursor = connection.cursor(dictionary=True)
+                            
+                            group_id = target_id  # 群组ID就是target_id
+                            class_id = msg_data1.get('class_id')
+                            subject = msg_data1.get('subject', '')
+                            content = msg_data1.get('content', '')
+                            date = msg_data1.get('date', '')
+                            class_time = msg_data1.get('time', '')  # 上课时间
+                            sender_id = msg_data1.get('sender_id') or user_id
+                            sender_name = msg_data1.get('sender_name', '')
+                            
+                            app_logger.info(f"[prepare_class] 参数解析 - group_id={group_id}, class_id={class_id}, subject={subject}, sender_id={sender_id}, sender_name={sender_name}, date={date}, time={class_time}, content_length={len(content)}")
+                            print(f"[prepare_class] group_id={group_id}, class_id={class_id}, subject={subject}, sender_id={sender_id}, time={class_time}")
+                            
+                            # 验证群组是否存在（使用 groups 表）
+                            cursor.execute("""
+                                SELECT group_id, group_name, owner_identifier 
+                                FROM `groups` 
+                                WHERE group_id = %s
+                            """, (group_id,))
+                            group_info = cursor.fetchone()
+                            
+                            if not group_info:
+                                error_msg = f"群组 {group_id} 不存在"
+                                app_logger.warning(f"[prepare_class] {error_msg}, user_id={user_id}")
+                                await websocket.send_text(json.dumps({
+                                    "type": "error",
+                                    "message": error_msg
+                                }, ensure_ascii=False))
+                                continue
+                            
+                            group_name = group_info.get('group_name', '')
+                            owner_identifier = group_info.get('owner_identifier', '')
+                            app_logger.info(f"[prepare_class] 群组验证成功 - group_id={group_id}, group_name={group_name}, owner_identifier={owner_identifier}")
+                            
+                            # 获取群组所有成员（使用 group_members 表）
+                            cursor.execute("""
+                                SELECT user_id 
+                                FROM `group_members`
+                                WHERE group_id = %s
+                            """, (group_id,))
+                            members = cursor.fetchall()
+                            total_members = len(members)
+                            app_logger.info(f"[prepare_class] 获取群组成员 - group_id={group_id}, 总成员数={total_members}")
+                            
+                            # 构建消息内容
+                            prepare_message = json.dumps({
+                                "type": "prepare_class",
+                                "class_id": class_id,
+                                "subject": subject,
+                                "content": content,
+                                "date": date,
+                                "time": class_time,
+                                "sender_id": sender_id,
+                                "sender_name": sender_name,
+                                "group_id": group_id,
+                                "group_name": group_name
+                            }, ensure_ascii=False)
+                            
+                            # 先为所有成员保存到数据库（不管是否在线）
+                            app_logger.info(f"[prepare_class] 开始保存课前准备数据到数据库，成员数={total_members}")
+                            prepare_id: Optional[int] = None
+
+                            # 判断是否存在相同 (group_id, class_id, subject, date, time) 的记录
+                            cursor.execute("""
+                                SELECT prepare_id FROM class_preparation
+                                WHERE group_id = %s AND class_id = %s AND subject = %s
+                                  AND date = %s AND IFNULL(time, '') = %s
+                                ORDER BY prepare_id DESC
+                                LIMIT 1
+                            """, (group_id, class_id, subject, date, class_time or ""))
+                            existing_prepare = cursor.fetchone()
+
+                            if existing_prepare:
+                                prepare_id = existing_prepare['prepare_id']
+                                cursor.execute("""
+                                    UPDATE class_preparation
+                                    SET content = %s,
+                                        sender_id = %s,
+                                        sender_name = %s,
+                                        updated_at = NOW()
+                                    WHERE prepare_id = %s
+                                """, (content, sender_id, sender_name, prepare_id))
+                                cursor.execute(
+                                    "DELETE FROM class_preparation_receiver WHERE prepare_id = %s",
+                                    (prepare_id,)
+                                )
+                                app_logger.info(f"[prepare_class] 更新已有课前准备记录 prepare_id={prepare_id}")
+                            else:
+                                cursor.execute("""
+                                    INSERT INTO class_preparation (
+                                        group_id, class_id, subject, content, date, time, sender_id, sender_name, created_at
+                                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                                """, (group_id, class_id, subject, content, date, class_time, sender_id, sender_name))
+                                prepare_id = cursor.lastrowid
+                                app_logger.info(f"[prepare_class] 插入主记录成功，prepare_id={prepare_id}")
+                            
+                            # 为每个成员插入接收记录（is_read=0 表示未读）
+                            for member in members:
+                                member_id = member['user_id']
+                                cursor.execute("""
+                                    INSERT INTO class_preparation_receiver (
+                                        prepare_id, receiver_id, is_read, created_at
+                                    ) VALUES (%s, %s, 0, NOW())
+                                """, (prepare_id, member_id))
+                            
+                            connection.commit()
+                            app_logger.info(f"[prepare_class] 已为所有 {total_members} 个成员保存课前准备数据")
+                            
+                            online_count = 0
+                            offline_count = 0
+                            online_members = []
+                            offline_members = []
+                            
+                            # 然后推送在线的成员
+                            for member in members:
+                                member_id = member['user_id']
+                                target_conn = connections.get(member_id)
+                                
+                                if target_conn:
+                                    app_logger.debug(f"[prepare_class] 用户 {member_id} 在线，推送消息并标记为已读")
+                                    print(f"[prepare_class] 用户 {member_id} 在线，推送消息")
+                                    online_count += 1
+                                    online_members.append(member_id)
+                                    await target_conn["ws"].send_text(prepare_message)
+                                    # 标记为已读（因为已经实时推送了）
+                                    cursor.execute("""
+                                        UPDATE class_preparation_receiver 
+                                        SET is_read = 1, read_at = NOW() 
+                                        WHERE prepare_id = %s AND receiver_id = %s
+                                    """, (prepare_id, member_id))
+                                else:
+                                    app_logger.debug(f"[prepare_class] 用户 {member_id} 不在线，已保存到数据库，等待登录时获取")
+                                    print(f"[prepare_class] 用户 {member_id} 不在线，已保存到数据库")
+                                    offline_count += 1
+                                    offline_members.append(member_id)
+                            
+                            # 提交已读标记的更新
+                            connection.commit()
+                            app_logger.info(f"[prepare_class] 已推送并标记 {online_count} 个在线成员为已读")
+                            
+                            # 给发送者返回结果
+                            result_message = f"课前准备消息已发送，在线: {online_count} 人，离线: {offline_count} 人"
+                            app_logger.info(f"[prepare_class] 完成 - group_id={group_id}, class_id={class_id}, subject={subject}, time={class_time}, 在线={online_count}, 离线={offline_count}, 在线成员={online_members}, 离线成员={offline_members}")
+                            print(f"[prepare_class] 完成，在线={online_count}, 离线={offline_count}, time={class_time}")
+                            
+                            await websocket.send_text(json.dumps({
+                                "type": "prepare_class",
+                                "status": "success",
+                                "message": result_message,
+                                "online_count": online_count,
+                                "offline_count": offline_count
+                            }, ensure_ascii=False))
                             continue
         
                     else:
