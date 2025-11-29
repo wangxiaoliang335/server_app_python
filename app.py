@@ -4980,6 +4980,70 @@ def create_access_token(data: dict, expires_delta: int = 30):
 @app.post("/login")
 async def login(request: Request):
     data = await request.json()
+    login_type = data.get('login_type')
+    
+    print(f"[login] 收到登录请求，login_type={login_type}, data={data}")
+    app_logger.info(f"[login] 收到登录请求，login_type={login_type}")
+    
+    # 班级端登录
+    if login_type == "class":
+        class_number = data.get('class_number')
+        
+        if not class_number:
+            app_logger.warning("[login] 班级端登录失败：缺少班级唯一编号")
+            return JSONResponse({'data': {'message': '班级唯一编号不能为空', 'code': 400}}, status_code=400)
+        
+        connection = get_db_connection()
+        if connection is None:
+            app_logger.error("[login] 数据库连接失败")
+            return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500}}, status_code=500)
+        
+        cursor = None
+        try:
+            cursor = connection.cursor(dictionary=True)
+            # 根据班级唯一编号查询班级信息（使用 ta_classes 表）
+            cursor.execute("""
+                SELECT class_code, class_name, school_stage, grade, schoolid, remark, created_at
+                FROM ta_classes
+                WHERE class_code = %s
+            """, (class_number,))
+            class_info = cursor.fetchone()
+            
+            if not class_info:
+                app_logger.warning(f"[login] 班级端登录失败：班级 {class_number} 不存在")
+                return JSONResponse({'data': {'message': '班级不存在', 'code': 404}}, status_code=404)
+            
+            # 使用班级编号作为 user_id（班级端登录）
+            user_id = class_number
+            
+            app_logger.info(f"[login] 班级端登录成功 - class_number={class_number}, class_name={class_info.get('class_name')}, user_id={user_id}")
+            
+            # 生成 token（使用班级编号作为标识）
+            token_data = {"sub": class_number, "type": "class"}
+            access_token = create_access_token(token_data, expires_delta=60)  # 60分钟有效期
+            
+            return safe_json_response({
+                'data': {
+                    'message': '登录成功',
+                    'code': 200,
+                    'access_token': access_token,
+                    'token_type': 'bearer',
+                    'user_id': user_id,
+                    'class_code': class_info.get('class_code'),
+                    'class_name': class_info.get('class_name'),
+                    'school_stage': class_info.get('school_stage'),
+                    'grade': class_info.get('grade'),
+                    'schoolid': class_info.get('schoolid')
+                }
+            }, status_code=200)
+        except Exception as e:
+            app_logger.error(f"[login] 班级端登录异常: {e}")
+            return JSONResponse({'data': {'message': '登录失败', 'code': 500}}, status_code=500)
+        finally:
+            if cursor: cursor.close()
+            if connection and connection.is_connected(): connection.close()
+    
+    # 普通用户登录（手机号+密码/验证码）
     phone = data.get('phone')
     password = data.get('password')
     verification_code = data.get('verification_code')
@@ -5032,6 +5096,92 @@ async def login(request: Request):
     except Exception as e:
         app_logger.error(f"Database error during login: {e}")
         return JSONResponse({'data': {'message': '登录失败', 'code': 500}}, status_code=500)
+    finally:
+        if cursor: cursor.close()
+        if connection and connection.is_connected(): connection.close()
+
+
+@app.get("/api/class/info")
+async def get_class_info(request: Request):
+    """获取班级信息接口（包含学校信息）"""
+    class_code = request.query_params.get('class_code')
+    
+    # 提取 Authorization header（可选，用于日志记录）
+    auth_header = request.headers.get('Authorization', '')
+    token = auth_header.replace('Bearer ', '') if auth_header.startswith('Bearer ') else ''
+    
+    app_logger.info(f"[class/info] 收到请求 - class_code={class_code}, has_token={bool(token)}")
+    
+    if not class_code:
+        app_logger.warning("[class/info] 缺少 class_code 参数")
+        return JSONResponse({'data': {'message': '班级编号不能为空', 'code': 400}}, status_code=400)
+    
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("[class/info] 数据库连接失败")
+        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500}}, status_code=500)
+    
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+        
+        # 1. 从 ta_classes 表查询班级信息
+        cursor.execute("""
+            SELECT class_code, class_name, school_stage, grade, schoolid, remark, created_at
+            FROM ta_classes
+            WHERE class_code = %s
+        """, (class_code,))
+        class_info = cursor.fetchone()
+        
+        if not class_info:
+            app_logger.warning(f"[class/info] 班级 {class_code} 不存在")
+            return JSONResponse({'data': {'message': '班级不存在', 'code': 404}}, status_code=404)
+        
+        schoolid = class_info.get('schoolid')
+        
+        # 2. 根据 schoolid 从 ta_school 表查询学校信息
+        school_info = None
+        if schoolid:
+            cursor.execute("""
+                SELECT id, name, address
+                FROM ta_school
+                WHERE id = %s
+            """, (schoolid,))
+            school_info = cursor.fetchone()
+        
+        # 3. 合并返回数据
+        result = {
+            'class_code': class_info.get('class_code'),
+            'class_name': class_info.get('class_name'),
+            'school_stage': class_info.get('school_stage'),
+            'grade': class_info.get('grade'),
+            'schoolid': schoolid,
+            'remark': class_info.get('remark')
+        }
+        
+        # 添加学校信息（如果存在）
+        if school_info:
+            result['school_name'] = school_info.get('name')
+            result['address'] = school_info.get('address')
+        else:
+            result['school_name'] = None
+            result['address'] = None
+            if schoolid:
+                app_logger.warning(f"[class/info] 学校 {schoolid} 不存在")
+        
+        app_logger.info(f"[class/info] 查询成功 - class_code={class_code}, schoolid={schoolid}, school_name={result.get('school_name')}")
+        
+        return safe_json_response({
+            'data': {
+                'message': '获取班级信息成功',
+                'code': 200,
+                **result
+            }
+        }, status_code=200)
+        
+    except Exception as e:
+        app_logger.error(f"[class/info] 查询异常: {e}")
+        return JSONResponse({'data': {'message': '获取班级信息失败', 'code': 500}}, status_code=500)
     finally:
         if cursor: cursor.close()
         if connection and connection.is_connected(): connection.close()
@@ -9045,7 +9195,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
         # 查询所有课前准备（包含已读与未读）
         cursor.execute("""
             SELECT 
-                cp.prepare_id, cp.group_id, cp.class_id, cp.subject, cp.content, cp.date, cp.time,
+                cp.prepare_id, cp.group_id, cp.class_id, cp.school_id, cp.subject, cp.content, cp.date, cp.time,
                 cp.sender_id, cp.sender_name, cp.created_at, g.group_name, cpr.is_read
             FROM class_preparation cp
             INNER JOIN class_preparation_receiver cpr ON cp.prepare_id = cpr.prepare_id
@@ -9066,6 +9216,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             for prep in preparation_rows:
                 message = {
                     "class_id": prep.get("class_id"),
+                        "school_id": prep.get("school_id"),
                     "subject": prep.get("subject"),
                     "content": prep.get("content"),
                     "date": prep.get("date"),
@@ -9463,6 +9614,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             
                             group_id = target_id  # 群组ID就是target_id
                             class_id = msg_data1.get('class_id')
+                            school_id = msg_data1.get('school_id')
                             subject = msg_data1.get('subject', '')
                             content = msg_data1.get('content', '')
                             date = msg_data1.get('date', '')
@@ -9470,8 +9622,12 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             sender_id = msg_data1.get('sender_id') or user_id
                             sender_name = msg_data1.get('sender_name', '')
                             
-                            app_logger.info(f"[prepare_class] 参数解析 - group_id={group_id}, class_id={class_id}, subject={subject}, sender_id={sender_id}, sender_name={sender_name}, date={date}, time={class_time}, content_length={len(content)}")
-                            print(f"[prepare_class] group_id={group_id}, class_id={class_id}, subject={subject}, sender_id={sender_id}, time={class_time}")
+                            app_logger.info(
+                                f"[prepare_class] 参数解析 - group_id={group_id}, class_id={class_id}, school_id={school_id}, "
+                                f"subject={subject}, sender_id={sender_id}, sender_name={sender_name}, "
+                                f"date={date}, time={class_time}, content_length={len(content)}"
+                            )
+                            print(f"[prepare_class] group_id={group_id}, class_id={class_id}, school_id={school_id}, subject={subject}, sender_id={sender_id}, time={class_time}")
                             
                             # 验证群组是否存在（使用 groups 表）
                             cursor.execute("""
@@ -9508,6 +9664,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             prepare_message = json.dumps({
                                 "type": "prepare_class",
                                 "class_id": class_id,
+                                "school_id": school_id,
                                 "subject": subject,
                                 "content": content,
                                 "date": date,
@@ -9522,14 +9679,18 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             app_logger.info(f"[prepare_class] 开始保存课前准备数据到数据库，成员数={total_members}")
                             prepare_id: Optional[int] = None
 
-                            # 判断是否存在相同 (group_id, class_id, subject, date, time) 的记录
+                            # 判断是否存在相同 (group_id, class_id, school_id, subject, date, time) 的记录
                             cursor.execute("""
                                 SELECT prepare_id FROM class_preparation
-                                WHERE group_id = %s AND class_id = %s AND subject = %s
-                                  AND date = %s AND IFNULL(time, '') = %s
+                                WHERE group_id = %s
+                                  AND class_id = %s
+                                  AND IFNULL(school_id, '') = %s
+                                  AND subject = %s
+                                  AND date = %s
+                                  AND IFNULL(time, '') = %s
                                 ORDER BY prepare_id DESC
                                 LIMIT 1
-                            """, (group_id, class_id, subject, date, class_time or ""))
+                            """, (group_id, class_id, school_id or "", subject, date, class_time or ""))
                             existing_prepare = cursor.fetchone()
 
                             if existing_prepare:
@@ -9537,11 +9698,12 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                 cursor.execute("""
                                     UPDATE class_preparation
                                     SET content = %s,
+                                        school_id = %s,
                                         sender_id = %s,
                                         sender_name = %s,
                                         updated_at = NOW()
                                     WHERE prepare_id = %s
-                                """, (content, sender_id, sender_name, prepare_id))
+                                """, (content, school_id, sender_id, sender_name, prepare_id))
                                 cursor.execute(
                                     "DELETE FROM class_preparation_receiver WHERE prepare_id = %s",
                                     (prepare_id,)
@@ -9550,9 +9712,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             else:
                                 cursor.execute("""
                                     INSERT INTO class_preparation (
-                                        group_id, class_id, subject, content, date, time, sender_id, sender_name, created_at
-                                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                                """, (group_id, class_id, subject, content, date, class_time, sender_id, sender_name))
+                                        group_id, class_id, school_id, subject, content, date, time, sender_id, sender_name, created_at
+                                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                                """, (group_id, class_id, school_id, subject, content, date, class_time, sender_id, sender_name))
                                 prepare_id = cursor.lastrowid
                                 app_logger.info(f"[prepare_class] 插入主记录成功，prepare_id={prepare_id}")
                             
