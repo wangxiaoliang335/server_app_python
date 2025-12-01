@@ -22,6 +22,12 @@ import zlib
 import urllib.error
 import urllib.parse
 import urllib.request
+try:
+    import httpx
+    HAS_HTTPX = True
+except ImportError:
+    HAS_HTTPX = False
+    print("[警告] httpx 未安装，SRS 信令转发功能将使用 urllib（同步方式）")
 from fastapi import FastAPI, Query
 from typing import Any, List, Dict, Optional, Union
 #import session
@@ -62,6 +68,24 @@ print(f"[启动检查] TENCENT_API_IDENTIFIER = {os.getenv('TENCENT_API_IDENTIFI
 print(f"[启动检查] TENCENT_API_SDK_APP_ID = {os.getenv('TENCENT_API_SDK_APP_ID')}")
 
 IMAGE_DIR = "/var/www/images"  # 存头像的目录
+
+# SRS 服务器配置（支持 WHIP/WHEP）
+SRS_SERVER = os.getenv('SRS_SERVER', '47.100.126.194')  # SRS 服务器地址
+SRS_PORT = os.getenv('SRS_PORT', '1985')  # SRS WebRTC API 端口（传统 API 使用 1985）
+SRS_HTTPS_PORT = os.getenv('SRS_HTTPS_PORT', '443')  # HTTPS 端口（nginx 反向代理）
+SRS_APP = os.getenv('SRS_APP', 'live')  # SRS 应用名称，默认 'live'
+SRS_USE_HTTPS = os.getenv('SRS_USE_HTTPS', 'true').lower() == 'true'  # 是否使用 HTTPS（默认启用）
+# SRS_BASE_URL 用于 WHIP/WHEP（通过 nginx HTTPS 代理）
+SRS_BASE_URL = f"{'https' if SRS_USE_HTTPS else 'http'}://{SRS_SERVER}"
+if SRS_USE_HTTPS:
+    # HTTPS 模式：通过 nginx 443 端口访问
+    SRS_BASE_URL = f"https://{SRS_SERVER}"
+    SRS_WEBRTC_API_URL = f"https://{SRS_SERVER}:{SRS_HTTPS_PORT}"
+else:
+    # HTTP 模式：直接访问 SRS 1985 端口
+    SRS_BASE_URL = f"http://{SRS_SERVER}"
+    SRS_WEBRTC_API_URL = f"http://{SRS_SERVER}:{SRS_PORT}"
+print(f"[启动检查] SRS 服务器配置: 协议={'HTTPS' if SRS_USE_HTTPS else 'HTTP'}, BASE_URL={SRS_BASE_URL}, WebRTC API: {SRS_WEBRTC_API_URL}, APP={SRS_APP}")
 
 # ===== 停止事件，用于控制心跳协程退出 =====
 stop_event = asyncio.Event()
@@ -9251,20 +9275,13 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
         async def handle_temp_room_creation(msg_data1: Dict[str, Any]):
             print(f"[temp_room] 创建请求 payload={msg_data1}")
+            app_logger.info(f"[temp_room] 创建房间请求 - user_id={user_id}, payload={msg_data1}")
             local_cursor = connection.cursor(dictionary=True)
 
             owner_id = user_id
             invited_users = msg_data1.get('invited_users', []) or []
             if not isinstance(invited_users, list):
                 invited_users = [invited_users]
-
-            stream_url = msg_data1.get('stream_url', '')
-            if not stream_url:
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "message": "拉流地址不能为空"
-                }, ensure_ascii=False))
-                return
 
             group_id = msg_data1.get('group_id')
             if not group_id:
@@ -9289,10 +9306,26 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     if not owner_icon:
                         owner_icon = owner_info.get('icon', '') or owner_icon
 
+            # 生成唯一的房间ID和流名称
+            # 注意：客户端当前使用传统 SRS WebRTC API（/rtc/v1/publish/ 和 /rtc/v1/play/）
+            # 这些字段（room_id, stream_name）是客户端构建传统 API URL 所需的
             room_id = str(uuid.uuid4())
+            stream_name = f"room_{group_id}_{int(time.time())}"
+            
+            # 自动生成 WHIP（推流）和 WHEP（拉流）URL
+            # 注意：客户端当前不使用这些 URL，但保留用于向后兼容
+            # WHIP: WebRTC-HTTP Ingestion Protocol (推流)
+            whip_url = f"{SRS_BASE_URL}/rtc/v1/whip/?app={SRS_APP}&stream={stream_name}"
+            # WHEP: WebRTC-HTTP Egress Protocol (拉流)
+            whep_url = f"{SRS_BASE_URL}/rtc/v1/whep/?app={SRS_APP}&stream={stream_name}"
+            
+            app_logger.info(f"[temp_room] 生成流地址 - room_id={room_id}, stream_name={stream_name}, whip_url={whip_url}, whep_url={whep_url}")
+            print(f"[temp_room] 生成流地址 - room_id={room_id}, stream_name={stream_name}")
+
             online_users: List[str] = []
             offline_users: List[str] = []
 
+            # 通知被邀请的用户
             for invited_user_id in invited_users:
                 target_conn = connections.get(invited_user_id)
                 if target_conn:
@@ -9304,7 +9337,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         "owner_id": owner_id,
                         "owner_name": owner_name,
                         "owner_icon": owner_icon,
-                        "stream_url": stream_url,
+                        "whip_url": whip_url,  # 推流地址（WHIP）
+                        "whep_url": whep_url,  # 拉流地址（WHEP）
+                        "stream_name": stream_name,  # 流名称
                         "group_id": group_id,
                         "message": f"{owner_name or '群主'}邀请你加入临时房间"
                     }, ensure_ascii=False))
@@ -9312,20 +9347,29 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     print(f"用户 {invited_user_id} 不在线")
                     offline_users.append(invited_user_id)
 
+            # 初始化房间成员列表（包含创建者）
             active_temp_rooms[group_id] = {
                 "room_id": room_id,
                 "owner_id": owner_id,
                 "owner_name": owner_name,
                 "owner_icon": owner_icon,
-                "stream_url": stream_url,
+                "whip_url": whip_url,  # 推流地址（WHIP）
+                "whep_url": whep_url,  # 拉流地址（WHEP）
+                "stream_name": stream_name,  # 流名称
                 "group_id": group_id,
-                "timestamp": time.time()
+                "timestamp": time.time(),
+                "members": [owner_id]  # 初始化成员列表，包含创建者
             }
-            print(f"[temp_room] 记录成功 group_id={group_id}, room_id={room_id}, invited={invited_users}, active_total={len(active_temp_rooms)}")
+            print(f"[temp_room] 记录成功 group_id={group_id}, room_id={room_id}, stream_name={stream_name}, invited={invited_users}, active_total={len(active_temp_rooms)}")
+            app_logger.info(f"[temp_room] 房间创建成功 - group_id={group_id}, room_id={room_id}, stream_name={stream_name}, members={[owner_id]}")
 
+            # 返回给创建者（包含推流和拉流地址）
             await websocket.send_text(json.dumps({
                 "type": "6",
                 "room_id": room_id,
+                "whip_url": whip_url,  # 推流地址（WHIP）- 创建者使用
+                "whep_url": whep_url,  # 拉流地址（WHEP）- 创建者也可以拉流
+                "stream_name": stream_name,  # 流名称
                 "status": "success",
                 "message": f"临时房间创建成功，已邀请 {len(online_users)} 个在线用户，{len(offline_users)} 个离线用户",
                 "online_users": online_users,
@@ -9350,19 +9394,260 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     "message": "未找到该班级的临时房间"
                 }, ensure_ascii=False))
                 print(f"[temp_room] group_id={group_key} 无匹配房间，active_total={len(active_temp_rooms)}")
+                app_logger.warning(f"[temp_room] 用户 {user_id} 尝试加入不存在的房间 group_id={group_key}")
                 return
 
+            # 将用户添加到房间成员列表（如果尚未加入）
+            if "members" not in room_info:
+                room_info["members"] = []
+            if user_id not in room_info["members"]:
+                room_info["members"].append(user_id)
+                print(f"[temp_room] 用户 {user_id} 加入成员列表，当前成员数={len(room_info['members'])}")
+                app_logger.info(f"[temp_room] 用户 {user_id} 加入房间 - group_id={group_key}, room_id={room_info['room_id']}, 当前成员={room_info['members']}")
+            
+            # 返回房间信息，包含 WHEP 拉流地址
             await websocket.send_text(json.dumps({
                 "type": "6",
                 "room_id": room_info["room_id"],
                 "owner_id": room_info["owner_id"],
                 "owner_name": room_info["owner_name"],
                 "owner_icon": room_info["owner_icon"],
-                "stream_url": room_info["stream_url"],
+                "whip_url": room_info.get("whip_url", ""),  # 推流地址（WHIP）
+                "whep_url": room_info.get("whep_url", ""),  # 拉流地址（WHEP）
+                "stream_name": room_info.get("stream_name", ""),  # 流名称
                 "group_id": group_key,
+                "members": room_info.get("members", []),
                 "message": f"已加入临时房间（班级: {group_key}）"
             }, ensure_ascii=False))
-            print(f"[temp_room] user_id={user_id} 加入 group_id={group_key}, room_id={room_info['room_id']}")
+            print(f"[temp_room] user_id={user_id} 加入 group_id={group_key}, room_id={room_info['room_id']}, stream_name={room_info.get('stream_name', '')}, 当前成员={room_info.get('members', [])}")
+
+        async def handle_srs_webrtc_offer(msg_data: Dict[str, Any], action_type: str):
+            """
+            处理客户端通过服务器转发到 SRS 的 WebRTC offer
+            action_type: 'publish' (推流) 或 'play' (拉流)
+            """
+            try:
+                sdp = msg_data.get('sdp')
+                stream_name = msg_data.get('stream_name')
+                room_id = msg_data.get('room_id')
+                group_id = msg_data.get('group_id')
+                
+                if not sdp:
+                    await websocket.send_text(json.dumps({
+                        "type": "srs_error",
+                        "action": action_type,
+                        "message": "缺少 SDP offer"
+                    }, ensure_ascii=False))
+                    return
+                
+                # 确定流名称（优先使用 stream_name，否则使用 room_id）
+                if not stream_name:
+                    if room_id:
+                        # 尝试从房间信息中获取 stream_name
+                        if group_id:
+                            room_info = active_temp_rooms.get(group_id)
+                            if room_info:
+                                stream_name = room_info.get('stream_name')
+                        if not stream_name:
+                            stream_name = room_id  # 回退使用 room_id
+                    else:
+                        await websocket.send_text(json.dumps({
+                            "type": "srs_error",
+                            "action": action_type,
+                            "message": "缺少 stream_name 或 room_id"
+                        }, ensure_ascii=False))
+                        return
+                
+                # 构建 SRS API URL
+                api_path = "/rtc/v1/publish/" if action_type == "publish" else "/rtc/v1/play/"
+                api_url = f"{SRS_WEBRTC_API_URL}{api_path}"
+                # api_control_url 用于 SRS API 的 api 参数（控制URL）
+                # 如果使用 HTTPS，通过 nginx 443 端口；如果使用 HTTP，直接使用 1985 端口
+                if SRS_USE_HTTPS:
+                    api_control_url = f"https://{SRS_SERVER}:{SRS_HTTPS_PORT}/api/v1{api_path}"
+                else:
+                    api_control_url = f"http://{SRS_SERVER}:{SRS_PORT}/api/v1{api_path}"
+                stream_url = f"webrtc://{SRS_SERVER}/live/{stream_name}"
+                
+                # 记录详细的请求信息，包括使用的协议和URL
+                protocol = "HTTPS" if SRS_USE_HTTPS else "HTTP"
+                app_logger.info(f"[srs_webrtc] 转发 {action_type} offer - 协议={protocol}, API_URL={api_url}, user_id={user_id}, stream_name={stream_name}")
+                print(f"[srs_webrtc] 转发 {action_type} offer - 协议={protocol}, API_URL={api_url}, user_id={user_id}, stream_name={stream_name}")
+                
+                # 准备请求数据
+                request_data = {
+                    "api": api_control_url,
+                    "streamurl": stream_url,
+                    "sdp": sdp
+                }
+                
+                # 发送请求到 SRS（异步使用 httpx，否则使用 urllib）
+                if HAS_HTTPX:
+                    # 如果使用 HTTPS 自签名证书，需要禁用 SSL 验证
+                    verify_ssl = not SRS_USE_HTTPS or os.getenv('SRS_VERIFY_SSL', 'false').lower() == 'true'
+                    async with httpx.AsyncClient(timeout=30.0, verify=verify_ssl) as client:
+                        response = await client.post(
+                            api_url,
+                            json=request_data,
+                            headers={"Content-Type": "application/json"}
+                        )
+                        response.raise_for_status()
+                        result = response.json()
+                else:
+                    # 同步方式（在异步环境中使用 run_in_executor 避免阻塞）
+                    def sync_http_request():
+                        import urllib.request
+                        import urllib.error
+                        import ssl
+                        request_json = json.dumps(request_data).encode('utf-8')
+                        req = urllib.request.Request(
+                            api_url,
+                            data=request_json,
+                            headers={"Content-Type": "application/json"},
+                            method="POST"
+                        )
+                        # 如果使用 HTTPS 自签名证书，创建不验证 SSL 的上下文
+                        if SRS_USE_HTTPS and os.getenv('SRS_VERIFY_SSL', 'false').lower() != 'true':
+                            ssl_context = ssl.create_default_context()
+                            ssl_context.check_hostname = False
+                            ssl_context.verify_mode = ssl.CERT_NONE
+                            with urllib.request.urlopen(req, timeout=30, context=ssl_context) as response:
+                                return json.loads(response.read().decode('utf-8'))
+                        else:
+                            with urllib.request.urlopen(req, timeout=30) as response:
+                                return json.loads(response.read().decode('utf-8'))
+                    
+                    loop = asyncio.get_event_loop()
+                    result = await loop.run_in_executor(None, sync_http_request)
+                
+                # 检查 SRS 响应
+                if result.get('code') != 0:
+                    error_msg = f"SRS {action_type} 失败: code={result.get('code')}, message={result.get('message', '未知错误')}"
+                    app_logger.error(f"[srs_webrtc] {error_msg}")
+                    await websocket.send_text(json.dumps({
+                        "type": "srs_error",
+                        "action": action_type,
+                        "code": result.get('code'),
+                        "message": error_msg
+                    }, ensure_ascii=False))
+                    return
+                
+                # 返回 answer 给客户端
+                answer_sdp = result.get('sdp')
+                if not answer_sdp:
+                    error_msg = "SRS 响应中缺少 SDP answer"
+                    app_logger.error(f"[srs_webrtc] {error_msg}")
+                    await websocket.send_text(json.dumps({
+                        "type": "srs_error",
+                        "action": action_type,
+                        "message": error_msg
+                    }, ensure_ascii=False))
+                    return
+                
+                app_logger.info(f"[srs_webrtc] {action_type} 成功 - user_id={user_id}, stream_name={stream_name}")
+                print(f"[srs_webrtc] {action_type} 成功 - user_id={user_id}")
+                
+                await websocket.send_text(json.dumps({
+                    "type": "srs_answer",
+                    "action": action_type,
+                    "sdp": answer_sdp,
+                    "code": 0,
+                    "stream_name": stream_name,
+                    "stream_url": stream_url
+                }, ensure_ascii=False))
+                
+            except Exception as e:
+                error_msg = f"处理 SRS {action_type} offer 时出错: {str(e)}"
+                app_logger.error(f"[srs_webrtc] {error_msg}", exc_info=True)
+                print(f"[srs_webrtc] 错误: {error_msg}")
+                await websocket.send_text(json.dumps({
+                    "type": "srs_error",
+                    "action": action_type,
+                    "message": error_msg
+                }, ensure_ascii=False))
+
+        async def handle_webrtc_signal(msg_data: Dict[str, Any], signal_type: str):
+            """处理 WebRTC 信令消息（offer/answer/ice_candidate）"""
+            target_user_id = msg_data.get('target_user_id')  # 目标用户ID
+            room_id = msg_data.get('room_id')  # 房间ID（可选，用于验证）
+            group_id = msg_data.get('group_id')  # 班级群ID（可选，用于验证）
+            
+            app_logger.info(f"[webrtc] 收到 {signal_type} 信令 - from={user_id}, to={target_user_id}, room_id={room_id}, group_id={group_id}")
+            print(f"[webrtc] {signal_type} from={user_id} to={target_user_id}")
+            
+            if not target_user_id:
+                error_msg = f"缺少目标用户ID (target_user_id)"
+                app_logger.warning(f"[webrtc] {error_msg}")
+                await websocket.send_text(json.dumps({
+                    "type": "webrtc_error",
+                    "signal_type": signal_type,
+                    "message": error_msg
+                }, ensure_ascii=False))
+                return
+            
+            # 验证目标用户是否在线
+            target_conn = connections.get(target_user_id)
+            if not target_conn:
+                error_msg = f"目标用户 {target_user_id} 不在线"
+                app_logger.warning(f"[webrtc] {error_msg}")
+                await websocket.send_text(json.dumps({
+                    "type": "webrtc_error",
+                    "signal_type": signal_type,
+                    "message": error_msg
+                }, ensure_ascii=False))
+                return
+            
+            # 可选：验证房间和成员关系
+            if group_id:
+                room_info = active_temp_rooms.get(group_id)
+                if room_info:
+                    members = room_info.get("members", [])
+                    if user_id not in members:
+                        app_logger.warning(f"[webrtc] 用户 {user_id} 不在房间 {group_id} 的成员列表中")
+                    if target_user_id not in members:
+                        app_logger.warning(f"[webrtc] 目标用户 {target_user_id} 不在房间 {group_id} 的成员列表中")
+            
+            # 构建转发消息
+            forward_message = {
+                "type": f"webrtc_{signal_type}",
+                "from_user_id": user_id,
+                "target_user_id": target_user_id,
+                "room_id": room_id,
+                "group_id": group_id
+            }
+            
+            # 根据信令类型添加特定字段
+            if signal_type == "offer":
+                forward_message["offer"] = msg_data.get('offer')
+                forward_message["sdp"] = msg_data.get('sdp')  # 兼容不同格式
+            elif signal_type == "answer":
+                forward_message["answer"] = msg_data.get('answer')
+                forward_message["sdp"] = msg_data.get('sdp')  # 兼容不同格式
+            elif signal_type == "ice_candidate":
+                forward_message["candidate"] = msg_data.get('candidate')
+                forward_message["sdpMLineIndex"] = msg_data.get('sdpMLineIndex')
+                forward_message["sdpMid"] = msg_data.get('sdpMid')
+            
+            # 转发给目标用户
+            try:
+                await target_conn["ws"].send_text(json.dumps(forward_message, ensure_ascii=False))
+                app_logger.info(f"[webrtc] {signal_type} 转发成功 - from={user_id} to={target_user_id}")
+                print(f"[webrtc] {signal_type} 转发成功 to={target_user_id}")
+                
+                # 给发送者返回成功确认
+                await websocket.send_text(json.dumps({
+                    "type": f"webrtc_{signal_type}_sent",
+                    "target_user_id": target_user_id,
+                    "status": "success"
+                }, ensure_ascii=False))
+            except Exception as e:
+                error_msg = f"转发 {signal_type} 失败: {str(e)}"
+                app_logger.error(f"[webrtc] {error_msg}")
+                await websocket.send_text(json.dumps({
+                    "type": "webrtc_error",
+                    "signal_type": signal_type,
+                    "message": error_msg
+                }, ensure_ascii=False))
 
         print(f"[websocket][{user_id}] 数据库连接成功，开始监听消息")
 
@@ -9775,6 +10060,24 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                 "offline_count": offline_count
                             }, ensure_ascii=False))
                             continue
+                        # WebRTC 信令消息处理
+                        elif msg_data1['type'] == "webrtc_offer":
+                            await handle_webrtc_signal(msg_data1, "offer")
+                            continue
+                        elif msg_data1['type'] == "webrtc_answer":
+                            await handle_webrtc_signal(msg_data1, "answer")
+                            continue
+                        elif msg_data1['type'] == "webrtc_ice_candidate":
+                            await handle_webrtc_signal(msg_data1, "ice_candidate")
+                            continue
+                        # 处理通过服务器转发到 SRS 的 offer（推流）
+                        elif msg_data1['type'] == "srs_publish_offer":
+                            await handle_srs_webrtc_offer(msg_data1, "publish")
+                            continue
+                        # 处理通过服务器转发到 SRS 的 offer（拉流）
+                        elif msg_data1['type'] == "srs_play_offer":
+                            await handle_srs_webrtc_offer(msg_data1, "play")
+                            continue
         
                     else:
                         print(" 格式错误")
@@ -9788,6 +10091,24 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
                     if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") == "6":
                         await handle_temp_room_creation(msg_data_raw)
+                        continue
+                    # WebRTC 信令消息处理（纯 JSON 格式）
+                    if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") == "webrtc_offer":
+                        await handle_webrtc_signal(msg_data_raw, "offer")
+                        continue
+                    if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") == "webrtc_answer":
+                        await handle_webrtc_signal(msg_data_raw, "answer")
+                        continue
+                    if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") == "webrtc_ice_candidate":
+                        await handle_webrtc_signal(msg_data_raw, "ice_candidate")
+                        continue
+                    # 处理通过服务器转发到 SRS 的 offer（推流）
+                    if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") == "srs_publish_offer":
+                        await handle_srs_webrtc_offer(msg_data_raw, "publish")
+                        continue
+                    # 处理通过服务器转发到 SRS 的 offer（拉流）
+                    if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") == "srs_play_offer":
+                        await handle_srs_webrtc_offer(msg_data_raw, "play")
                         continue
                 if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") in ("join_temp_room", "temp_room_join"):
                     await handle_join_temp_room(msg_data_raw.get("group_id"))
@@ -9906,6 +10227,19 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
         if user_id in connections:
             connections.pop(user_id, None)
             print(f"用户 {user_id} 离线（外层捕获），当前在线={len(connections)}，详情: {exc}")
+        
+        # 清理用户从所有临时房间的成员列表中移除
+        for group_id, room_info in list(active_temp_rooms.items()):
+            members = room_info.get("members", [])
+            if user_id in members:
+                members.remove(user_id)
+                app_logger.info(f"[webrtc] 用户 {user_id} 离开房间 {group_id}，当前成员数={len(members)}")
+                print(f"[webrtc] 用户 {user_id} 离开房间 {group_id}，当前成员数={len(members)}")
+                # 如果房间没有成员了，可以选择清理房间（可选）
+                # if len(members) == 0:
+                #     active_temp_rooms.pop(group_id, None)
+                #     print(f"[webrtc] 房间 {group_id} 已清空，已移除")
+        
         if connection:
             connection.rollback()
     finally:
@@ -9936,6 +10270,12 @@ async def heartbeat_checker():
                     to_remove.append(uid)
             for uid in to_remove:
                 connections.pop(uid, None)  # 安全移除
+                # 清理用户从所有临时房间的成员列表中移除
+                for group_id, room_info in list(active_temp_rooms.items()):
+                    members = room_info.get("members", [])
+                    if uid in members:
+                        members.remove(uid)
+                        print(f"[webrtc] 心跳超时：用户 {uid} 离开房间 {group_id}，当前成员数={len(members)}")
             await asyncio.sleep(10)
     except asyncio.CancelledError:
         print("heartbeat_checker 已安全退出")
