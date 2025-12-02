@@ -9755,6 +9755,54 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     "timestamp": time.time(),
                     "members": [owner_id]  # 初始化成员列表，包含创建者
                 }
+                
+                # 保存临时语音房间到数据库
+                try:
+                    # 插入临时语音房间信息
+                    insert_room_sql = """
+                        INSERT INTO `temp_voice_rooms` (
+                            room_id, group_id, owner_id, owner_name, owner_icon,
+                            whip_url, whep_url, stream_name, status, create_time
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                        )
+                    """
+                    local_cursor.execute(insert_room_sql, (
+                        room_id,
+                        group_id,
+                        owner_id,
+                        owner_name if owner_name else None,
+                        owner_icon if owner_icon else None,
+                        whip_url,
+                        whep_url,
+                        stream_name,
+                        1  # status = 1 (活跃)
+                    ))
+                    
+                    # 插入房间创建者（群主）到成员表
+                    insert_member_sql = """
+                        INSERT INTO `temp_voice_room_members` (
+                            room_id, user_id, user_name, status, join_time
+                        ) VALUES (
+                            %s, %s, %s, %s, NOW()
+                        )
+                    """
+                    local_cursor.execute(insert_member_sql, (
+                        room_id,
+                        owner_id,
+                        owner_name if owner_name else None,
+                        1  # status = 1 (在线)
+                    ))
+                    
+                    connection.commit()
+                    print(f"[temp_room] 临时语音房间已保存到数据库 - room_id={room_id}, group_id={group_id}")
+                    app_logger.info(f"[temp_room] 临时语音房间已保存到数据库 - room_id={room_id}, group_id={group_id}")
+                except Exception as db_save_error:
+                    # 数据库保存失败不影响内存中的房间创建
+                    print(f"[temp_room] 保存临时语音房间到数据库失败 - room_id={room_id}, error={db_save_error}")
+                    app_logger.error(f"[temp_room] 保存临时语音房间到数据库失败 - room_id={room_id}, error={db_save_error}", exc_info=True)
+                    connection.rollback()
+                
                 print(f"[temp_room] 记录成功 group_id={group_id}, room_id={room_id}, stream_name={stream_name}, invited={invited_users}, active_total={len(active_temp_rooms)}")
                 app_logger.info(f"[temp_room] 房间创建成功 - group_id={group_id}, room_id={room_id}, stream_name={stream_name}, members={[owner_id]}")
 
@@ -10685,6 +10733,53 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                             "timestamp": time.time(),
                                             "members": [owner_id]  # 初始化成员列表，包含创建者
                                         }
+                                        
+                                        # 保存临时语音房间到数据库
+                                        try:
+                                            # 插入临时语音房间信息
+                                            insert_room_sql = """
+                                                INSERT INTO `temp_voice_rooms` (
+                                                    room_id, group_id, owner_id, owner_name, owner_icon,
+                                                    whip_url, whep_url, stream_name, status, create_time
+                                                ) VALUES (
+                                                    %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                                                )
+                                            """
+                                            cursor.execute(insert_room_sql, (
+                                                room_id,
+                                                unique_group_id,
+                                                owner_id,
+                                                owner_name if owner_name else None,
+                                                owner_icon if owner_icon else None,
+                                                whip_url,
+                                                whep_url,
+                                                stream_name,
+                                                1  # status = 1 (活跃)
+                                            ))
+                                            
+                                            # 插入房间创建者（群主）到成员表
+                                            insert_member_sql = """
+                                                INSERT INTO `temp_voice_room_members` (
+                                                    room_id, user_id, user_name, status, join_time
+                                                ) VALUES (
+                                                    %s, %s, %s, %s, NOW()
+                                                )
+                                            """
+                                            cursor.execute(insert_member_sql, (
+                                                room_id,
+                                                owner_id,
+                                                owner_name if owner_name else None,
+                                                1  # status = 1 (在线)
+                                            ))
+                                            
+                                            connection.commit()
+                                            print(f"[创建班级群] 临时语音房间已保存到数据库 - room_id={room_id}, group_id={unique_group_id}")
+                                            app_logger.info(f"[创建班级群] 临时语音房间已保存到数据库 - room_id={room_id}, group_id={unique_group_id}")
+                                        except Exception as db_save_error:
+                                            # 数据库保存失败不影响内存中的房间创建
+                                            print(f"[创建班级群] 保存临时语音房间到数据库失败 - room_id={room_id}, error={db_save_error}")
+                                            app_logger.error(f"[创建班级群] 保存临时语音房间到数据库失败 - room_id={room_id}, error={db_save_error}", exc_info=True)
+                                            connection.rollback()
                                         
                                         temp_room_info = {
                                             "room_id": room_id,
