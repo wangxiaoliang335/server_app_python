@@ -558,6 +558,61 @@ def resolve_tencent_identifier(connection, *, id_number: Optional[str] = None, p
     return id_number or phone
 
 
+def convert_group_type_to_int(group_type: Union[str, int, None]) -> int:
+    """
+    将群类型字符串转换为整数
+    腾讯IM群类型：Public=0, Private=1, ChatRoom=2, AVChatRoom=3, BChatRoom=4, Community=5, Work=6, Meeting=7
+    注意：会议群(Meeting)在腾讯IM中通常映射到 ChatRoom(2) 或 AVChatRoom(3)，但有些版本可能有独立的 Meeting 类型
+    """
+    if group_type is None:
+        return 0  # 默认 Public
+    
+    if isinstance(group_type, int):
+        return group_type
+    
+    if isinstance(group_type, str):
+        type_mapping = {
+            "public": 0,
+            "Public": 0,
+            "PUBLIC": 0,
+            "private": 1,
+            "Private": 1,
+            "PRIVATE": 1,
+            "chatroom": 2,
+            "ChatRoom": 2,
+            "CHATROOM": 2,
+            "avchatroom": 3,
+            "AVChatRoom": 3,
+            "AVCHATROOM": 3,
+            "bchatroom": 4,
+            "BChatRoom": 4,
+            "BCHATROOM": 4,
+            "community": 5,
+            "Community": 5,
+            "COMMUNITY": 5,
+            "work": 6,
+            "Work": 6,
+            "WORK": 6,
+            "class": 6,  # 班级群使用 Work 类型
+            "Class": 6,
+            # 会议群相关映射（通常映射到 ChatRoom 或 AVChatRoom）
+            "meeting": 2,  # 会议群映射到 ChatRoom
+            "Meeting": 2,
+            "MEETING": 2,
+            "meetinggroup": 2,  # 会议群组映射到 ChatRoom
+            "MeetingGroup": 2,
+            "MEETINGGROUP": 2,
+            "会议": 2,  # 中文"会议"映射到 ChatRoom
+            "会议群": 2,  # 中文"会议群"映射到 ChatRoom
+            # 如果需要音视频会议功能，可以映射到 AVChatRoom(3)
+            "avmeeting": 3,  # 音视频会议映射到 AVChatRoom
+            "AVMeeting": 3,
+            "AVMEETING": 3
+        }
+        return type_mapping.get(group_type, 0)  # 默认返回 0 (Public)
+    
+    return 0  # 默认返回 0 (Public)
+
 def normalize_tencent_group_type(raw_type: Optional[str]) -> str:
     default_type = "ChatRoom"
     if not raw_type:
@@ -8810,9 +8865,173 @@ async def sync_groups(request: Request):
                         print(f"[groups/sync] 插入群组 {group_id} 完成, 影响行数: {affected_rows}, lastrowid: {lastrowid}")
                     
                     # 处理群成员信息
+                    # 1. 优先处理 member_info（群主，必须存在）
+                    # 2. 然后处理 members 数组（管理员和其他成员）
+                    members_list = group.get('members', [])
                     member_info = group.get('member_info')
-                    print(f"[groups/sync] 群组 {group_id} 的成员信息: {member_info}")
+                    print(f"[groups/sync] 群组 {group_id} 的成员信息: member_info={member_info is not None}, members数组={len(members_list)}个成员")
+                    
+                    # 记录已处理的成员ID，避免重复插入
+                    processed_member_ids = set()
+                    
+                    # 第一步：处理 member_info（群主，必须存在）
                     if member_info:
+                        member_user_id = member_info.get('user_id')
+                        if member_user_id:
+                            print(f"[groups/sync] 处理 member_info（群主）: user_id={member_user_id}")
+                            member_user_name = member_info.get('user_name', '')
+                            member_self_role = member_info.get('self_role', 400)  # 默认群主
+                            member_join_time = timestamp_to_datetime(member_info.get('join_time')) or timestamp_to_datetime(group.get('create_time'))
+                            if not member_join_time:
+                                member_join_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            
+                            # 检查成员是否已存在
+                            cursor.execute(
+                                "SELECT group_id FROM `group_members` WHERE group_id = %s AND user_id = %s",
+                                (group_id, member_user_id)
+                            )
+                            member_exists = cursor.fetchone()
+                            
+                            if member_exists:
+                                # 更新群主信息
+                                print(f"[groups/sync] 更新群主 group_id={group_id}, user_id={member_user_id}, self_role={member_self_role}")
+                                update_member_sql = """
+                                    UPDATE `group_members` SET
+                                        user_name = %s, self_role = %s, join_time = %s,
+                                        msg_flag = %s, self_msg_flag = %s, readed_seq = %s, unread_num = %s
+                                    WHERE group_id = %s AND user_id = %s
+                                """
+                                update_params = (
+                                    member_user_name if member_user_name else None,
+                                    member_self_role,
+                                    member_join_time,
+                                    member_info.get('msg_flag', 0),
+                                    member_info.get('self_msg_flag', 0),
+                                    member_info.get('readed_seq', 0),
+                                    member_info.get('unread_num', 0),
+                                    group_id,
+                                    member_user_id
+                                )
+                                cursor.execute(update_member_sql, update_params)
+                            else:
+                                # 插入群主
+                                print(f"[groups/sync] 插入群主 group_id={group_id}, user_id={member_user_id}, self_role={member_self_role}")
+                                insert_member_sql = """
+                                    INSERT INTO `group_members` (
+                                        group_id, user_id, user_name, self_role, join_time, msg_flag,
+                                        self_msg_flag, readed_seq, unread_num
+                                    ) VALUES (
+                                        %s, %s, %s, %s, %s, %s, %s, %s, %s
+                                    )
+                                """
+                                insert_params = (
+                                    group_id,
+                                    member_user_id,
+                                    member_user_name if member_user_name else None,
+                                    member_self_role,
+                                    member_join_time,
+                                    member_info.get('msg_flag', 0),
+                                    member_info.get('self_msg_flag', 0),
+                                    member_info.get('readed_seq', 0),
+                                    member_info.get('unread_num', 0)
+                                )
+                                cursor.execute(insert_member_sql, insert_params)
+                            
+                            processed_member_ids.add(member_user_id)
+                        else:
+                            print(f"[groups/sync] 警告: member_info 缺少 user_id，跳过")
+                    else:
+                        print(f"[groups/sync] 警告: 缺少 member_info（群主信息），这是必需的")
+                    
+                    # 第二步：处理 members 数组（管理员和其他成员）
+                    if members_list:
+                        print(f"[groups/sync] 处理 members 数组，共 {len(members_list)} 个成员")
+                        for member_item in members_list:
+                            # 兼容新旧字段名
+                            member_user_id = member_item.get('user_id') or member_item.get('unique_member_id')
+                            member_user_name = member_item.get('user_name') or member_item.get('member_name', '')
+                            
+                            if not member_user_id:
+                                print(f"[groups/sync] 警告: 成员信息缺少 user_id/unique_member_id，跳过")
+                                continue
+                            
+                            # 如果该成员已经在 member_info 中处理过（群主），跳过避免重复
+                            if member_user_id in processed_member_ids:
+                                print(f"[groups/sync] 跳过已处理的成员（群主）: user_id={member_user_id}")
+                                continue
+                            
+                            # 处理 self_role：优先使用 self_role，否则从 group_role 转换
+                            if 'self_role' in member_item:
+                                member_self_role = member_item.get('self_role')
+                            else:
+                                # 从 group_role 转换：400=群主，300=管理员，其他=普通成员(200)
+                                group_role = member_item.get('group_role')
+                                if group_role == 400:
+                                    member_self_role = 400  # 群主（但应该已经在 member_info 中处理）
+                                elif group_role == 300:
+                                    member_self_role = 300  # 管理员（保持300）
+                                else:
+                                    member_self_role = 200  # 普通成员
+                            
+                            # 处理 join_time：支持时间戳或直接使用当前时间
+                            member_join_time = timestamp_to_datetime(member_item.get('join_time')) or timestamp_to_datetime(group.get('create_time'))
+                            if not member_join_time:
+                                member_join_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            
+                            # 检查成员是否已存在
+                            cursor.execute(
+                                "SELECT group_id FROM `group_members` WHERE group_id = %s AND user_id = %s",
+                                (group_id, member_user_id)
+                            )
+                            member_exists = cursor.fetchone()
+                            
+                            if member_exists:
+                                # 更新成员信息
+                                print(f"[groups/sync] 更新成员 group_id={group_id}, user_id={member_user_id}, self_role={member_self_role}")
+                                update_member_sql = """
+                                    UPDATE `group_members` SET
+                                        user_name = %s, self_role = %s, join_time = %s,
+                                        msg_flag = %s, self_msg_flag = %s, readed_seq = %s, unread_num = %s
+                                    WHERE group_id = %s AND user_id = %s
+                                """
+                                update_params = (
+                                    member_user_name if member_user_name else None,
+                                    member_self_role,
+                                    member_join_time,
+                                    member_item.get('msg_flag', 0),
+                                    member_item.get('self_msg_flag', 0),
+                                    member_item.get('readed_seq', 0),
+                                    member_item.get('unread_num', 0),
+                                    group_id,
+                                    member_user_id
+                                )
+                                cursor.execute(update_member_sql, update_params)
+                            else:
+                                # 插入新成员
+                                print(f"[groups/sync] 插入成员 group_id={group_id}, user_id={member_user_id}, self_role={member_self_role}")
+                                insert_member_sql = """
+                                    INSERT INTO `group_members` (
+                                        group_id, user_id, user_name, self_role, join_time, msg_flag,
+                                        self_msg_flag, readed_seq, unread_num
+                                    ) VALUES (
+                                        %s, %s, %s, %s, %s, %s, %s, %s, %s
+                                    )
+                                """
+                                insert_params = (
+                                    group_id,
+                                    member_user_id,
+                                    member_user_name if member_user_name else None,
+                                    member_self_role,
+                                    member_join_time,
+                                    member_item.get('msg_flag', 0),
+                                    member_item.get('self_msg_flag', 0),
+                                    member_item.get('readed_seq', 0),
+                                    member_item.get('unread_num', 0)
+                                )
+                                cursor.execute(insert_member_sql, insert_params)
+                            
+                            processed_member_ids.add(member_user_id)
+                    elif not member_info:
                         group_id = group.get('group_id')
                         member_user_id = member_info.get('user_id')
                         
@@ -10082,56 +10301,471 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             print(" 创建群")   
                             cursor = connection.cursor(dictionary=True)
                             unique_group_id = str(uuid.uuid4())
-
-                            cursor.execute(
-                                "INSERT INTO ta_group (permission_level, headImage_path, group_type, nickname, unique_group_id, group_admin_id, school_id, class_id, create_time)"
-                                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())",
-                                (msg_data1.get('permission_level'),
-                                msg_data1.get('headImage_path'),
-                                msg_data1.get('group_type'),
-                                msg_data1.get('nickname'),
-                                unique_group_id,
-                                msg_data1.get('owner_id'),
-                                msg_data1.get('school_id'),
-                                msg_data1.get('class_id'))
-                            )
-
-                            for m in msg_data1['members']:
-                                cursor.execute(
-                                    "INSERT INTO ta_group_member_relation (unique_member_id, unique_group_id, join_time, group_role, member_name)"
-                                    " VALUES (%s,%s,NOW(),%s,%s)",
-                                    (m['unique_member_id'], unique_group_id, m['group_role'], m['member_name'])
+                            
+                            # 获取当前时间
+                            current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            
+                            # 字段映射：统一使用与 /groups/sync 相同的字段名
+                            # 兼容旧字段名（nickname, headImage_path, owner_id, school_id, class_id）
+                            group_name = msg_data1.get('group_name') or msg_data1.get('nickname', '')
+                            face_url = msg_data1.get('face_url') or msg_data1.get('headImage_path', '')
+                            detail_face_url = msg_data1.get('detail_face_url') or face_url
+                            # 转换 group_type：数据库中是整数类型，需要将字符串转换为整数
+                            group_type_raw = msg_data1.get('group_type', '')
+                            group_type = convert_group_type_to_int(group_type_raw)
+                            owner_identifier = msg_data1.get('owner_identifier') or msg_data1.get('owner_id', '')
+                            schoolid = msg_data1.get('schoolid') or msg_data1.get('school_id')
+                            classid = msg_data1.get('classid') or msg_data1.get('class_id')
+                            is_class_group = msg_data1.get('is_class_group')
+                            if is_class_group is None:
+                                is_class_group = 1 if classid else 0
+                            
+                            # 插入 groups 表
+                            insert_group_sql = """
+                                INSERT INTO `groups` (
+                                    group_id, group_name, group_type, face_url, detail_face_url,
+                                    owner_identifier, create_time, max_member_num, member_num,
+                                    introduction, notification, searchable, visible, add_option,
+                                    is_shutup_all, next_msg_seq, latest_seq, last_msg_time,
+                                    last_info_time, info_seq, detail_info_seq, detail_group_id,
+                                    detail_group_name, detail_group_type, detail_is_shutup_all,
+                                    online_member_num, classid, schoolid, is_class_group
+                                ) VALUES (
+                                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                    %s, %s, %s, %s, %s, %s, %s, %s,
+                                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                                 )
+                            """
+                            insert_group_params = (
+                                unique_group_id,  # group_id
+                                group_name,  # group_name
+                                group_type,  # group_type
+                                face_url,  # face_url
+                                detail_face_url,  # detail_face_url
+                                owner_identifier,  # owner_identifier
+                                current_time,  # create_time
+                                500,  # max_member_num (默认500)
+                                len(msg_data1.get('members', [])),  # member_num
+                                '',  # introduction
+                                '',  # notification
+                                1,  # searchable (默认可搜索)
+                                1,  # visible (默认可见)
+                                0,  # add_option (默认0)
+                                0,  # is_shutup_all (默认0)
+                                0,  # next_msg_seq
+                                0,  # latest_seq
+                                current_time,  # last_msg_time
+                                current_time,  # last_info_time
+                                0,  # info_seq
+                                0,  # detail_info_seq
+                                None,  # detail_group_id
+                                None,  # detail_group_name
+                                None,  # detail_group_type
+                                None,  # detail_is_shutup_all
+                                0,  # online_member_num
+                                classid,  # classid
+                                schoolid,  # schoolid
+                                is_class_group  # is_class_group
+                            )
+                            
+                            print(f"[创建群] 插入 groups 表 - group_id={unique_group_id}, group_name={group_name}")
+                            cursor.execute(insert_group_sql, insert_group_params)
+                            
+                            # 插入群成员到 group_members 表
+                            # 1. 优先处理 member_info（群主，必须存在）
+                            # 2. 然后处理 members 数组（管理员和其他成员）
+                            members_list = msg_data1.get('members', [])
+                            member_info = msg_data1.get('member_info')
+                            
+                            # 记录已处理的成员ID，避免重复插入
+                            processed_member_ids = set()
+                            
+                            # 第一步：处理 member_info（群主，必须存在）
+                            if member_info:
+                                member_user_id = member_info.get('user_id')
+                                if member_user_id:
+                                    print(f"[创建群] 处理 member_info（群主）: user_id={member_user_id}")
+                                    member_user_name = member_info.get('user_name', '')
+                                    member_self_role = member_info.get('self_role', 400)  # 默认群主
+                                    
+                                    # 处理 join_time
+                                    member_join_time = current_time
+                                    if 'join_time' in member_info:
+                                        join_time_value = member_info.get('join_time')
+                                        if join_time_value:
+                                            try:
+                                                if isinstance(join_time_value, (int, float)):
+                                                    if join_time_value > 2147483647:
+                                                        join_time_value = int(join_time_value / 1000)
+                                                    dt = datetime.datetime.fromtimestamp(int(join_time_value))
+                                                    member_join_time = dt.strftime('%Y-%m-%d %H:%M:%S')
+                                                else:
+                                                    member_join_time = join_time_value
+                                            except (ValueError, OSError):
+                                                member_join_time = current_time
+                                    
+                                    insert_member_sql = """
+                                        INSERT INTO `group_members` (
+                                            group_id, user_id, user_name, self_role, join_time, msg_flag,
+                                            self_msg_flag, readed_seq, unread_num
+                                        ) VALUES (
+                                            %s, %s, %s, %s, %s, %s, %s, %s, %s
+                                        )
+                                    """
+                                    insert_member_params = (
+                                        unique_group_id,
+                                        member_user_id,
+                                        member_user_name if member_user_name else None,
+                                        member_self_role,
+                                        member_join_time,
+                                        member_info.get('msg_flag', 0),
+                                        member_info.get('self_msg_flag', 0),
+                                        member_info.get('readed_seq', 0),
+                                        member_info.get('unread_num', 0)
+                                    )
+                                    
+                                    print(f"[创建群] 插入群主 - group_id={unique_group_id}, user_id={member_user_id}, user_name={member_user_name}, self_role={member_self_role}")
+                                    cursor.execute(insert_member_sql, insert_member_params)
+                                    processed_member_ids.add(member_user_id)
+                                else:
+                                    print(f"[创建群] 警告: member_info 缺少 user_id，跳过")
+                            else:
+                                print(f"[创建群] 警告: 缺少 member_info（群主信息），这是必需的")
+                            
+                            # 第二步：处理 members 数组（管理员和其他成员）
+                            if members_list:
+                            
+                                for m in members_list:
+                                    # 兼容新旧字段名
+                                    member_user_id = m.get('user_id') or m.get('unique_member_id')
+                                    member_user_name = m.get('user_name') or m.get('member_name', '')
+                                    
+                                    if not member_user_id:
+                                        print(f"[创建群] 警告: 成员信息缺少 user_id/unique_member_id，跳过")
+                                        continue
+                                    
+                                    # 如果该成员已经在 member_info 中处理过（群主），跳过避免重复
+                                    if member_user_id in processed_member_ids:
+                                        print(f"[创建群] 跳过已处理的成员（群主）: user_id={member_user_id}")
+                                        continue
+                                    
+                                    # self_role 字段：优先使用 self_role，否则从 group_role 转换
+                                    if 'self_role' in m:
+                                        self_role = m.get('self_role')
+                                    else:
+                                        # 从 group_role 转换：400=群主，300=管理员，其他=普通成员(200)
+                                        group_role = m.get('group_role')
+                                        if isinstance(group_role, int):
+                                            if group_role == 400:
+                                                self_role = 400  # 群主（但应该已经在 member_info 中处理）
+                                            elif group_role == 300:
+                                                self_role = 300  # 管理员（保持300）
+                                            else:
+                                                self_role = 200  # 普通成员
+                                        elif isinstance(group_role, str):
+                                            # 字符串格式的角色
+                                            if group_role in ['owner', '群主', '400'] or member_user_id == owner_identifier:
+                                                self_role = 400  # 群主（但应该已经在 member_info 中处理）
+                                            elif group_role in ['admin', '管理员', '300']:
+                                                self_role = 300  # 管理员
+                                            else:
+                                                self_role = 200  # 普通成员
+                                        else:
+                                            # 默认：如果是创建者则为群主，否则为普通成员
+                                            if member_user_id == owner_identifier:
+                                                self_role = 400  # 群主（但应该已经在 member_info 中处理）
+                                            else:
+                                                self_role = 200  # 普通成员
+                                    
+                                    insert_member_sql = """
+                                        INSERT INTO `group_members` (
+                                            group_id, user_id, user_name, self_role, join_time, msg_flag,
+                                            self_msg_flag, readed_seq, unread_num
+                                        ) VALUES (
+                                            %s, %s, %s, %s, %s, %s, %s, %s, %s
+                                        )
+                                    """
+                                    # 处理 join_time：支持时间戳格式（与 /groups/sync 一致）或直接使用当前时间
+                                    member_join_time = current_time
+                                    if 'join_time' in m:
+                                        join_time_value = m.get('join_time')
+                                        if join_time_value:
+                                            # 如果是时间戳，转换为 datetime 字符串
+                                            try:
+                                                if isinstance(join_time_value, (int, float)):
+                                                    if join_time_value > 2147483647:  # 毫秒级时间戳
+                                                        join_time_value = int(join_time_value / 1000)
+                                                    dt = datetime.datetime.fromtimestamp(int(join_time_value))
+                                                    member_join_time = dt.strftime('%Y-%m-%d %H:%M:%S')
+                                                else:
+                                                    member_join_time = join_time_value
+                                            except (ValueError, OSError):
+                                                member_join_time = current_time
+                                    
+                                    # 获取其他成员字段（与 /groups/sync 一致）
+                                    member_msg_flag = m.get('msg_flag', 0)
+                                    member_self_msg_flag = m.get('self_msg_flag', 0)
+                                    member_readed_seq = m.get('readed_seq', 0)
+                                    member_unread_num = m.get('unread_num', 0)
+                                    
+                                    insert_member_params = (
+                                        unique_group_id,  # group_id
+                                        member_user_id,  # user_id
+                                        member_user_name if member_user_name else None,  # user_name
+                                        self_role,  # self_role
+                                        member_join_time,  # join_time
+                                        member_msg_flag,  # msg_flag
+                                        member_self_msg_flag,  # self_msg_flag
+                                        member_readed_seq,  # readed_seq
+                                        member_unread_num   # unread_num
+                                    )
+                                    
+                                    print(f"[创建群] 插入成员 - group_id={unique_group_id}, user_id={member_user_id}, user_name={member_user_name}, self_role={self_role}")
+                                    cursor.execute(insert_member_sql, insert_member_params)
+                                    processed_member_ids.add(member_user_id)
 
                             connection.commit()
+                            
+                            # 同步到腾讯IM（异步执行，不阻塞响应）
+                            try:
+                                # 构建腾讯IM需要的群组数据格式
+                                tencent_group_data = {
+                                    "GroupId": unique_group_id,
+                                    "group_id": unique_group_id,
+                                    "Name": group_name,
+                                    "group_name": group_name,
+                                    "Type": group_type_raw,  # 使用原始字符串类型，build_group_payload 会转换
+                                    "group_type": group_type_raw,
+                                    "Owner_Account": owner_identifier,
+                                    "owner_identifier": owner_identifier,
+                                    "FaceUrl": face_url,
+                                    "face_url": face_url,
+                                    "Introduction": msg_data1.get('introduction', ''),
+                                    "introduction": msg_data1.get('introduction', ''),
+                                    "Notification": msg_data1.get('notification', ''),
+                                    "notification": msg_data1.get('notification', ''),
+                                    "MaxMemberCount": msg_data1.get('max_member_num', 500),
+                                    "max_member_num": msg_data1.get('max_member_num', 500),
+                                    "ApplyJoinOption": msg_data1.get('add_option', 0),
+                                    "add_option": msg_data1.get('add_option', 0),
+                                    "member_info": member_info,  # 群主信息
+                                    "MemberList": []  # 成员列表（包含群主和管理员）
+                                }
+                                
+                                # 构建成员列表（包含群主和管理员）
+                                member_list = []
+                                # 添加群主（从 member_info）
+                                if member_info:
+                                    owner_user_id = member_info.get('user_id')
+                                    if owner_user_id:
+                                        member_list.append({
+                                            "Member_Account": owner_user_id,
+                                            "user_id": owner_user_id,
+                                            "Role": "Owner",
+                                            "self_role": 400
+                                        })
+                                # 添加管理员和其他成员（从 members 数组）
+                                if members_list:
+                                    for m in members_list:
+                                        member_user_id = m.get('user_id') or m.get('unique_member_id')
+                                        if not member_user_id:
+                                            continue
+                                        
+                                        # 如果已经在 member_info 中处理过（群主），跳过
+                                        if member_user_id in processed_member_ids:
+                                            continue
+                                            # 确定角色
+                                            if 'self_role' in m:
+                                                role_value = m.get('self_role')
+                                            else:
+                                                group_role = m.get('group_role')
+                                                if isinstance(group_role, int):
+                                                    if group_role == 400:
+                                                        role_value = 400
+                                                    elif group_role == 300:
+                                                        role_value = 300
+                                                    else:
+                                                        role_value = 200
+                                                else:
+                                                    role_value = 200
+                                            
+                                            # 转换为腾讯IM的角色字符串
+                                            if role_value == 400:
+                                                role_str = "Owner"
+                                            elif role_value == 300:
+                                                role_str = "Admin"
+                                            else:
+                                                role_str = "Member"
+                                            
+                                            member_list.append({
+                                                "Member_Account": member_user_id,
+                                                "user_id": member_user_id,
+                                                "Role": role_str,
+                                                "self_role": role_value
+                                            })
+                                
+                                tencent_group_data["MemberList"] = member_list
+                                
+                                # 异步调用同步函数（不阻塞当前流程）
+                                print(f"[创建群] 准备同步到腾讯IM - group_id={unique_group_id}")
+                                app_logger.info(f"[创建群] 准备同步到腾讯IM - group_id={unique_group_id}, group_name={group_name}")
+                                
+                                # 使用 asyncio.create_task 异步执行，不等待结果
+                                async def sync_to_tencent():
+                                    try:
+                                        # 调用同步函数（需要传入列表格式）
+                                        result = await notify_tencent_group_sync(owner_identifier, [tencent_group_data])
+                                        if result.get("status") == "success":
+                                            print(f"[创建群] 腾讯IM同步成功 - group_id={unique_group_id}")
+                                            app_logger.info(f"[创建群] 腾讯IM同步成功 - group_id={unique_group_id}")
+                                        else:
+                                            print(f"[创建群] 腾讯IM同步失败 - group_id={unique_group_id}, error={result.get('error')}")
+                                            app_logger.warning(f"[创建群] 腾讯IM同步失败 - group_id={unique_group_id}, error={result.get('error')}")
+                                    except Exception as sync_error:
+                                        print(f"[创建群] 腾讯IM同步异常 - group_id={unique_group_id}, error={sync_error}")
+                                        app_logger.error(f"[创建群] 腾讯IM同步异常 - group_id={unique_group_id}, error={sync_error}", exc_info=True)
+                                
+                                # 创建异步任务，不等待完成
+                                asyncio.create_task(sync_to_tencent())
+                                
+                            except Exception as tencent_sync_error:
+                                # 同步失败不影响群组创建
+                                print(f"[创建群] 准备腾讯IM同步时出错 - group_id={unique_group_id}, error={tencent_sync_error}")
+                                app_logger.error(f"[创建群] 准备腾讯IM同步时出错 - group_id={unique_group_id}, error={tencent_sync_error}", exc_info=True)
+                            
+                            # 如果是班级群（有 classid 或 class_id），自动创建临时语音群
+                            temp_room_info = None
+                            class_id = classid  # 使用统一后的 classid 变量
+                            if class_id:
+                                # 检查是否已经有临时语音群（使用 unique_group_id 作为 group_id）
+                                if unique_group_id not in active_temp_rooms:
+                                    try:
+                                        print(f"[创建班级群] 检测到班级群，自动创建临时语音群 - group_id={unique_group_id}, class_id={class_id}")
+                                        app_logger.info(f"[创建班级群] 自动创建临时语音群 - group_id={unique_group_id}, class_id={class_id}, owner_id={user_id}")
+                                        
+                                        # 获取创建者信息
+                                        owner_id = user_id
+                                        owner_name = msg_data1.get('owner_name', '') or ''
+                                        owner_icon = msg_data1.get('owner_icon', '') or ''
+                                        
+                                        # 尝试从数据库获取创建者信息
+                                        if not owner_name or not owner_icon:
+                                            try:
+                                                cursor.execute(
+                                                    "SELECT name, icon FROM ta_teacher WHERE teacher_unique_id = %s",
+                                                    (owner_id,)
+                                                )
+                                                owner_info = cursor.fetchone()
+                                                if owner_info:
+                                                    if not owner_name:
+                                                        owner_name = owner_info.get('name', '') or owner_name
+                                                    if not owner_icon:
+                                                        owner_icon = owner_info.get('icon', '') or owner_icon
+                                            except Exception as db_error:
+                                                app_logger.error(f"[创建班级群] 查询创建者信息失败 - user_id={user_id}, error={db_error}")
+                                        
+                                        # 生成唯一的房间ID和流名称
+                                        room_id = str(uuid.uuid4())
+                                        stream_name = f"room_{unique_group_id}_{int(time.time())}"
+                                        
+                                        # 自动生成 WHIP（推流）和 WHEP（拉流）URL
+                                        whip_url = f"{SRS_BASE_URL}/rtc/v1/whip/?app={SRS_APP}&stream={stream_name}"
+                                        whep_url = f"{SRS_BASE_URL}/rtc/v1/whep/?app={SRS_APP}&stream={stream_name}"
+                                        
+                                        # 创建临时语音群
+                                        active_temp_rooms[unique_group_id] = {
+                                            "room_id": room_id,
+                                            "owner_id": owner_id,
+                                            "owner_name": owner_name,
+                                            "owner_icon": owner_icon,
+                                            "whip_url": whip_url,
+                                            "whep_url": whep_url,
+                                            "stream_name": stream_name,
+                                            "group_id": unique_group_id,
+                                            "timestamp": time.time(),
+                                            "members": [owner_id]  # 初始化成员列表，包含创建者
+                                        }
+                                        
+                                        temp_room_info = {
+                                            "room_id": room_id,
+                                            "whip_url": whip_url,
+                                            "whep_url": whep_url,
+                                            "stream_name": stream_name,
+                                            "group_id": unique_group_id,
+                                            "owner_id": owner_id,
+                                            "owner_name": owner_name,
+                                            "owner_icon": owner_icon
+                                        }
+                                        
+                                        print(f"[创建班级群] 临时语音群创建成功 - group_id={unique_group_id}, room_id={room_id}, stream_name={stream_name}")
+                                        app_logger.info(f"[创建班级群] 临时语音群创建成功 - group_id={unique_group_id}, room_id={room_id}")
+                                    except Exception as temp_room_error:
+                                        app_logger.error(f"[创建班级群] 创建临时语音群失败 - group_id={unique_group_id}, error={temp_room_error}")
+                                        print(f"[创建班级群] 创建临时语音群失败: {temp_room_error}")
+                                        # 临时语音群创建失败不影响班级群创建
+                                else:
+                                    # 如果已存在临时语音群，获取其信息
+                                    existing_room = active_temp_rooms[unique_group_id]
+                                    temp_room_info = {
+                                        "room_id": existing_room.get("room_id"),
+                                        "whip_url": existing_room.get("whip_url"),
+                                        "whep_url": existing_room.get("whep_url"),
+                                        "stream_name": existing_room.get("stream_name"),
+                                        "group_id": unique_group_id,
+                                        "owner_id": existing_room.get("owner_id"),
+                                        "owner_name": existing_room.get("owner_name"),
+                                        "owner_icon": existing_room.get("owner_icon")
+                                    }
+                                    print(f"[创建班级群] 临时语音群已存在 - group_id={unique_group_id}, room_id={temp_room_info.get('room_id')}")
+                            
                             # 给在线成员推送
-                            for m in msg_data1['members']:
-                                target_conn = connections.get(m['unique_member_id'])
+                            # 兼容新旧字段名：user_id 或 unique_member_id
+                            members_to_notify = msg_data1.get('members', [])
+                            for m in members_to_notify:
+                                # 兼容新旧字段名
+                                member_id = m.get('user_id') or m.get('unique_member_id')
+                                if not member_id:
+                                    continue
+                                
+                                target_conn = connections.get(member_id)
                                 if target_conn:
                                     await target_conn["ws"].send_text(json.dumps({
                                         "type":"notify",
-                                        "message":f"你已加入群: {msg_data1['nickname']}",
+                                        "message":f"你已加入群: {msg_data1.get('group_name') or msg_data1.get('nickname', '')}",
                                         "group_id": unique_group_id,
-                                        "groupname": msg_data1.get('nickname')
+                                        "groupname": msg_data1.get('group_name') or msg_data1.get('nickname', '')
                                     }))
                                 else:
-                                    print(m['unique_member_id'], " 不在线", ", 来自:", user_id)
+                                    print(f"[创建群] 成员 {member_id} 不在线，插入通知")
                                     cursor = connection.cursor(dictionary=True)
 
                                     update_query = """
                                             INSERT INTO ta_notification (sender_id, sender_name, receiver_id, unique_group_id, group_name, content, content_text)
                                             VALUES (%s, %s, %s, %s, %s, %s, %s)
                                         """
-                                    cursor.execute(update_query, (user_id, msg_data1.get('owner_name'), m['unique_member_id'], unique_group_id, msg_data1.get("nickname"), "邀请你加入了群", msg_data1['type']))
+                                    cursor.execute(update_query, (user_id, msg_data1.get('owner_name'), member_id, unique_group_id, msg_data1.get("group_name") or msg_data1.get("nickname", ""), "邀请你加入了群", msg_data1['type']))
                                     connection.commit()
 
-                            #把创建成功的群信息发回给创建者
-                            await websocket.send_text(json.dumps({
-                                        "type":"3",
-                                        "message":f"你创建了群: {msg_data1['nickname']}",
-                                        "group_id": unique_group_id,
-                                        "groupname": msg_data1.get('nickname')
-                                    }))
+                            #把创建成功的群信息发回给创建者（包含临时语音群信息）
+                            # 兼容新旧字段名：group_name 或 nickname
+                            group_name_for_response = msg_data1.get('group_name') or msg_data1.get('nickname', '')
+                            response_data = {
+                                "type":"3",
+                                "message":f"你创建了群: {group_name_for_response}",
+                                "group_id": unique_group_id,
+                                "groupname": group_name_for_response
+                            }
+                            
+                            # 如果有临时语音群信息，添加到响应中
+                            if temp_room_info:
+                                response_data["temp_room"] = temp_room_info
+                            
+                            # 打印返回给客户端的消息
+                            response_json = json.dumps(response_data, ensure_ascii=False)
+                            print(f"[创建群] 返回给客户端 - user_id={user_id}, group_id={unique_group_id}, response={response_json}")
+                            app_logger.info(f"[创建群] 返回给客户端 - user_id={user_id}, group_id={unique_group_id}, response={response_json}")
+                            
+                            await websocket.send_text(response_json)
 
                                     # 群消息: 群主发消息，发给除群主外的所有群成员
                         elif msg_data1['type'] == "5":
@@ -10480,24 +11114,28 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") == "srs_play_offer":
                         await handle_srs_webrtc_offer(msg_data_raw, "play")
                         continue
-                if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") in ("join_temp_room", "temp_room_join"):
-                    group_id_from_msg = msg_data_raw.get("group_id")
-                    app_logger.info(f"[temp_room] 🔵 收到 JSON 格式的加入房间请求 - user_id={user_id}, type={msg_data_raw.get('type')}, group_id={group_id_from_msg}, 原始消息={data[:200]}")
-                    print(f"[temp_room] 🔵 收到 JSON 格式的加入房间请求 - user_id={user_id}, type={msg_data_raw.get('type')}, group_id={group_id_from_msg}")
-                    await handle_join_temp_room(group_id_from_msg)
-                    continue
+                    # 处理加入临时房间请求
+                    if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") in ("join_temp_room", "temp_room_join"):
+                        group_id_from_msg = msg_data_raw.get("group_id")
+                        app_logger.info(f"[temp_room] 🔵 收到 JSON 格式的加入房间请求 - user_id={user_id}, type={msg_data_raw.get('type')}, group_id={group_id_from_msg}, 原始消息={data[:200]}")
+                        print(f"[temp_room] 🔵 收到 JSON 格式的加入房间请求 - user_id={user_id}, type={msg_data_raw.get('type')}, group_id={group_id_from_msg}")
+                        await handle_join_temp_room(group_id_from_msg)
+                        continue
 
-                stripped_data = (data or "").strip()
-                if stripped_data and stripped_data in active_temp_rooms:
-                    app_logger.info(f"[temp_room] 🔵 收到字符串格式的加入房间请求 - user_id={user_id}, stripped_data={stripped_data}, 原始消息={data[:200]}, active_rooms={list(active_temp_rooms.keys())}")
-                    print(f"[temp_room] 🔵 收到字符串格式的加入房间请求 - user_id={user_id}, stripped_data={stripped_data}")
-                    await handle_join_temp_room(stripped_data)
-                    continue
-                elif stripped_data:
-                    app_logger.debug(f"[temp_room] 🔵 字符串数据不在 active_temp_rooms 中 - user_id={user_id}, stripped_data={stripped_data}, active_rooms={list(active_temp_rooms.keys())}")
-                    print(f"[temp_room] 🔵 字符串数据不在 active_temp_rooms 中 - user_id={user_id}, stripped_data={stripped_data}")
+                    # 处理字符串格式的加入房间请求
+                    stripped_data = (data or "").strip()
+                    if stripped_data and stripped_data in active_temp_rooms:
+                        app_logger.info(f"[temp_room] 🔵 收到字符串格式的加入房间请求 - user_id={user_id}, stripped_data={stripped_data}, 原始消息={data[:200]}, active_rooms={list(active_temp_rooms.keys())}")
+                        print(f"[temp_room] 🔵 收到字符串格式的加入房间请求 - user_id={user_id}, stripped_data={stripped_data}")
+                        await handle_join_temp_room(stripped_data)
+                        continue
+                    elif stripped_data:
+                        app_logger.debug(f"[temp_room] 🔵 字符串数据不在 active_temp_rooms 中 - user_id={user_id}, stripped_data={stripped_data}, active_rooms={list(active_temp_rooms.keys())}")
+                        print(f"[temp_room] 🔵 字符串数据不在 active_temp_rooms 中 - user_id={user_id}, stripped_data={stripped_data}")
+                        continue
 
-                    print(data)
+                    # 如果都不匹配，打印原始数据用于调试
+                    print(f"[websocket][{user_id}] 未处理的消息: {data[:200]}")
                 # 广播
                 for uid, conn in connections.items():
                     if uid != user_id:
