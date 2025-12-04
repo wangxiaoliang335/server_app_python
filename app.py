@@ -301,8 +301,20 @@ def upload_avatar_to_oss(avatar_bytes: bytes, object_name: str) -> Optional[str]
         auth = oss2.Auth(ALIYUN_OSS_ACCESS_KEY_ID, ALIYUN_OSS_ACCESS_KEY_SECRET)
         print(f"[upload_avatar_to_oss] 创建OSS Bucket对象...")
         bucket = oss2.Bucket(auth, ALIYUN_OSS_ENDPOINT, ALIYUN_OSS_BUCKET)
+        
+        # 设置过期时间为100年后
+        expire_time = datetime.datetime.utcnow() + datetime.timedelta(days=36500)  # 100年 = 36500天
+        expires_header = expire_time.strftime('%a, %d %b %Y %H:%M:%S GMT')
+        
+        # 设置HTTP头，包括Expires和Cache-Control
+        headers = {
+            'Expires': expires_header,
+            'Cache-Control': 'max-age=3153600000'  # 100年的秒数（约31.5亿秒）
+        }
+        
+        print(f"[upload_avatar_to_oss] 设置过期时间: {expires_header} (100年后)")
         print(f"[upload_avatar_to_oss] 开始上传文件到OSS...")
-        bucket.put_object(normalized_object_name, avatar_bytes)
+        bucket.put_object(normalized_object_name, avatar_bytes, headers=headers)
         print(f"[upload_avatar_to_oss] 文件上传成功！")
 
         if ALIYUN_OSS_BASE_URL:
@@ -5742,8 +5754,9 @@ def get_groups_by_teacher(
         
         for row in results:
             # 构建群组信息（包含成员信息）
+            group_id = row.get("group_id")
             group_info = {
-                "group_id": row.get("group_id"),
+                "group_id": group_id,
                 "group_name": row.get("group_name"),
                 "group_type": row.get("group_type"),
                 "face_url": row.get("face_url"),
@@ -5784,6 +5797,88 @@ def get_groups_by_teacher(
                     "unread_num": row.get("unread_num")
                 }
             }
+            
+            # 检查该群组是否有临时语音房间（先从内存查找，如果没有则从数据库恢复）
+            temp_room_info = None
+            if group_id:
+                # 优先从内存中查找
+                if group_id in active_temp_rooms:
+                    room_info = active_temp_rooms[group_id]
+                    temp_room_info = {
+                        "room_id": room_info.get("room_id"),
+                        "publish_url": room_info.get("publish_url"),  # 推流地址（传统 WebRTC API）
+                        "play_url": room_info.get("play_url"),  # 拉流地址（传统 WebRTC API）
+                        "stream_name": room_info.get("stream_name"),
+                        "owner_id": room_info.get("owner_id"),
+                        "owner_name": room_info.get("owner_name"),
+                        "owner_icon": room_info.get("owner_icon"),
+                        "members": room_info.get("members", [])
+                    }
+                    app_logger.info(f"[groups/by-teacher] 群组 {group_id} 有临时语音房间（内存），已添加到返回信息")
+                else:
+                    # 内存中没有，从数据库查询
+                    try:
+                        room_query = """
+                            SELECT room_id, group_id, owner_id, owner_name, owner_icon,
+                                   whip_url, whep_url, stream_name, status, create_time
+                            FROM temp_voice_rooms
+                            WHERE group_id = %s AND status = 1
+                            ORDER BY create_time DESC
+                            LIMIT 1
+                        """
+                        cursor.execute(room_query, (group_id,))
+                        room_row = cursor.fetchone()
+                        
+                        if room_row:
+                            stream_name = room_row.get("stream_name")
+                            # 从 stream_name 重新生成传统 WebRTC API 地址
+                            publish_url = f"{SRS_WEBRTC_API_URL}/rtc/v1/publish/?app={SRS_APP}&stream={stream_name}"
+                            play_url = f"{SRS_WEBRTC_API_URL}/rtc/v1/play/?app={SRS_APP}&stream={stream_name}"
+                            
+                            # 查询房间成员
+                            members_query = """
+                                SELECT user_id, user_name, status
+                                FROM temp_voice_room_members
+                                WHERE room_id = %s AND status = 1
+                            """
+                            cursor.execute(members_query, (room_row.get("room_id"),))
+                            member_rows = cursor.fetchall()
+                            members = [m.get("user_id") for m in member_rows if m.get("user_id")]
+                            
+                            temp_room_info = {
+                                "room_id": room_row.get("room_id"),
+                                "publish_url": publish_url,  # 推流地址（传统 WebRTC API）
+                                "play_url": play_url,  # 拉流地址（传统 WebRTC API）
+                                "stream_name": stream_name,
+                                "owner_id": room_row.get("owner_id"),
+                                "owner_name": room_row.get("owner_name"),
+                                "owner_icon": room_row.get("owner_icon"),
+                                "members": members
+                            }
+                            
+                            # 将房间信息恢复到内存中（可选，用于后续快速访问）
+                            active_temp_rooms[group_id] = {
+                                "room_id": room_row.get("room_id"),
+                                "publish_url": publish_url,
+                                "play_url": play_url,
+                                "whip_url": room_row.get("whip_url"),
+                                "whep_url": room_row.get("whep_url"),
+                                "stream_name": stream_name,
+                                "owner_id": room_row.get("owner_id"),
+                                "owner_name": room_row.get("owner_name"),
+                                "owner_icon": room_row.get("owner_icon"),
+                                "group_id": group_id,
+                                "timestamp": time.time(),
+                                "members": members
+                            }
+                            
+                            app_logger.info(f"[groups/by-teacher] 群组 {group_id} 有临时语音房间（数据库恢复），已添加到返回信息并恢复到内存")
+                    except Exception as db_error:
+                        app_logger.error(f"[groups/by-teacher] 从数据库查询临时语音房间失败 - group_id={group_id}, error={db_error}")
+                        # 数据库查询失败不影响主流程，继续处理
+                
+                if temp_room_info:
+                    group_info["temp_room"] = temp_room_info
             
             # 判断是否是群主：self_role = 400 表示群主
             if row.get("self_role") == 400:
@@ -9342,7 +9437,7 @@ def get_friends(id_card: str = Query(..., description="教师身份证号")):
             with connection.cursor(dictionary=True) as cursor:
                 cursor.execute("SELECT * FROM ta_teacher WHERE teacher_unique_id=%s", (friendcode,))
                 teacher_rows = cursor.fetchall()
-                app_logger.info(f"📌 Step3: ta_teacher for friendcode={friendcode} -> {teacher_rows}")
+                # app_logger.info(f"📌 Step3: ta_teacher for friendcode={friendcode} -> {teacher_rows}")
             if not teacher_rows:
                 continue
             friend_teacher = teacher_rows[0]
@@ -9352,7 +9447,7 @@ def get_friends(id_card: str = Query(..., description="教师身份证号")):
             with connection.cursor(dictionary=True) as cursor:
                 cursor.execute("SELECT * FROM ta_user_details WHERE id_number=%s", (id_number,))
                 user_rows = cursor.fetchall()
-                app_logger.info(f"📌 Step4: ta_user_details for id_number={id_number} -> {user_rows}")
+                # app_logger.info(f"📌 Step4: ta_user_details for id_number={id_number} -> {user_rows}")
             user_details = user_rows[0] if user_rows else None
 
             if user_details:
@@ -9376,7 +9471,7 @@ def get_friends(id_card: str = Query(..., description="教师身份证号")):
                 "user_details": user_details
             }
             # 打印组合后的数据
-            app_logger.info(f"📌 Step5: combined record -> {combined}")
+            # app_logger.info(f"📌 Step5: combined record -> {combined}")
             results.append({
                 "teacher_info": friend_teacher,
                 "user_details": user_details
@@ -9690,20 +9785,22 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     # 数据库查询失败不影响房间创建，继续使用传入的值
 
                 # 生成唯一的房间ID和流名称
-                # 注意：客户端当前使用传统 SRS WebRTC API（/rtc/v1/publish/ 和 /rtc/v1/play/）
-                # 这些字段（room_id, stream_name）是客户端构建传统 API URL 所需的
+                # 客户端使用传统 SRS WebRTC API（/rtc/v1/publish/ 和 /rtc/v1/play/）
                 room_id = str(uuid.uuid4())
                 stream_name = f"room_{group_id}_{int(time.time())}"
                 
-                # 自动生成 WHIP（推流）和 WHEP（拉流）URL
-                # 注意：客户端当前不使用这些 URL，但保留用于向后兼容
-                # WHIP: WebRTC-HTTP Ingestion Protocol (推流)
+                # 生成传统 WebRTC API 地址（推流和拉流）
+                # 推流地址：/rtc/v1/publish/
+                publish_url = f"{SRS_WEBRTC_API_URL}/rtc/v1/publish/?app={SRS_APP}&stream={stream_name}"
+                # 拉流地址：/rtc/v1/play/
+                play_url = f"{SRS_WEBRTC_API_URL}/rtc/v1/play/?app={SRS_APP}&stream={stream_name}"
+                
+                # 保留 WHIP/WHEP 地址用于向后兼容（但客户端主要使用上面的传统地址）
                 whip_url = f"{SRS_BASE_URL}/rtc/v1/whip/?app={SRS_APP}&stream={stream_name}"
-                # WHEP: WebRTC-HTTP Egress Protocol (拉流)
                 whep_url = f"{SRS_BASE_URL}/rtc/v1/whep/?app={SRS_APP}&stream={stream_name}"
                 
-                app_logger.info(f"[temp_room] 生成流地址 - room_id={room_id}, stream_name={stream_name}, whip_url={whip_url}, whep_url={whep_url}")
-                print(f"[temp_room] 生成流地址 - room_id={room_id}, stream_name={stream_name}")
+                app_logger.info(f"[temp_room] 生成流地址 - room_id={room_id}, stream_name={stream_name}, publish_url={publish_url}, play_url={play_url}")
+                print(f"[temp_room] 生成流地址 - room_id={room_id}, stream_name={stream_name}, publish_url={publish_url}, play_url={play_url}")
 
                 online_users: List[str] = []
                 offline_users: List[str] = []
@@ -9722,8 +9819,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                     "owner_id": owner_id,
                                     "owner_name": owner_name,
                                     "owner_icon": owner_icon,
-                                    "whip_url": whip_url,  # 推流地址（WHIP）
-                                    "whep_url": whep_url,  # 拉流地址（WHEP）
+                                    "publish_url": publish_url,  # 推流地址（传统 WebRTC API）
+                                    "play_url": play_url,  # 拉流地址（传统 WebRTC API）
                                     "stream_name": stream_name,  # 流名称
                                     "group_id": group_id,
                                     "message": f"{owner_name or '群主'}邀请你加入临时房间"
@@ -9748,8 +9845,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     "owner_id": owner_id,
                     "owner_name": owner_name,
                     "owner_icon": owner_icon,
-                    "whip_url": whip_url,  # 推流地址（WHIP）
-                    "whep_url": whep_url,  # 拉流地址（WHEP）
+                    "publish_url": publish_url,  # 推流地址（传统 WebRTC API）
+                    "play_url": play_url,  # 拉流地址（传统 WebRTC API）
+                    "whip_url": whip_url,  # WHIP 地址（向后兼容）
+                    "whep_url": whep_url,  # WHEP 地址（向后兼容）
                     "stream_name": stream_name,  # 流名称
                     "group_id": group_id,
                     "timestamp": time.time(),
@@ -9810,8 +9909,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 create_room_response = {
                     "type": "6",
                     "room_id": room_id,
-                    "whip_url": whip_url,  # 推流地址（WHIP）- 创建者使用
-                    "whep_url": whep_url,  # 拉流地址（WHEP）- 创建者也可以拉流
+                    "publish_url": publish_url,  # 推流地址（传统 WebRTC API）- 创建者使用
+                    "play_url": play_url,  # 拉流地址（传统 WebRTC API）- 创建者也可以拉流
                     "stream_name": stream_name,  # 流名称
                     "group_id": group_id,  # 添加 group_id 字段，客户端需要使用
                     "status": "success",
@@ -9904,7 +10003,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     app_logger.error(f"[temp_room] 添加成员到房间列表失败 - user_id={user_id}, group_id={group_key}, error={member_error}")
                     # 即使添加成员失败，也继续返回房间信息
                 
-                # 返回房间信息，包含 WHEP 拉流地址
+                # 返回房间信息，包含推流和拉流地址
                 # 如果用户已经在房间中，仍然返回房间信息（可能是客户端重试）
                 join_room_response = {
                     "type": "6",
@@ -9912,8 +10011,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     "owner_id": room_info.get("owner_id", ""),
                     "owner_name": room_info.get("owner_name", ""),
                     "owner_icon": room_info.get("owner_icon", ""),
-                    "whip_url": room_info.get("whip_url", ""),  # 推流地址（WHIP）
-                    "whep_url": room_info.get("whep_url", ""),  # 拉流地址（WHEP）
+                    "publish_url": room_info.get("publish_url", ""),  # 推流地址（传统 WebRTC API）
+                    "play_url": room_info.get("play_url", ""),  # 拉流地址（传统 WebRTC API）
                     "stream_name": room_info.get("stream_name", ""),  # 流名称
                     "group_id": group_key,
                     "members": room_info.get("members", []),
@@ -10348,7 +10447,6 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         elif msg_data1['type'] == "3": 
                             print(" 创建群")   
                             cursor = connection.cursor(dictionary=True)
-                            unique_group_id = str(uuid.uuid4())
                             
                             # 获取当前时间
                             current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -10367,6 +10465,20 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             is_class_group = msg_data1.get('is_class_group')
                             if is_class_group is None:
                                 is_class_group = 1 if classid else 0
+                            
+                            # 生成群ID：优先使用客户端传过来的，如果没有则使用班级ID+01，否则使用UUID
+                            unique_group_id = msg_data1.get('group_id')
+                            if not unique_group_id:
+                                if classid:
+                                    # 班级群：使用班级ID + "01"
+                                    unique_group_id = str(classid) + "01"
+                                    print(f"[创建群] 使用班级ID生成群ID: {unique_group_id}")
+                                else:
+                                    # 非班级群：使用UUID
+                                    unique_group_id = str(uuid.uuid4())
+                                    print(f"[创建群] 使用UUID生成群ID: {unique_group_id}")
+                            else:
+                                print(f"[创建群] 使用客户端传入的群ID: {unique_group_id}")
                             
                             # 插入 groups 表
                             insert_group_sql = """
@@ -10473,6 +10585,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                     )
                                     
                                     print(f"[创建群] 插入群主 - group_id={unique_group_id}, user_id={member_user_id}, user_name={member_user_name}, self_role={member_self_role}")
+                                    app_logger.info(f"[创建群] 插入群主 - group_id={unique_group_id}, user_id={member_user_id}, user_name={member_user_name}, self_role={member_self_role}")
                                     cursor.execute(insert_member_sql, insert_member_params)
                                     processed_member_ids.add(member_user_id)
                                 else:
@@ -10569,6 +10682,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                     )
                                     
                                     print(f"[创建群] 插入成员 - group_id={unique_group_id}, user_id={member_user_id}, user_name={member_user_name}, self_role={self_role}")
+                                    app_logger.info(f"[创建群] 插入成员 - group_id={unique_group_id}, user_id={member_user_id}, user_name={member_user_name}, self_role={self_role}")
                                     cursor.execute(insert_member_sql, insert_member_params)
                                     processed_member_ids.add(member_user_id)
 
@@ -10716,7 +10830,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                         room_id = str(uuid.uuid4())
                                         stream_name = f"room_{unique_group_id}_{int(time.time())}"
                                         
-                                        # 自动生成 WHIP（推流）和 WHEP（拉流）URL
+                                        # 生成传统 WebRTC API 地址（推流和拉流）
+                                        publish_url = f"{SRS_WEBRTC_API_URL}/rtc/v1/publish/?app={SRS_APP}&stream={stream_name}"
+                                        play_url = f"{SRS_WEBRTC_API_URL}/rtc/v1/play/?app={SRS_APP}&stream={stream_name}"
+                                        
+                                        # 保留 WHIP/WHEP 地址用于向后兼容
                                         whip_url = f"{SRS_BASE_URL}/rtc/v1/whip/?app={SRS_APP}&stream={stream_name}"
                                         whep_url = f"{SRS_BASE_URL}/rtc/v1/whep/?app={SRS_APP}&stream={stream_name}"
                                         
@@ -10726,8 +10844,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                             "owner_id": owner_id,
                                             "owner_name": owner_name,
                                             "owner_icon": owner_icon,
-                                            "whip_url": whip_url,
-                                            "whep_url": whep_url,
+                                            "publish_url": publish_url,  # 推流地址（传统 WebRTC API）
+                                            "play_url": play_url,  # 拉流地址（传统 WebRTC API）
+                                            "whip_url": whip_url,  # WHIP 地址（向后兼容）
+                                            "whep_url": whep_url,  # WHEP 地址（向后兼容）
                                             "stream_name": stream_name,
                                             "group_id": unique_group_id,
                                             "timestamp": time.time(),
@@ -10783,8 +10903,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                         
                                         temp_room_info = {
                                             "room_id": room_id,
-                                            "whip_url": whip_url,
-                                            "whep_url": whep_url,
+                                            "publish_url": publish_url,  # 推流地址（传统 WebRTC API）
+                                            "play_url": play_url,  # 拉流地址（传统 WebRTC API）
                                             "stream_name": stream_name,
                                             "group_id": unique_group_id,
                                             "owner_id": owner_id,
@@ -10803,8 +10923,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                     existing_room = active_temp_rooms[unique_group_id]
                                     temp_room_info = {
                                         "room_id": existing_room.get("room_id"),
-                                        "whip_url": existing_room.get("whip_url"),
-                                        "whep_url": existing_room.get("whep_url"),
+                                        "publish_url": existing_room.get("publish_url"),  # 推流地址（传统 WebRTC API）
+                                        "play_url": existing_room.get("play_url"),  # 拉流地址（传统 WebRTC API）
                                         "stream_name": existing_room.get("stream_name"),
                                         "group_id": unique_group_id,
                                         "owner_id": existing_room.get("owner_id"),
