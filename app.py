@@ -10468,6 +10468,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             
                             # 生成群ID：优先使用客户端传过来的，如果没有则使用班级ID+01，否则使用UUID
                             unique_group_id = msg_data1.get('group_id')
+                            print(f"[创建群] 收到客户端传入的 group_id={unique_group_id}, classid={classid}")
+                            app_logger.info(f"[创建群] 收到客户端传入的 group_id={unique_group_id}, classid={classid}")
                             if not unique_group_id:
                                 if classid:
                                     # 班级群：使用班级ID + "01"
