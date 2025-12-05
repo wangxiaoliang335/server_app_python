@@ -97,6 +97,9 @@ async def lifespan(app: FastAPI):
     global stop_event
     stop_event.clear()
 
+    # 启动时从数据库加载仍然活跃的临时语音房间
+    load_active_temp_rooms_from_db()
+
     # 启动心跳检测任务
     hb_task = asyncio.create_task(heartbeat_checker())
     print("🚀 应用启动，心跳检测已启动")
@@ -117,6 +120,89 @@ app = FastAPI(lifespan=lifespan)
 # 本机维护的客户端连接表
 connections: Dict[str, Dict] = {}  # {user_id: {"ws": WebSocket, "last_heartbeat": timestamp}}
 active_temp_rooms: Dict[str, Dict[str, Any]] = {}  # {group_id: {...room info...}}
+
+
+def load_active_temp_rooms_from_db() -> None:
+    """
+    应用启动时，从数据库加载仍然处于活跃状态的临时语音房间到内存 active_temp_rooms。
+    防止程序重启后丢失房间信息。
+    """
+    try:
+        connection = get_db_connection()
+        if connection is None or not connection.is_connected():
+            print("[temp_room][startup] 数据库连接失败，无法从数据库加载临时语音房间")
+            app_logger.error("[temp_room][startup] 数据库连接失败，无法从数据库加载临时语音房间")
+            return
+
+        cursor = connection.cursor(dictionary=True)
+
+        # 查询所有状态为活跃的临时语音房间
+        query_rooms = """
+            SELECT room_id, group_id, owner_id, owner_name, owner_icon,
+                   whip_url, whep_url, stream_name, status, create_time
+            FROM temp_voice_rooms
+            WHERE status = 1
+        """
+        cursor.execute(query_rooms)
+        rooms = cursor.fetchall() or []
+
+        if not rooms:
+            print("[temp_room][startup] 数据库中没有状态为活跃的临时语音房间")
+            app_logger.info("[temp_room][startup] 数据库中没有状态为活跃的临时语音房间")
+            return
+
+        loaded_count = 0
+        for room in rooms:
+            group_id = room.get("group_id")
+            room_id = room.get("room_id")
+            stream_name = room.get("stream_name")
+            if not group_id or not room_id or not stream_name:
+                continue
+
+            # 根据 stream_name 重新生成传统 WebRTC 推流/拉流地址
+            publish_url = f"{SRS_WEBRTC_API_URL}/rtc/v1/publish/?app={SRS_APP}&stream={stream_name}"
+            play_url = f"{SRS_WEBRTC_API_URL}/rtc/v1/play/?app={SRS_APP}&stream={stream_name}"
+
+            # 查询房间成员
+            members_query = """
+                SELECT user_id, user_name, status
+                FROM temp_voice_room_members
+                WHERE room_id = %s AND status = 1
+            """
+            cursor.execute(members_query, (room_id,))
+            member_rows = cursor.fetchall() or []
+            members = [m.get("user_id") for m in member_rows if m.get("user_id")]
+
+            active_temp_rooms[group_id] = {
+                "room_id": room_id,
+                "publish_url": publish_url,
+                "play_url": play_url,
+                "whip_url": room.get("whip_url"),
+                "whep_url": room.get("whep_url"),
+                "stream_name": stream_name,
+                "owner_id": room.get("owner_id"),
+                "owner_name": room.get("owner_name"),
+                "owner_icon": room.get("owner_icon"),
+                "group_id": group_id,
+                "timestamp": time.time(),
+                "members": members,
+            }
+            loaded_count += 1
+
+        print(f"[temp_room][startup] 已从数据库加载 {loaded_count} 个临时语音房间到内存")
+        app_logger.info(f"[temp_room][startup] 已从数据库加载 {loaded_count} 个临时语音房间到内存")
+
+    except Exception as e:
+        print(f"[temp_room][startup] 从数据库加载临时语音房间失败: {e}")
+        app_logger.error(f"[temp_room][startup] 从数据库加载临时语音房间失败: {e}", exc_info=True)
+    finally:
+        try:
+            if 'cursor' in locals() and cursor:
+                cursor.close()
+            if 'connection' in locals() and connection and connection.is_connected():
+                connection.close()
+        except Exception:
+            pass
 
 
 async def notify_temp_room_closed(group_id: str, room_info: Dict[str, Any], reason: str, initiator: str):
@@ -8386,7 +8472,8 @@ def get_group_members_by_group_id(
                 gm.msg_flag,
                 gm.self_msg_flag,
                 gm.readed_seq,
-                gm.unread_num
+                gm.unread_num,
+                gm.is_voice_enabled
             FROM `group_members` gm
             WHERE gm.group_id = %s
             ORDER BY gm.join_time ASC
@@ -11462,23 +11549,13 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             print(f"用户 {user_id} 离线（外层捕获），当前在线={len(connections)}，详情: {exc}")
         
         # 清理用户从所有临时房间的成员列表中移除
+        # 注意：不再因为 WebSocket 断开而自动解散房间，只移除成员，房间是否解散由业务消息控制（如 temp_room_owner_leave）
         for group_id, room_info in list(active_temp_rooms.items()):
             members = room_info.get("members", [])
-            owner_id = room_info.get("owner_id")
             if user_id in members:
                 members.remove(user_id)
                 app_logger.info(f"[webrtc] 用户 {user_id} 离开房间 {group_id}，当前成员数={len(members)}")
                 print(f"[webrtc] 用户 {user_id} 离开房间 {group_id}，当前成员数={len(members)}")
-                # 如果离开的用户是创建者，则解散房间并通知所有成员停止推拉流
-                if user_id == owner_id:
-                    await notify_temp_room_closed(group_id, room_info, "owner_left", user_id)
-                    active_temp_rooms.pop(group_id, None)
-                    app_logger.info(f"[webrtc] 创建者 {user_id} 离开房间 {group_id}，房间已解散")
-                    print(f"[webrtc] 创建者 {user_id} 离开房间 {group_id}，房间已解散")
-                # 如果房间没有成员了，也可以清理房间
-                elif len(members) == 0:
-                    active_temp_rooms.pop(group_id, None)
-                    print(f"[webrtc] 房间 {group_id} 已清空，已移除")
         
         if connection:
             connection.rollback()
@@ -11511,22 +11588,12 @@ async def heartbeat_checker():
             for uid in to_remove:
                 connections.pop(uid, None)  # 安全移除
                 # 清理用户从所有临时房间的成员列表中移除
+                # 注意：不再因为心跳超时自动解散房间，只移除成员，房间是否解散由业务消息控制（如 temp_room_owner_leave）
                 for group_id, room_info in list(active_temp_rooms.items()):
                     members = room_info.get("members", [])
-                    owner_id = room_info.get("owner_id")
                     if uid in members:
                         members.remove(uid)
                         print(f"[webrtc] 心跳超时：用户 {uid} 离开房间 {group_id}，当前成员数={len(members)}")
-                        # 如果离开的用户是创建者，则解散房间并通知所有成员停止推拉流
-                        if uid == owner_id:
-                            await notify_temp_room_closed(group_id, room_info, "owner_heartbeat_timeout", uid)
-                            active_temp_rooms.pop(group_id, None)
-                            app_logger.info(f"[webrtc] 心跳超时：创建者 {uid} 离开房间 {group_id}，房间已解散")
-                            print(f"[webrtc] 心跳超时：创建者 {uid} 离开房间 {group_id}，房间已解散")
-                        # 如果房间没有成员了，也可以清理房间
-                        elif len(members) == 0:
-                            active_temp_rooms.pop(group_id, None)
-                            print(f"[webrtc] 心跳超时：房间 {group_id} 已清空，已移除")
             await asyncio.sleep(10)
     except asyncio.CancelledError:
         print("heartbeat_checker 已安全退出")
