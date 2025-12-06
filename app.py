@@ -422,6 +422,88 @@ def upload_avatar_to_oss(avatar_bytes: bytes, object_name: str) -> Optional[str]
         return None
 
 
+def upload_excel_to_oss(excel_bytes: bytes, object_name: str) -> Optional[str]:
+    """
+    上传Excel文件到阿里云 OSS，返回可访问的 URL。
+    """
+    print(f"[upload_excel_to_oss] 开始上传Excel文件到OSS")
+    print(f"[upload_excel_to_oss] object_name: {object_name}")
+    print(f"[upload_excel_to_oss] excel_bytes大小: {len(excel_bytes) if excel_bytes else 0} bytes")
+    
+    if not excel_bytes:
+        error_msg = "upload_excel_to_oss: excel_bytes 为空"
+        app_logger.error(error_msg)
+        print(f"[upload_excel_to_oss] 错误: {error_msg}")
+        return None
+
+    print(f"[upload_excel_to_oss] 检查oss2模块... oss2={oss2}")
+    if oss2 is None:
+        error_msg = "upload_excel_to_oss: oss2 模块未安装，无法上传到 OSS"
+        app_logger.error(error_msg)
+        print(f"[upload_excel_to_oss] 错误: {error_msg}")
+        return None
+
+    print(f"[upload_excel_to_oss] 检查OSS配置...")
+    print(f"[upload_excel_to_oss]   ALIYUN_OSS_ENDPOINT: {ALIYUN_OSS_ENDPOINT}")
+    print(f"[upload_excel_to_oss]   ALIYUN_OSS_BUCKET: {ALIYUN_OSS_BUCKET}")
+    print(f"[upload_excel_to_oss]   ALIYUN_OSS_ACCESS_KEY_ID: {'已设置' if ALIYUN_OSS_ACCESS_KEY_ID else '未设置'}")
+    print(f"[upload_excel_to_oss]   ALIYUN_OSS_ACCESS_KEY_SECRET: {'已设置' if ALIYUN_OSS_ACCESS_KEY_SECRET else '未设置'}")
+    print(f"[upload_excel_to_oss]   ALIYUN_OSS_BASE_URL: {ALIYUN_OSS_BASE_URL}")
+    
+    if not all([ALIYUN_OSS_ENDPOINT, ALIYUN_OSS_BUCKET, ALIYUN_OSS_ACCESS_KEY_ID, ALIYUN_OSS_ACCESS_KEY_SECRET]):
+        error_msg = "upload_excel_to_oss: OSS 配置缺失，请检查环境变量"
+        app_logger.error(error_msg)
+        print(f"[upload_excel_to_oss] 错误: {error_msg}")
+        print(f"[upload_excel_to_oss] 配置检查结果:")
+        print(f"[upload_excel_to_oss]   - ALIYUN_OSS_ENDPOINT存在: {bool(ALIYUN_OSS_ENDPOINT)}")
+        print(f"[upload_excel_to_oss]   - ALIYUN_OSS_BUCKET存在: {bool(ALIYUN_OSS_BUCKET)}")
+        print(f"[upload_excel_to_oss]   - ALIYUN_OSS_ACCESS_KEY_ID存在: {bool(ALIYUN_OSS_ACCESS_KEY_ID)}")
+        print(f"[upload_excel_to_oss]   - ALIYUN_OSS_ACCESS_KEY_SECRET存在: {bool(ALIYUN_OSS_ACCESS_KEY_SECRET)}")
+        return None
+
+    normalized_object_name = object_name.lstrip("/")
+    print(f"[upload_excel_to_oss] 标准化对象名称: {normalized_object_name}")
+
+    try:
+        print(f"[upload_excel_to_oss] 创建OSS认证对象...")
+        auth = oss2.Auth(ALIYUN_OSS_ACCESS_KEY_ID, ALIYUN_OSS_ACCESS_KEY_SECRET)
+        print(f"[upload_excel_to_oss] 创建OSS Bucket对象...")
+        bucket = oss2.Bucket(auth, ALIYUN_OSS_ENDPOINT, ALIYUN_OSS_BUCKET)
+        
+        # 设置过期时间为100年后
+        expire_time = datetime.datetime.utcnow() + datetime.timedelta(days=36500)  # 100年 = 36500天
+        expires_header = expire_time.strftime('%a, %d %b %Y %H:%M:%S GMT')
+        
+        # 设置HTTP头，包括Expires和Cache-Control
+        headers = {
+            'Expires': expires_header,
+            'Cache-Control': 'max-age=3153600000'  # 100年的秒数（约31.5亿秒）
+        }
+        
+        print(f"[upload_excel_to_oss] 设置过期时间: {expires_header} (100年后)")
+        print(f"[upload_excel_to_oss] 开始上传文件到OSS...")
+        bucket.put_object(normalized_object_name, excel_bytes, headers=headers)
+        print(f"[upload_excel_to_oss] 文件上传成功！")
+
+        if ALIYUN_OSS_BASE_URL:
+            base = ALIYUN_OSS_BASE_URL.rstrip("/")
+            url = f"{base}/{normalized_object_name}"
+            print(f"[upload_excel_to_oss] 使用自定义BASE_URL生成URL: {url}")
+            return url
+
+        endpoint_host = ALIYUN_OSS_ENDPOINT.replace("https://", "").replace("http://", "").strip("/")
+        url = f"https://{ALIYUN_OSS_BUCKET}.{endpoint_host}/{normalized_object_name}"
+        print(f"[upload_excel_to_oss] 使用默认格式生成URL: {url}")
+        return url
+    except Exception as exc:
+        error_msg = f"upload_excel_to_oss: 上传失败 object={normalized_object_name}, error={exc}"
+        app_logger.error(error_msg)
+        print(f"[upload_excel_to_oss] 异常: {error_msg}")
+        print(f"[upload_excel_to_oss] 异常类型: {type(exc).__name__}")
+        print(f"[upload_excel_to_oss] 异常堆栈:\n{traceback.format_exc()}")
+        return None
+
+
 def save_avatar_locally(avatar_bytes: bytes, object_name: str) -> Optional[str]:
     """
     OSS 上传失败时，将头像保存到本地 IMAGE_DIR/avatars 下，返回相对路径。
@@ -2111,7 +2193,8 @@ def save_student_scores(
     exam_name: str,
     term: Optional[str] = None,
     remark: Optional[str] = None,
-    scores: List[Dict] = None
+    scores: List[Dict] = None,
+    excel_file_url: Optional[str] = None
 ) -> Dict[str, object]:
     """
     保存学生成绩表
@@ -2120,6 +2203,7 @@ def save_student_scores(
     - exam_name: 考试名称（必需，如"期中考试"、"期末考试"）
     - term: 学期（可选，如 '2025-2026-1'）
     - remark: 备注（可选）
+    - excel_file_url: Excel文件在OSS的URL（可选）
     - scores: 成绩明细列表，每个元素包含:
       {
         'student_id': str,      # 学号（可选）
@@ -2139,93 +2223,298 @@ def save_student_scores(
     if not scores or not isinstance(scores, list):
         return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '成绩明细列表不能为空' }
 
+    print(f"[save_student_scores] 开始保存成绩 - class_id={class_id}, exam_name={exam_name}, term={term}, scores数量={len(scores) if scores else 0}")
+    app_logger.info(f"[save_student_scores] 开始保存成绩 - class_id={class_id}, exam_name={exam_name}, term={term}, scores数量={len(scores) if scores else 0}")
+    
     connection = get_db_connection()
     if connection is None:
-        app_logger.error("Save student scores failed: Database connection error.")
+        error_msg = "Save student scores failed: Database connection error."
+        print(f"[save_student_scores] 错误: {error_msg}")
+        app_logger.error(error_msg)
         return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '数据库连接失败' }
 
+    print(f"[save_student_scores] 数据库连接成功，开始事务")
+    app_logger.info(f"[save_student_scores] 数据库连接成功，开始事务")
     try:
         connection.start_transaction()
         cursor = connection.cursor(dictionary=True)
 
         # 1. 插入或获取成绩表头
+        print(f"[save_student_scores] 查询成绩表头 - class_id={class_id}, exam_name={exam_name}, term={term}")
+        app_logger.info(f"[save_student_scores] 查询成绩表头 - class_id={class_id}, exam_name={exam_name}, term={term}")
         cursor.execute(
             "SELECT id FROM ta_student_score_header WHERE class_id = %s AND exam_name = %s AND (%s IS NULL OR term = %s) LIMIT 1",
             (class_id, exam_name, term, term)
         )
         header_row = cursor.fetchone()
+        print(f"[save_student_scores] 查询成绩表头结果: {header_row}")
+        app_logger.info(f"[save_student_scores] 查询成绩表头结果: {header_row}")
 
         if header_row is None:
             # 插入新表头
+            print(f"[save_student_scores] 插入新成绩表头 - class_id={class_id}, exam_name={exam_name}, term={term}, remark={remark}, excel_file_url={excel_file_url}")
+            app_logger.info(f"[save_student_scores] 插入新成绩表头 - class_id={class_id}, exam_name={exam_name}, term={term}, remark={remark}, excel_file_url={excel_file_url}")
             insert_header_sql = (
-                "INSERT INTO ta_student_score_header (class_id, exam_name, term, remark, created_at) "
-                "VALUES (%s, %s, %s, %s, NOW())"
+                "INSERT INTO ta_student_score_header (class_id, exam_name, term, remark, excel_file_url, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, NOW())"
             )
-            cursor.execute(insert_header_sql, (class_id, exam_name, term, remark))
+            cursor.execute(insert_header_sql, (class_id, exam_name, term, remark, excel_file_url))
             score_header_id = cursor.lastrowid
+            print(f"[save_student_scores] 插入成绩表头成功 - score_header_id={score_header_id}")
+            app_logger.info(f"[save_student_scores] 插入成绩表头成功 - score_header_id={score_header_id}")
         else:
             score_header_id = header_row['id']
+            print(f"[save_student_scores] 成绩表头已存在 - score_header_id={score_header_id}")
+            app_logger.info(f"[save_student_scores] 成绩表头已存在 - score_header_id={score_header_id}")
             # 更新表头信息（若存在）
+            update_fields = []
+            update_values = []
             if remark is not None:
-                cursor.execute(
-                    "UPDATE ta_student_score_header SET remark = %s, updated_at = NOW() WHERE id = %s",
-                    (remark, score_header_id)
-                )
-            # 删除旧的成绩明细（重新上传时覆盖）
-            cursor.execute("DELETE FROM ta_student_score_detail WHERE score_header_id = %s", (score_header_id,))
+                update_fields.append("remark = %s")
+                update_values.append(remark)
+            if excel_file_url is not None:
+                update_fields.append("excel_file_url = %s")
+                update_values.append(excel_file_url)
+            if update_fields:
+                update_values.append(score_header_id)
+                update_sql = f"UPDATE ta_student_score_header SET {', '.join(update_fields)}, updated_at = NOW() WHERE id = %s"
+                print(f"[save_student_scores] 更新成绩表头 - score_header_id={score_header_id}, 更新字段: {', '.join(update_fields)}")
+                app_logger.info(f"[save_student_scores] 更新成绩表头 - score_header_id={score_header_id}, 更新字段: {', '.join(update_fields)}")
+                cursor.execute(update_sql, tuple(update_values))
+            # 不删除旧的成绩明细和字段定义，而是追加新的数据
+            print(f"[save_student_scores] 表头已存在，将追加新的字段定义和成绩明细 - score_header_id={score_header_id}")
+            app_logger.info(f"[save_student_scores] 表头已存在，将追加新的字段定义和成绩明细 - score_header_id={score_header_id}")
 
-        # 2. 批量插入成绩明细
+        # 2. 打印scores数据用于调试
+        print(f"[save_student_scores] ========== 收到scores数据 ==========")
+        print(f"[save_student_scores] scores数量: {len(scores)}")
+        for idx, score_item in enumerate(scores):
+            print(f"[save_student_scores] 第{idx+1}条: {json.dumps(score_item, ensure_ascii=False)}")
+        print(f"[save_student_scores] =====================================")
+        app_logger.info(f"[save_student_scores] 收到scores数据: {json.dumps(scores, ensure_ascii=False, indent=2)}")
+        
+        # 3. 从scores数据中提取所有字段名（除了student_id和student_name）
+        print(f"[save_student_scores] 开始提取字段定义 - score_header_id={score_header_id}, 待处理数量={len(scores)}")
+        app_logger.info(f"[save_student_scores] 开始提取字段定义 - score_header_id={score_header_id}, 待处理数量={len(scores)}")
+        
+        # 收集所有出现的字段名
+        field_set = set()
+        for score_item in scores:
+            for key in score_item.keys():
+                if key not in ['student_id', 'student_name']:
+                    field_set.add(key)
+        
+        field_list = sorted(list(field_set))  # 排序以保证一致性
+        print(f"[save_student_scores] 提取到的字段: {field_list}")
+        app_logger.info(f"[save_student_scores] 提取到的字段: {field_list}")
+        
+        # 4. 查询现有字段定义，获取最大field_order
+        cursor.execute(
+            "SELECT MAX(field_order) as max_order FROM ta_student_score_field WHERE score_header_id = %s",
+            (score_header_id,)
+        )
+        max_order_result = cursor.fetchone()
+        max_order = max_order_result['max_order'] if max_order_result and max_order_result['max_order'] is not None else 0
+        print(f"[save_student_scores] 现有字段最大顺序: {max_order}")
+        app_logger.info(f"[save_student_scores] 现有字段最大顺序: {max_order}")
+        
+        # 5. 保存字段定义到ta_student_score_field表（追加，不删除旧的）
+        if field_list:
+            insert_field_sql = (
+                "INSERT INTO ta_student_score_field "
+                "(score_header_id, field_name, field_type, field_order, is_total) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE field_name = field_name"  # 如果字段已存在，不更新
+            )
+            new_field_count = 0
+            for idx, field_name in enumerate(field_list):
+                # 检查字段是否已存在
+                cursor.execute(
+                    "SELECT id FROM ta_student_score_field WHERE score_header_id = %s AND field_name = %s",
+                    (score_header_id, field_name)
+                )
+                existing_field = cursor.fetchone()
+                
+                if not existing_field:
+                    # 字段不存在，插入新字段
+                    is_total = 1 if '总分' in field_name or 'total' in field_name.lower() else 0
+                    cursor.execute(insert_field_sql, (
+                        score_header_id,
+                        field_name,
+                        'number',  # 默认为数字类型
+                        max_order + idx + 1,   # 字段顺序（追加到现有字段后面）
+                        is_total
+                    ))
+                    new_field_count += 1
+                    print(f"[save_student_scores] 新增字段: {field_name} (顺序: {max_order + idx + 1})")
+                    app_logger.info(f"[save_student_scores] 新增字段: {field_name} (顺序: {max_order + idx + 1})")
+                else:
+                    print(f"[save_student_scores] 字段已存在，跳过: {field_name}")
+                    app_logger.info(f"[save_student_scores] 字段已存在，跳过: {field_name}")
+            
+            print(f"[save_student_scores] 字段定义保存完成 - 新增{new_field_count}个字段，跳过{len(field_list) - new_field_count}个已存在字段")
+            app_logger.info(f"[save_student_scores] 字段定义保存完成 - 新增{new_field_count}个字段，跳过{len(field_list) - new_field_count}个已存在字段")
+
+        # 6. 批量插入或更新成绩明细（使用JSON格式存储动态字段）
+        print(f"[save_student_scores] 开始插入/更新成绩明细 - score_header_id={score_header_id}, 待处理数量={len(scores)}")
+        app_logger.info(f"[save_student_scores] 开始插入/更新成绩明细 - score_header_id={score_header_id}, 待处理数量={len(scores)}")
+        
+        # 使用 INSERT ... ON DUPLICATE KEY UPDATE 来支持插入或更新
+        # 注意：需要根据student_id和student_name来判断是否已存在
         insert_detail_sql = (
             "INSERT INTO ta_student_score_detail "
-            "(score_header_id, student_id, student_name, chinese, math, english, total_score) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            "(score_header_id, student_id, student_name, scores_json, total_score) "
+            "VALUES (%s, %s, %s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE "
+            "scores_json = VALUES(scores_json), "
+            "total_score = VALUES(total_score), "
+            "updated_at = NOW()"
         )
         
         inserted_count = 0
-        for score_item in scores:
+        updated_count = 0
+        skipped_count = 0
+        
+        for idx, score_item in enumerate(scores):
             student_id = score_item.get('student_id')
             student_name = score_item.get('student_name', '').strip()
             if not student_name:
+                skipped_count += 1
+                print(f"[save_student_scores] 跳过第{idx+1}条记录：缺少学生姓名 - score_item={score_item}")
+                app_logger.warning(f"[save_student_scores] 跳过第{idx+1}条记录：缺少学生姓名 - score_item={score_item}")
                 continue  # 跳过没有姓名的记录
             
-            chinese = score_item.get('chinese')
-            math = score_item.get('math')
-            english = score_item.get('english')
+            # 检查该学生是否已有成绩记录
+            check_sql = (
+                "SELECT id, scores_json FROM ta_student_score_detail "
+                "WHERE score_header_id = %s AND student_name = %s "
+                "AND (%s IS NULL OR student_id = %s) "
+                "LIMIT 1"
+            )
+            cursor.execute(check_sql, (score_header_id, student_name, student_id, student_id))
+            existing_record = cursor.fetchone()
             
-            # 计算总分（如果未提供或需要重新计算）
-            total_score = score_item.get('total_score')
+            # 构建JSON对象（包含除student_id和student_name外的所有字段）
+            scores_json = {}
+            total_score = None
+            for key, value in score_item.items():
+                if key not in ['student_id', 'student_name']:
+                    if value is not None:
+                        # 尝试转换为数字
+                        try:
+                            if isinstance(value, (int, float)):
+                                scores_json[key] = float(value)
+                            elif isinstance(value, str) and value.strip():
+                                # 尝试解析为数字
+                                scores_json[key] = float(value.strip())
+                            else:
+                                scores_json[key] = value
+                        except (ValueError, TypeError):
+                            scores_json[key] = value
+                    
+                    # 检查是否为总分字段
+                    if ('总分' in key or 'total' in key.lower()) and value is not None:
+                        try:
+                            total_score = float(value)
+                        except (ValueError, TypeError):
+                            pass
+            
+            # 如果记录已存在，合并JSON数据（保留旧字段，添加新字段）
+            if existing_record and existing_record.get('scores_json'):
+                try:
+                    existing_json = json.loads(existing_record['scores_json']) if isinstance(existing_record['scores_json'], str) else existing_record['scores_json']
+                    # 合并JSON：新字段覆盖旧字段，保留旧字段中没有的字段
+                    merged_json = {**existing_json, **scores_json}
+                    scores_json = merged_json
+                    print(f"[save_student_scores] 合并已有成绩数据 - student_name={student_name}, 旧字段数={len(existing_json)}, 新字段数={len(scores_json)}")
+                    app_logger.info(f"[save_student_scores] 合并已有成绩数据 - student_name={student_name}")
+                except (json.JSONDecodeError, TypeError) as e:
+                    print(f"[save_student_scores] 解析已有JSON失败，使用新数据 - student_name={student_name}, error={e}")
+                    app_logger.warning(f"[save_student_scores] 解析已有JSON失败，使用新数据 - student_name={student_name}, error={e}")
+            
+            # 如果没有找到总分字段，自动计算总分（所有数字字段的和）
             if total_score is None:
-                # 自动计算总分（只计算提供的科目）
                 total_score = 0.0
-                if chinese is not None:
-                    total_score += float(chinese)
-                if math is not None:
-                    total_score += float(math)
-                if english is not None:
-                    total_score += float(english)
+                for key, value in scores_json.items():
+                    if isinstance(value, (int, float)):
+                        total_score += float(value)
+                if total_score == 0.0:
+                    total_score = None  # 如果所有值都是0或没有值，设为None
             
-            cursor.execute(insert_detail_sql, (
-                score_header_id,
-                student_id,
-                student_name,
-                chinese,
-                math,
-                english,
-                total_score
-            ))
-            inserted_count += 1
+            # 将scores_json转换为JSON字符串
+            scores_json_str = json.dumps(scores_json, ensure_ascii=False)
+            
+            is_update = existing_record is not None
+            action = "更新" if is_update else "插入"
+            print(f"[save_student_scores] {action}第{idx+1}条成绩 - student_name={student_name}, student_id={student_id}, scores_json={scores_json_str}, total_score={total_score}")
+            app_logger.info(f"[save_student_scores] {action}第{idx+1}条成绩 - student_name={student_name}, student_id={student_id}, scores_json={scores_json_str}, total_score={total_score}")
+            
+            try:
+                # 如果记录已存在，使用UPDATE语句
+                if existing_record:
+                    update_detail_sql = (
+                        "UPDATE ta_student_score_detail "
+                        "SET scores_json = %s, total_score = %s, updated_at = NOW() "
+                        "WHERE id = %s"
+                    )
+                    cursor.execute(update_detail_sql, (
+                        scores_json_str,
+                        total_score,
+                        existing_record['id']
+                    ))
+                    updated_count += 1
+                    print(f"[save_student_scores] 第{idx+1}条成绩更新成功 - rowcount={cursor.rowcount}")
+                else:
+                    # 新记录，使用INSERT
+                    cursor.execute(insert_detail_sql, (
+                        score_header_id,
+                        student_id,
+                        student_name,
+                        scores_json_str,
+                        total_score
+                    ))
+                    inserted_count += 1
+                    print(f"[save_student_scores] 第{idx+1}条成绩插入成功 - rowcount={cursor.rowcount}")
+            except Exception as insert_error:
+                print(f"[save_student_scores] 第{idx+1}条成绩{action}失败 - student_name={student_name}, error={insert_error}")
+                app_logger.error(f"[save_student_scores] 第{idx+1}条成绩{action}失败 - student_name={student_name}, error={insert_error}", exc_info=True)
+                raise  # 重新抛出异常，让外层捕获
 
+        print(f"[save_student_scores] 成绩明细处理完成 - 插入={inserted_count}, 更新={updated_count}, 跳过={skipped_count}, 总计={len(scores)}")
+        app_logger.info(f"[save_student_scores] 成绩明细处理完成 - 插入={inserted_count}, 更新={updated_count}, 跳过={skipped_count}, 总计={len(scores)}")
+        
+        print(f"[save_student_scores] 开始提交事务")
+        app_logger.info(f"[save_student_scores] 开始提交事务")
         connection.commit()
-        return { 'success': True, 'score_header_id': score_header_id, 'inserted_count': inserted_count, 'message': '保存成功' }
+        total_processed = inserted_count + updated_count
+        print(f"[save_student_scores] 事务提交成功 - score_header_id={score_header_id}, 插入={inserted_count}, 更新={updated_count}, 总计={total_processed}")
+        app_logger.info(f"[save_student_scores] 事务提交成功 - score_header_id={score_header_id}, 插入={inserted_count}, 更新={updated_count}, 总计={total_processed}")
+        return { 'success': True, 'score_header_id': score_header_id, 'inserted_count': inserted_count, 'updated_count': updated_count, 'message': '保存成功' }
     except mysql.connector.Error as e:
         if connection and connection.is_connected():
+            print(f"[save_student_scores] 数据库错误，回滚事务 - error={e}")
+            app_logger.error(f"[save_student_scores] 数据库错误，回滚事务 - error={e}")
             connection.rollback()
-        app_logger.error(f"Database error during save_student_scores: {e}")
+        else:
+            print(f"[save_student_scores] 数据库错误，连接已断开 - error={e}")
+            app_logger.error(f"[save_student_scores] 数据库错误，连接已断开 - error={e}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[save_student_scores] 数据库错误堆栈:\n{traceback_str}")
+        app_logger.error(f"Database error during save_student_scores: {e}\n{traceback_str}")
         return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': f'数据库错误: {e}' }
     except Exception as e:
         if connection and connection.is_connected():
+            print(f"[save_student_scores] 未知错误，回滚事务 - error={e}")
+            app_logger.error(f"[save_student_scores] 未知错误，回滚事务 - error={e}")
             connection.rollback()
-        app_logger.error(f"Unexpected error during save_student_scores: {e}")
+        else:
+            print(f"[save_student_scores] 未知错误，连接已断开 - error={e}")
+            app_logger.error(f"[save_student_scores] 未知错误，连接已断开 - error={e}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[save_student_scores] 未知错误堆栈:\n{traceback_str}")
+        app_logger.error(f"Unexpected error during save_student_scores: {e}\n{traceback_str}")
         return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': f'未知错误: {e}' }
     finally:
         if connection and connection.is_connected():
@@ -2236,12 +2525,17 @@ def save_student_scores(
 async def api_save_student_scores(request: Request):
     """
     保存学生成绩表
-    请求体 JSON:
+    支持两种请求格式：
+    1. application/json: 直接发送JSON数据
+    2. multipart/form-data: 包含data字段（JSON字符串）和excel_file字段（Excel文件）
+    
+    请求体 JSON (或multipart中的data字段):
     {
       "class_id": "class_1001",
       "exam_name": "期中考试",
       "term": "2025-2026-1",  // 可选
       "remark": "备注信息",    // 可选
+      "excel_file_name": "成绩表.xlsx",  // 可选，Excel文件名
       "scores": [
         {
           "student_id": "2024001",    // 可选
@@ -2260,30 +2554,130 @@ async def api_save_student_scores(request: Request):
       ]
     }
     """
-    try:
-        data = await request.json()
-        # 打印接收到的 JSON 数据
-        print(f"[student-scores/save] 收到请求数据:")
-        print(json.dumps(data, ensure_ascii=False, indent=2))
-    except Exception:
-        return safe_json_response({'message': '无效的 JSON 请求体', 'code': 400}, status_code=400)
-
+    data = None
+    excel_file = None
+    excel_file_name = None
+    excel_file_url = None
+    
+    # 检查Content-Type
+    content_type = request.headers.get("content-type", "").lower()
+    
+    if "multipart/form-data" in content_type:
+        # 处理multipart/form-data格式
+        try:
+            form_data = await request.form()
+            
+            # 获取JSON数据（从data字段）
+            data_str = form_data.get("data")
+            if not data_str:
+                return safe_json_response({'message': 'multipart请求中缺少data字段', 'code': 400}, status_code=400)
+            
+            # 解析JSON字符串（form_data.get返回的可能是字符串）
+            if isinstance(data_str, str):
+                data = json.loads(data_str)
+            else:
+                # 如果不是字符串，尝试转换为字符串再解析
+                data = json.loads(str(data_str))
+            
+            # 获取Excel文件（可选）
+            excel_file = form_data.get("excel_file")
+            excel_file_url = None
+            if excel_file:
+                # FastAPI的UploadFile对象有filename属性
+                if isinstance(excel_file, UploadFile) and excel_file.filename:
+                    excel_file_name = excel_file.filename
+                    print(f"[student-scores/save] 收到Excel文件: {excel_file_name}")
+                    app_logger.info(f"[student-scores/save] 收到Excel文件: {excel_file_name}")
+                    
+                    # 读取Excel文件内容
+                    try:
+                        excel_content = await excel_file.read()
+                        print(f"[student-scores/save] Excel文件大小: {len(excel_content)} bytes")
+                        app_logger.info(f"[student-scores/save] Excel文件大小: {len(excel_content)} bytes")
+                        
+                        # 生成OSS对象名称（使用时间戳和文件名避免冲突）
+                        timestamp = int(time.time())
+                        file_ext = os.path.splitext(excel_file_name)[1] or '.xlsx'
+                        oss_object_name = f"excel/student-scores/{timestamp}_{excel_file_name}"
+                        
+                        # 上传到阿里云OSS
+                        print(f"[student-scores/save] 开始上传Excel文件到OSS: {oss_object_name}")
+                        app_logger.info(f"[student-scores/save] 开始上传Excel文件到OSS: {oss_object_name}")
+                        excel_file_url = upload_excel_to_oss(excel_content, oss_object_name)
+                        
+                        if excel_file_url:
+                            print(f"[student-scores/save] Excel文件上传成功，OSS URL: {excel_file_url}")
+                            app_logger.info(f"[student-scores/save] Excel文件上传成功，OSS URL: {excel_file_url}")
+                        else:
+                            print(f"[student-scores/save] Excel文件上传失败")
+                            app_logger.warning(f"[student-scores/save] Excel文件上传失败")
+                    except Exception as e:
+                        error_msg = f'读取或上传Excel文件时出错: {str(e)}'
+                        print(f"[student-scores/save] 错误: {error_msg}")
+                        app_logger.error(f"[student-scores/save] {error_msg}", exc_info=True)
+                        # 继续处理，不阻止成绩数据保存
+            
+        except json.JSONDecodeError as e:
+            error_msg = f'无法解析multipart中的JSON数据: {str(e)}'
+            print(f"[student-scores/save] 错误: {error_msg}")
+            app_logger.warning(f"[student-scores/save] {error_msg}")
+            return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
+        except Exception as e:
+            error_msg = f'处理multipart请求时出错: {str(e)}'
+            print(f"[student-scores/save] 错误: {error_msg}")
+            app_logger.warning(f"[student-scores/save] {error_msg}")
+            return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
+    else:
+        # 处理application/json格式
+        try:
+            data = await request.json()
+        except Exception as e:
+            error_msg = f'无效的 JSON 请求体: {str(e)}'
+            print(f"[student-scores/save] 错误: {error_msg}")
+            app_logger.warning(f"[student-scores/save] {error_msg}")
+            return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
+    
+    if not data:
+        return safe_json_response({'message': '无法解析请求数据', 'code': 400}, status_code=400)
+    
+    # 打印接收到的数据
+    print(f"[student-scores/save] 收到请求数据:")
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+    if excel_file_name:
+        print(f"[student-scores/save] Excel文件名: {excel_file_name}")
+    
+    # 从JSON数据中提取excel_file_name（如果multipart中没有提供）
+    if not excel_file_name:
+        excel_file_name = data.get('excel_file_name')
+    
     class_id = data.get('class_id')
     exam_name = data.get('exam_name')
     term = data.get('term')
     remark = data.get('remark')
     scores = data.get('scores', [])
 
-    if not class_id or not exam_name:
-        return safe_json_response({'message': '缺少必要参数 class_id 或 exam_name', 'code': 400}, status_code=400)
+    print(f"[student-scores/save] 解析后的参数: class_id={class_id}, exam_name={exam_name}, term={term}, excel_file_name={excel_file_name}, excel_file_url={excel_file_url}, scores数量={len(scores) if scores else 0}")
+    app_logger.info(f"[student-scores/save] 解析后的参数: class_id={class_id}, exam_name={exam_name}, term={term}, excel_file_name={excel_file_name}, excel_file_url={excel_file_url}, scores数量={len(scores) if scores else 0}")
 
+    if not class_id or not exam_name:
+        error_msg = '缺少必要参数 class_id 或 exam_name'
+        print(f"[student-scores/save] 错误: {error_msg}")
+        app_logger.warning(f"[student-scores/save] {error_msg}")
+        return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
+
+    print(f"[student-scores/save] 开始调用 save_student_scores 函数")
+    app_logger.info(f"[student-scores/save] 开始调用 save_student_scores 函数")
     result = save_student_scores(
         class_id=class_id,
         exam_name=exam_name,
         term=term,
         remark=remark,
-        scores=scores
+        scores=scores,
+        excel_file_url=excel_file_url
     )
+
+    print(f"[student-scores/save] save_student_scores 返回结果: {result}")
+    app_logger.info(f"[student-scores/save] save_student_scores 返回结果: {result}")
 
     if result.get('success'):
         return safe_json_response({'message': '保存成功', 'code': 200, 'data': result})
@@ -2340,14 +2734,14 @@ async def api_get_student_scores(
         # 查询成绩表头
         if exam_name:
             cursor.execute(
-                "SELECT id, class_id, exam_name, term, remark, created_at, updated_at "
+                "SELECT id, class_id, exam_name, term, remark, excel_file_url, created_at, updated_at "
                 "FROM ta_student_score_header "
                 "WHERE class_id = %s AND exam_name = %s AND (%s IS NULL OR term = %s)",
                 (class_id, exam_name, term, term)
             )
         else:
             cursor.execute(
-                "SELECT id, class_id, exam_name, term, remark, created_at, updated_at "
+                "SELECT id, class_id, exam_name, term, remark, excel_file_url, created_at, updated_at "
                 "FROM ta_student_score_header "
                 "WHERE class_id = %s AND (%s IS NULL OR term = %s) "
                 "ORDER BY created_at DESC",
@@ -2356,18 +2750,59 @@ async def api_get_student_scores(
         
         headers = cursor.fetchall() or []
         
-        # 查询每个表头的成绩明细
+        # 查询每个表头的成绩明细和字段定义
         result_headers = []
         for header in headers:
             score_header_id = header['id']
+            
+            # 查询字段定义
             cursor.execute(
-                "SELECT id, student_id, student_name, chinese, math, english, total_score "
+                "SELECT field_name, field_type, field_order, is_total "
+                "FROM ta_student_score_field "
+                "WHERE score_header_id = %s "
+                "ORDER BY field_order ASC",
+                (score_header_id,)
+            )
+            fields = cursor.fetchall() or []
+            field_names = [f['field_name'] for f in fields]
+            
+            # 查询成绩明细
+            cursor.execute(
+                "SELECT id, student_id, student_name, scores_json, total_score "
                 "FROM ta_student_score_detail "
                 "WHERE score_header_id = %s "
                 "ORDER BY total_score DESC, student_name ASC",
                 (score_header_id,)
             )
-            scores = cursor.fetchall() or []
+            score_rows = cursor.fetchall() or []
+            
+            # 解析JSON字段并构建成绩列表
+            scores = []
+            for row in score_rows:
+                score_dict = {
+                    'id': row['id'],
+                    'student_id': row.get('student_id'),
+                    'student_name': row.get('student_name'),
+                    'total_score': float(row['total_score']) if row['total_score'] is not None else None
+                }
+                
+                # 解析JSON字段
+                if row.get('scores_json'):
+                    try:
+                        if isinstance(row['scores_json'], str):
+                            scores_data = json.loads(row['scores_json'])
+                        else:
+                            scores_data = row['scores_json']
+                        
+                        # 将JSON中的字段添加到score_dict中
+                        for field_name in field_names:
+                            if field_name in scores_data:
+                                score_dict[field_name] = scores_data[field_name]
+                    except (json.JSONDecodeError, TypeError) as e:
+                        print(f"[api_get_student_scores] 解析JSON失败: {e}, scores_json={row.get('scores_json')}")
+                        app_logger.warning(f"[api_get_student_scores] 解析JSON失败: {e}")
+                
+                scores.append(score_dict)
             
             header_dict = {
                 'id': header['id'],
@@ -2375,8 +2810,10 @@ async def api_get_student_scores(
                 'exam_name': header['exam_name'],
                 'term': header.get('term'),
                 'remark': header.get('remark'),
+                'excel_file_url': header.get('excel_file_url'),
                 'created_at': header.get('created_at'),
                 'updated_at': header.get('updated_at'),
+                'fields': fields,  # 字段定义列表
                 'scores': scores
             }
             result_headers.append(header_dict)
@@ -2475,21 +2912,62 @@ async def api_get_student_score(
         print(f"[student-scores/get] 找到成绩表头 - id: {header['id']}, created_at: {header.get('created_at')}")
         app_logger.info(f"[student-scores/get] 找到成绩表头 - id: {header['id']}, class_id: {class_id}, exam_name: {exam_name}, term: {term}, created_at: {header.get('created_at')}")
         
-        # 查询成绩明细
+        # 查询字段定义
         score_header_id = header['id']
+        print(f"[student-scores/get] 查询字段定义 - score_header_id: {score_header_id}")
+        app_logger.info(f"[student-scores/get] 开始查询字段定义 - score_header_id: {score_header_id}")
+        cursor.execute(
+            "SELECT field_name, field_type, field_order, is_total "
+            "FROM ta_student_score_field "
+            "WHERE score_header_id = %s "
+            "ORDER BY field_order ASC",
+            (score_header_id,)
+        )
+        fields = cursor.fetchall() or []
+        field_names = [f['field_name'] for f in fields]
+        
+        # 查询成绩明细
         print(f"[student-scores/get] 查询成绩明细 - score_header_id: {score_header_id}")
         app_logger.info(f"[student-scores/get] 开始查询成绩明细 - score_header_id: {score_header_id}")
         cursor.execute(
-            "SELECT id, student_id, student_name, chinese, math, english, total_score "
+            "SELECT id, student_id, student_name, scores_json, total_score "
             "FROM ta_student_score_detail "
             "WHERE score_header_id = %s "
             "ORDER BY total_score DESC, student_name ASC",
             (score_header_id,)
         )
-        scores = cursor.fetchall() or []
+        score_rows = cursor.fetchall() or []
         
-        print(f"[student-scores/get] 查询到 {len(scores)} 条成绩明细")
-        app_logger.info(f"[student-scores/get] 查询到 {len(scores)} 条成绩明细 - score_header_id: {score_header_id}")
+        print(f"[student-scores/get] 查询到 {len(score_rows)} 条成绩明细")
+        app_logger.info(f"[student-scores/get] 查询到 {len(score_rows)} 条成绩明细 - score_header_id: {score_header_id}")
+        
+        # 解析JSON字段并构建成绩列表
+        scores = []
+        for row in score_rows:
+            score_dict = {
+                'id': row['id'],
+                'student_id': row.get('student_id'),
+                'student_name': row.get('student_name'),
+                'total_score': float(row['total_score']) if row['total_score'] is not None else None
+            }
+            
+            # 解析JSON字段
+            if row.get('scores_json'):
+                try:
+                    if isinstance(row['scores_json'], str):
+                        scores_data = json.loads(row['scores_json'])
+                    else:
+                        scores_data = row['scores_json']
+                    
+                    # 将JSON中的字段添加到score_dict中
+                    for field_name in field_names:
+                        if field_name in scores_data:
+                            score_dict[field_name] = scores_data[field_name]
+                except (json.JSONDecodeError, TypeError) as e:
+                    print(f"[api_get_student_score] 解析JSON失败: {e}, scores_json={row.get('scores_json')}")
+                    app_logger.warning(f"[api_get_student_score] 解析JSON失败: {e}")
+            
+            scores.append(score_dict)
         
         # 转换 Decimal 类型为 float（用于 JSON 序列化）
         from decimal import Decimal
@@ -2521,8 +2999,10 @@ async def api_get_student_score(
             'exam_name': header['exam_name'],
             'term': header.get('term'),
             'remark': header.get('remark'),
+            'excel_file_url': header.get('excel_file_url'),
             'created_at': header.get('created_at'),
             'updated_at': header.get('updated_at'),
+            'fields': fields,  # 字段定义列表
             'scores': scores
         }
         
