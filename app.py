@@ -426,9 +426,12 @@ def upload_excel_to_oss(excel_bytes: bytes, object_name: str) -> Optional[str]:
     """
     上传Excel文件到阿里云 OSS，返回可访问的 URL。
     """
-    print(f"[upload_excel_to_oss] 开始上传Excel文件到OSS")
-    print(f"[upload_excel_to_oss] object_name: {object_name}")
-    print(f"[upload_excel_to_oss] excel_bytes大小: {len(excel_bytes) if excel_bytes else 0} bytes")
+    print(f"[upload_excel_to_oss] ========== 开始上传Excel文件到OSS ==========")
+    app_logger.info(f"[upload_excel_to_oss] ========== 开始上传Excel文件到OSS ==========")
+    print(f"[upload_excel_to_oss] 📋 输入参数:")
+    print(f"[upload_excel_to_oss]   - object_name: {object_name}")
+    print(f"[upload_excel_to_oss]   - excel_bytes大小: {len(excel_bytes) if excel_bytes else 0} bytes")
+    app_logger.info(f"[upload_excel_to_oss] 📋 输入参数: object_name={object_name}, excel_bytes大小={len(excel_bytes) if excel_bytes else 0} bytes")
     
     if not excel_bytes:
         error_msg = "upload_excel_to_oss: excel_bytes 为空"
@@ -481,19 +484,29 @@ def upload_excel_to_oss(excel_bytes: bytes, object_name: str) -> Optional[str]:
         }
         
         print(f"[upload_excel_to_oss] 设置过期时间: {expires_header} (100年后)")
-        print(f"[upload_excel_to_oss] 开始上传文件到OSS...")
+        print(f"[upload_excel_to_oss] ☁️ 开始上传文件到OSS...")
+        app_logger.info(f"[upload_excel_to_oss] ☁️ 开始上传文件到OSS: {normalized_object_name}")
         bucket.put_object(normalized_object_name, excel_bytes, headers=headers)
-        print(f"[upload_excel_to_oss] 文件上传成功！")
+        print(f"[upload_excel_to_oss] ✅ 文件上传成功！")
+        app_logger.info(f"[upload_excel_to_oss] ✅ 文件上传成功: {normalized_object_name}")
 
+        print(f"[upload_excel_to_oss] 🔗 开始生成访问URL...")
+        app_logger.info(f"[upload_excel_to_oss] 🔗 开始生成访问URL...")
         if ALIYUN_OSS_BASE_URL:
             base = ALIYUN_OSS_BASE_URL.rstrip("/")
             url = f"{base}/{normalized_object_name}"
-            print(f"[upload_excel_to_oss] 使用自定义BASE_URL生成URL: {url}")
+            print(f"[upload_excel_to_oss] ✅ 使用自定义BASE_URL生成URL: {url}")
+            app_logger.info(f"[upload_excel_to_oss] ✅ 使用自定义BASE_URL生成URL: {url}")
+            print(f"[upload_excel_to_oss] ========== 上传完成，返回URL ==========")
+            app_logger.info(f"[upload_excel_to_oss] ========== 上传完成，返回URL: {url} ==========")
             return url
 
         endpoint_host = ALIYUN_OSS_ENDPOINT.replace("https://", "").replace("http://", "").strip("/")
         url = f"https://{ALIYUN_OSS_BUCKET}.{endpoint_host}/{normalized_object_name}"
-        print(f"[upload_excel_to_oss] 使用默认格式生成URL: {url}")
+        print(f"[upload_excel_to_oss] ✅ 使用默认格式生成URL: {url}")
+        app_logger.info(f"[upload_excel_to_oss] ✅ 使用默认格式生成URL: {url}")
+        print(f"[upload_excel_to_oss] ========== 上传完成，返回URL ==========")
+        app_logger.info(f"[upload_excel_to_oss] ========== 上传完成，返回URL: {url} ==========")
         return url
     except Exception as exc:
         error_msg = f"upload_excel_to_oss: 上传失败 object={normalized_object_name}, error={exc}"
@@ -2194,7 +2207,8 @@ def save_student_scores(
     term: Optional[str] = None,
     remark: Optional[str] = None,
     scores: List[Dict] = None,
-    excel_file_url: Optional[str] = None
+    excel_file_url: Optional[str] = None,
+    excel_file_name: Optional[str] = None
 ) -> Dict[str, object]:
     """
     保存学生成绩表
@@ -2204,6 +2218,7 @@ def save_student_scores(
     - term: 学期（可选，如 '2025-2026-1'）
     - remark: 备注（可选）
     - excel_file_url: Excel文件在OSS的URL（可选）
+    - excel_file_name: Excel文件名（可选，用于管理多个文件）
     - scores: 成绩明细列表，每个元素包含:
       {
         'student_id': str,      # 学号（可选）
@@ -2243,7 +2258,7 @@ def save_student_scores(
         print(f"[save_student_scores] 查询成绩表头 - class_id={class_id}, exam_name={exam_name}, term={term}")
         app_logger.info(f"[save_student_scores] 查询成绩表头 - class_id={class_id}, exam_name={exam_name}, term={term}")
         cursor.execute(
-            "SELECT id FROM ta_student_score_header WHERE class_id = %s AND exam_name = %s AND (%s IS NULL OR term = %s) LIMIT 1",
+            "SELECT id, excel_file_url FROM ta_student_score_header WHERE class_id = %s AND exam_name = %s AND (%s IS NULL OR term = %s) LIMIT 1",
             (class_id, exam_name, term, term)
         )
         header_row = cursor.fetchone()
@@ -2252,35 +2267,140 @@ def save_student_scores(
 
         if header_row is None:
             # 插入新表头
-            print(f"[save_student_scores] 插入新成绩表头 - class_id={class_id}, exam_name={exam_name}, term={term}, remark={remark}, excel_file_url={excel_file_url}")
-            app_logger.info(f"[save_student_scores] 插入新成绩表头 - class_id={class_id}, exam_name={exam_name}, term={term}, remark={remark}, excel_file_url={excel_file_url}")
+            print(f"[save_student_scores] ========== 插入新成绩表头 ==========")
+            app_logger.info(f"[save_student_scores] ========== 插入新成绩表头 ==========")
+            print(f"[save_student_scores] 📝 准备插入新表头:")
+            print(f"[save_student_scores]   - class_id: {class_id}")
+            print(f"[save_student_scores]   - exam_name: {exam_name}")
+            print(f"[save_student_scores]   - term: {term}")
+            print(f"[save_student_scores]   - remark: {remark}")
+            print(f"[save_student_scores]   - excel_file_url: {excel_file_url}")
+            print(f"[save_student_scores]   - excel_file_name: {excel_file_name}")
+            print(f"[save_student_scores]   - excel_file_url类型: {type(excel_file_url)}")
+            app_logger.info(f"[save_student_scores] 📝 准备插入新表头 - class_id={class_id}, exam_name={exam_name}, term={term}, remark={remark}, excel_file_url={excel_file_url}, excel_file_name={excel_file_name}, excel_file_url类型={type(excel_file_url)}")
+            
+            # 如果有excel_file_url，使用JSON格式存储（支持多个文件）
+            final_excel_file_url = None
+            if excel_file_url:
+                if excel_file_name:
+                    # 使用文件名作为key
+                    url_dict = {excel_file_name: excel_file_url}
+                else:
+                    # 如果没有文件名，使用默认key
+                    timestamp = int(time.time())
+                    url_dict = {f"excel_file_{timestamp}": excel_file_url}
+                final_excel_file_url = json.dumps(url_dict, ensure_ascii=False)
+                print(f"[save_student_scores] 📝 新表头的excel_file_url（JSON格式）: {final_excel_file_url}")
+                app_logger.info(f"[save_student_scores] 📝 新表头的excel_file_url（JSON格式）: {final_excel_file_url}")
+            else:
+                final_excel_file_url = excel_file_url
+            
             insert_header_sql = (
                 "INSERT INTO ta_student_score_header (class_id, exam_name, term, remark, excel_file_url, created_at) "
                 "VALUES (%s, %s, %s, %s, %s, NOW())"
             )
-            cursor.execute(insert_header_sql, (class_id, exam_name, term, remark, excel_file_url))
+            print(f"[save_student_scores] 📝 SQL语句: {insert_header_sql}")
+            print(f"[save_student_scores] 📝 SQL参数: ({class_id}, {exam_name}, {term}, {remark}, {final_excel_file_url})")
+            app_logger.info(f"[save_student_scores] 📝 SQL语句: {insert_header_sql}, SQL参数: ({class_id}, {exam_name}, {term}, {remark}, {final_excel_file_url})")
+            cursor.execute(insert_header_sql, (class_id, exam_name, term, remark, final_excel_file_url))
             score_header_id = cursor.lastrowid
-            print(f"[save_student_scores] 插入成绩表头成功 - score_header_id={score_header_id}")
-            app_logger.info(f"[save_student_scores] 插入成绩表头成功 - score_header_id={score_header_id}")
+            print(f"[save_student_scores] ✅ 插入成绩表头成功 - score_header_id={score_header_id}")
+            print(f"[save_student_scores] ✅ excel_file_url已写入数据库: {excel_file_url}")
+            app_logger.info(f"[save_student_scores] ✅ 插入成绩表头成功 - score_header_id={score_header_id}, excel_file_url={excel_file_url}")
         else:
             score_header_id = header_row['id']
-            print(f"[save_student_scores] 成绩表头已存在 - score_header_id={score_header_id}")
-            app_logger.info(f"[save_student_scores] 成绩表头已存在 - score_header_id={score_header_id}")
+            print(f"[save_student_scores] ========== 成绩表头已存在，准备更新 ==========")
+            app_logger.info(f"[save_student_scores] ========== 成绩表头已存在，准备更新 ==========")
+            print(f"[save_student_scores] 📋 现有表头ID: {score_header_id}")
+            app_logger.info(f"[save_student_scores] 📋 现有表头ID: {score_header_id}")
             # 更新表头信息（若存在）
             update_fields = []
             update_values = []
             if remark is not None:
                 update_fields.append("remark = %s")
                 update_values.append(remark)
-            if excel_file_url is not None:
+                print(f"[save_student_scores] 📝 将更新remark字段: {remark}")
+                app_logger.info(f"[save_student_scores] 📝 将更新remark字段: {remark}")
+            # 更新 excel_file_url（如果提供了有效的 URL）
+            # 支持多个Excel文件的URL管理：如果文件名相同则更新，否则追加
+            print(f"[save_student_scores] 🔍 检查excel_file_url是否需要更新:")
+            print(f"[save_student_scores]   - excel_file_url值: {excel_file_url}")
+            print(f"[save_student_scores]   - excel_file_name值: {excel_file_name}")
+            print(f"[save_student_scores]   - excel_file_url类型: {type(excel_file_url)}")
+            app_logger.info(f"[save_student_scores] 🔍 检查excel_file_url是否需要更新: excel_file_url={excel_file_url}, excel_file_name={excel_file_name}, 类型={type(excel_file_url)}")
+            
+            if excel_file_url:
+                # 获取现有的excel_file_url值
+                existing_excel_file_url = header_row.get('excel_file_url') if header_row else None
+                print(f"[save_student_scores] 📋 现有的excel_file_url值: {existing_excel_file_url}")
+                app_logger.info(f"[save_student_scores] 📋 现有的excel_file_url值: {existing_excel_file_url}")
+                
+                # 解析现有的URL列表（JSON格式：{"文件名1": "URL1", "文件名2": "URL2"}）
+                url_dict = {}
+                if existing_excel_file_url:
+                    try:
+                        # 尝试解析为JSON对象
+                        url_dict = json.loads(existing_excel_file_url)
+                        if not isinstance(url_dict, dict):
+                            # 如果不是字典，可能是旧的单个URL格式，转换为字典
+                            url_dict = {}
+                            # 尝试从旧格式中提取文件名（如果有的话）
+                            if excel_file_name:
+                                url_dict[excel_file_name] = existing_excel_file_url
+                            else:
+                                url_dict['excel_file'] = existing_excel_file_url
+                        print(f"[save_student_scores] ✅ 成功解析现有的URL字典: {url_dict}")
+                        app_logger.info(f"[save_student_scores] ✅ 成功解析现有的URL字典: {url_dict}")
+                    except (json.JSONDecodeError, TypeError):
+                        # 如果解析失败，说明是旧的单个URL格式
+                        print(f"[save_student_scores] ⚠️ 现有值不是JSON格式，转换为字典格式")
+                        app_logger.warning(f"[save_student_scores] ⚠️ 现有值不是JSON格式，转换为字典格式")
+                        if excel_file_name:
+                            url_dict[excel_file_name] = existing_excel_file_url
+                        else:
+                            url_dict['excel_file'] = existing_excel_file_url
+                
+                # 更新或添加新的URL
+                if excel_file_name:
+                    # 如果提供了文件名，使用文件名作为key
+                    url_dict[excel_file_name] = excel_file_url
+                    print(f"[save_student_scores] 📝 更新/添加URL: {excel_file_name} -> {excel_file_url}")
+                    app_logger.info(f"[save_student_scores] 📝 更新/添加URL: {excel_file_name} -> {excel_file_url}")
+                else:
+                    # 如果没有提供文件名，使用默认key
+                    timestamp = int(time.time())
+                    default_key = f"excel_file_{timestamp}"
+                    url_dict[default_key] = excel_file_url
+                    print(f"[save_student_scores] 📝 添加URL（无文件名）: {default_key} -> {excel_file_url}")
+                    app_logger.info(f"[save_student_scores] 📝 添加URL（无文件名）: {default_key} -> {excel_file_url}")
+                
+                # 将字典转换为JSON字符串保存
+                updated_excel_file_url = json.dumps(url_dict, ensure_ascii=False)
+                print(f"[save_student_scores] ✅ 更新后的excel_file_url（JSON格式）: {updated_excel_file_url}")
+                app_logger.info(f"[save_student_scores] ✅ 更新后的excel_file_url（JSON格式）: {updated_excel_file_url}")
+                
                 update_fields.append("excel_file_url = %s")
-                update_values.append(excel_file_url)
+                update_values.append(updated_excel_file_url)
+            else:
+                print(f"[save_student_scores] ⚠️ excel_file_url为空或None，不更新该字段，保留原有值")
+                app_logger.info(f"[save_student_scores] ⚠️ excel_file_url为空或None，不更新该字段，保留原有值")
             if update_fields:
                 update_values.append(score_header_id)
                 update_sql = f"UPDATE ta_student_score_header SET {', '.join(update_fields)}, updated_at = NOW() WHERE id = %s"
-                print(f"[save_student_scores] 更新成绩表头 - score_header_id={score_header_id}, 更新字段: {', '.join(update_fields)}")
-                app_logger.info(f"[save_student_scores] 更新成绩表头 - score_header_id={score_header_id}, 更新字段: {', '.join(update_fields)}")
+                print(f"[save_student_scores] 📝 准备执行UPDATE SQL:")
+                print(f"[save_student_scores]   - SQL语句: {update_sql}")
+                print(f"[save_student_scores]   - 更新字段: {', '.join(update_fields)}")
+                print(f"[save_student_scores]   - SQL参数: {tuple(update_values)}")
+                app_logger.info(f"[save_student_scores] 📝 准备执行UPDATE SQL: {update_sql}, 更新字段: {', '.join(update_fields)}, SQL参数: {tuple(update_values)}")
                 cursor.execute(update_sql, tuple(update_values))
+                print(f"[save_student_scores] ✅ UPDATE执行成功，影响行数: {cursor.rowcount}")
+                app_logger.info(f"[save_student_scores] ✅ UPDATE执行成功，影响行数: {cursor.rowcount}")
+                if excel_file_url:
+                    print(f"[save_student_scores] ✅ excel_file_url已更新到数据库: {excel_file_url}")
+                    app_logger.info(f"[save_student_scores] ✅ excel_file_url已更新到数据库: {excel_file_url}")
+            else:
+                print(f"[save_student_scores] ℹ️ 没有需要更新的字段")
+                app_logger.info(f"[save_student_scores] ℹ️ 没有需要更新的字段")
             # 不删除旧的成绩明细和字段定义，而是追加新的数据
             print(f"[save_student_scores] 表头已存在，将追加新的字段定义和成绩明细 - score_header_id={score_header_id}")
             app_logger.info(f"[save_student_scores] 表头已存在，将追加新的字段定义和成绩明细 - score_header_id={score_header_id}")
@@ -2582,40 +2702,167 @@ async def api_save_student_scores(request: Request):
             # 获取Excel文件（可选）
             excel_file = form_data.get("excel_file")
             excel_file_url = None
+            print(f"[student-scores/save] ========== 开始处理Excel文件 ==========")
+            app_logger.info(f"[student-scores/save] ========== 开始处理Excel文件 ==========")
+            print(f"[student-scores/save] excel_file是否存在: {excel_file is not None}")
+            app_logger.info(f"[student-scores/save] excel_file是否存在: {excel_file is not None}")
             if excel_file:
-                # FastAPI的UploadFile对象有filename属性
-                if isinstance(excel_file, UploadFile) and excel_file.filename:
-                    excel_file_name = excel_file.filename
-                    print(f"[student-scores/save] 收到Excel文件: {excel_file_name}")
-                    app_logger.info(f"[student-scores/save] 收到Excel文件: {excel_file_name}")
+                print(f"[student-scores/save] excel_file类型: {type(excel_file)}")
+                print(f"[student-scores/save] excel_file类型名称: {type(excel_file).__name__}")
+                print(f"[student-scores/save] excel_file模块: {type(excel_file).__module__}")
+                app_logger.info(f"[student-scores/save] excel_file类型: {type(excel_file)}, 类型名称: {type(excel_file).__name__}, 模块: {type(excel_file).__module__}")
+                
+                # 检查是否是UploadFile类型（支持fastapi.UploadFile和starlette.datastructures.UploadFile）
+                is_upload_file = isinstance(excel_file, UploadFile) or type(excel_file).__name__ == 'UploadFile'
+                print(f"[student-scores/save] isinstance(excel_file, UploadFile): {isinstance(excel_file, UploadFile)}")
+                print(f"[student-scores/save] type(excel_file).__name__ == 'UploadFile': {type(excel_file).__name__ == 'UploadFile'}")
+                print(f"[student-scores/save] is_upload_file: {is_upload_file}")
+                app_logger.info(f"[student-scores/save] is_upload_file检查结果: {is_upload_file}")
+                
+                if is_upload_file:
+                    filename_value = getattr(excel_file, 'filename', None)
+                    print(f"[student-scores/save] excel_file.filename值: {filename_value}")
+                    print(f"[student-scores/save] excel_file.filename类型: {type(filename_value)}")
+                    app_logger.info(f"[student-scores/save] excel_file.filename值: {filename_value}, 类型: {type(filename_value)}")
+                    
+                    # 优先使用客户端JSON中的excel_file_name字段
+                    # 如果JSON中没有，再使用excel_file.filename
+                    # 如果都没有，使用默认名称
+                    excel_file_name = None
+                    if data:
+                        excel_file_name = data.get('excel_file_name')
+                        if excel_file_name:
+                            print(f"[student-scores/save] ✅ 从JSON数据中获取excel_file_name: {excel_file_name}")
+                            app_logger.info(f"[student-scores/save] ✅ 从JSON数据中获取excel_file_name: {excel_file_name}")
+                    
+                    # 如果JSON中没有，尝试使用excel_file.filename
+                    if not excel_file_name and filename_value:
+                        excel_file_name = filename_value
+                        print(f"[student-scores/save] ✅ 使用excel_file.filename: {excel_file_name}")
+                        app_logger.info(f"[student-scores/save] ✅ 使用excel_file.filename: {excel_file_name}")
+                    
+                    # 如果都没有，使用默认名称
+                    if not excel_file_name:
+                        timestamp = int(time.time())
+                        excel_file_name = f"excel_{timestamp}.xlsx"
+                        print(f"[student-scores/save] ⚠️ 使用默认文件名: {excel_file_name}")
+                        app_logger.warning(f"[student-scores/save] ⚠️ 使用默认文件名: {excel_file_name}")
+                    
+                    print(f"[student-scores/save] 📋 最终使用的文件名: {excel_file_name}")
+                    app_logger.info(f"[student-scores/save] 📋 最终使用的文件名: {excel_file_name}")
                     
                     # 读取Excel文件内容
                     try:
+                        print(f"[student-scores/save] 📖 开始读取Excel文件内容...")
+                        app_logger.info(f"[student-scores/save] 📖 开始读取Excel文件内容...")
                         excel_content = await excel_file.read()
-                        print(f"[student-scores/save] Excel文件大小: {len(excel_content)} bytes")
-                        app_logger.info(f"[student-scores/save] Excel文件大小: {len(excel_content)} bytes")
+                        print(f"[student-scores/save] ✅ Excel文件读取成功，文件大小: {len(excel_content)} bytes")
+                        app_logger.info(f"[student-scores/save] ✅ Excel文件读取成功，文件大小: {len(excel_content)} bytes")
                         
                         # 生成OSS对象名称（使用时间戳和文件名避免冲突）
                         timestamp = int(time.time())
                         file_ext = os.path.splitext(excel_file_name)[1] or '.xlsx'
                         oss_object_name = f"excel/student-scores/{timestamp}_{excel_file_name}"
+                        print(f"[student-scores/save] 📝 生成OSS对象名称: {oss_object_name}")
+                        app_logger.info(f"[student-scores/save] 📝 生成OSS对象名称: {oss_object_name}")
                         
                         # 上传到阿里云OSS
-                        print(f"[student-scores/save] 开始上传Excel文件到OSS: {oss_object_name}")
-                        app_logger.info(f"[student-scores/save] 开始上传Excel文件到OSS: {oss_object_name}")
+                        print(f"[student-scores/save] ☁️ 开始上传Excel文件到阿里云OSS...")
+                        print(f"[student-scores/save] ☁️ OSS对象名称: {oss_object_name}")
+                        app_logger.info(f"[student-scores/save] ☁️ 开始上传Excel文件到阿里云OSS: {oss_object_name}")
                         excel_file_url = upload_excel_to_oss(excel_content, oss_object_name)
                         
+                        print(f"[student-scores/save] ========== Excel文件上传结果 ==========")
+                        app_logger.info(f"[student-scores/save] ========== Excel文件上传结果 ==========")
+                        print(f"[student-scores/save] upload_excel_to_oss返回值类型: {type(excel_file_url)}")
+                        app_logger.info(f"[student-scores/save] upload_excel_to_oss返回值类型: {type(excel_file_url)}")
+                        print(f"[student-scores/save] upload_excel_to_oss返回值: {excel_file_url}")
+                        app_logger.info(f"[student-scores/save] upload_excel_to_oss返回值: {excel_file_url}")
+                        
                         if excel_file_url:
-                            print(f"[student-scores/save] Excel文件上传成功，OSS URL: {excel_file_url}")
-                            app_logger.info(f"[student-scores/save] Excel文件上传成功，OSS URL: {excel_file_url}")
+                            print(f"[student-scores/save] ✅ Excel文件上传成功！")
+                            print(f"[student-scores/save] ✅ 阿里云OSS URL: {excel_file_url}")
+                            app_logger.info(f"[student-scores/save] ✅ Excel文件上传成功，OSS URL: {excel_file_url}")
                         else:
-                            print(f"[student-scores/save] Excel文件上传失败")
-                            app_logger.warning(f"[student-scores/save] Excel文件上传失败")
+                            print(f"[student-scores/save] ❌ Excel文件上传失败，返回值为None或空")
+                            app_logger.warning(f"[student-scores/save] ❌ Excel文件上传失败，返回值为None或空")
                     except Exception as e:
                         error_msg = f'读取或上传Excel文件时出错: {str(e)}'
-                        print(f"[student-scores/save] 错误: {error_msg}")
-                        app_logger.error(f"[student-scores/save] {error_msg}", exc_info=True)
+                        print(f"[student-scores/save] ❌ 错误: {error_msg}")
+                        app_logger.error(f"[student-scores/save] ❌ {error_msg}", exc_info=True)
+                        import traceback
+                        traceback_str = traceback.format_exc()
+                        print(f"[student-scores/save] ❌ 错误堆栈:\n{traceback_str}")
+                        app_logger.error(f"[student-scores/save] ❌ 错误堆栈:\n{traceback_str}")
                         # 继续处理，不阻止成绩数据保存
+                else:
+                    # 即使不是标准的UploadFile类型，也尝试处理（可能是其他类型的文件对象）
+                    print(f"[student-scores/save] ⚠️ Excel文件类型检查未通过，但尝试继续处理")
+                    print(f"[student-scores/save] ⚠️ 文件对象类型: {type(excel_file)}, 类型名称: {type(excel_file).__name__}")
+                    app_logger.warning(f"[student-scores/save] ⚠️ Excel文件类型检查未通过，但尝试继续处理，类型: {type(excel_file)}")
+                    
+                    # 尝试从JSON数据中获取文件名
+                    excel_file_name = None
+                    if data:
+                        excel_file_name = data.get('excel_file_name')
+                        if excel_file_name:
+                            print(f"[student-scores/save] ✅ 从JSON数据中获取excel_file_name: {excel_file_name}")
+                            app_logger.info(f"[student-scores/save] ✅ 从JSON数据中获取excel_file_name: {excel_file_name}")
+                    
+                    # 如果JSON中没有，使用默认名称
+                    if not excel_file_name:
+                        timestamp = int(time.time())
+                        excel_file_name = f"excel_{timestamp}.xlsx"
+                        print(f"[student-scores/save] ⚠️ 使用默认文件名: {excel_file_name}")
+                        app_logger.warning(f"[student-scores/save] ⚠️ 使用默认文件名: {excel_file_name}")
+                    
+                    # 尝试读取文件内容（如果对象有read方法）
+                    try:
+                        if hasattr(excel_file, 'read'):
+                            print(f"[student-scores/save] 📖 尝试读取文件内容（使用read方法）...")
+                            app_logger.info(f"[student-scores/save] 📖 尝试读取文件内容（使用read方法）...")
+                            if asyncio.iscoroutinefunction(excel_file.read):
+                                excel_content = await excel_file.read()
+                            else:
+                                excel_content = excel_file.read()
+                            
+                            print(f"[student-scores/save] ✅ 文件读取成功，文件大小: {len(excel_content)} bytes")
+                            app_logger.info(f"[student-scores/save] ✅ 文件读取成功，文件大小: {len(excel_content)} bytes")
+                            
+                            # 生成OSS对象名称
+                            timestamp = int(time.time())
+                            oss_object_name = f"excel/student-scores/{timestamp}_{excel_file_name}"
+                            print(f"[student-scores/save] 📝 生成OSS对象名称: {oss_object_name}")
+                            app_logger.info(f"[student-scores/save] 📝 生成OSS对象名称: {oss_object_name}")
+                            
+                            # 上传到阿里云OSS
+                            print(f"[student-scores/save] ☁️ 开始上传Excel文件到阿里云OSS...")
+                            app_logger.info(f"[student-scores/save] ☁️ 开始上传Excel文件到阿里云OSS: {oss_object_name}")
+                            excel_file_url = upload_excel_to_oss(excel_content, oss_object_name)
+                            
+                            if excel_file_url:
+                                print(f"[student-scores/save] ✅ Excel文件上传成功，OSS URL: {excel_file_url}")
+                                app_logger.info(f"[student-scores/save] ✅ Excel文件上传成功，OSS URL: {excel_file_url}")
+                            else:
+                                print(f"[student-scores/save] ❌ Excel文件上传失败")
+                                app_logger.warning(f"[student-scores/save] ❌ Excel文件上传失败")
+                        else:
+                            print(f"[student-scores/save] ❌ 文件对象没有read方法，无法读取")
+                            app_logger.error(f"[student-scores/save] ❌ 文件对象没有read方法，无法读取")
+                    except Exception as e:
+                        error_msg = f'读取或上传Excel文件时出错: {str(e)}'
+                        print(f"[student-scores/save] ❌ 错误: {error_msg}")
+                        app_logger.error(f"[student-scores/save] ❌ {error_msg}", exc_info=True)
+                        import traceback
+                        traceback_str = traceback.format_exc()
+                        print(f"[student-scores/save] ❌ 错误堆栈:\n{traceback_str}")
+                        app_logger.error(f"[student-scores/save] ❌ 错误堆栈:\n{traceback_str}")
+            else:
+                print(f"[student-scores/save] ℹ️ 未提供Excel文件")
+                app_logger.info(f"[student-scores/save] ℹ️ 未提供Excel文件")
+            print(f"[student-scores/save] ========== Excel文件处理完成 ==========")
+            print(f"[student-scores/save] 最终excel_file_url值: {excel_file_url}")
+            app_logger.info(f"[student-scores/save] ========== Excel文件处理完成，最终excel_file_url值: {excel_file_url} ==========")
             
         except json.JSONDecodeError as e:
             error_msg = f'无法解析multipart中的JSON数据: {str(e)}'
@@ -2650,14 +2897,36 @@ async def api_save_student_scores(request: Request):
     if not excel_file_name:
         excel_file_name = data.get('excel_file_name')
     
+    # 从JSON数据中提取excel_file_url（如果multipart中没有提供）
+    print(f"[student-scores/save] 📋 检查是否需要从JSON数据中提取excel_file_url...")
+    app_logger.info(f"[student-scores/save] 📋 检查是否需要从JSON数据中提取excel_file_url...")
+    print(f"[student-scores/save] 当前excel_file_url值: {excel_file_url}")
+    app_logger.info(f"[student-scores/save] 当前excel_file_url值: {excel_file_url}")
+    if not excel_file_url:
+        json_excel_file_url = data.get('excel_file_url')
+        print(f"[student-scores/save] 从JSON数据中获取excel_file_url: {json_excel_file_url}")
+        app_logger.info(f"[student-scores/save] 从JSON数据中获取excel_file_url: {json_excel_file_url}")
+        excel_file_url = json_excel_file_url
+    else:
+        print(f"[student-scores/save] ✅ excel_file_url已有值，无需从JSON数据中提取")
+        app_logger.info(f"[student-scores/save] ✅ excel_file_url已有值，无需从JSON数据中提取")
+    
     class_id = data.get('class_id')
     exam_name = data.get('exam_name')
     term = data.get('term')
     remark = data.get('remark')
     scores = data.get('scores', [])
 
-    print(f"[student-scores/save] 解析后的参数: class_id={class_id}, exam_name={exam_name}, term={term}, excel_file_name={excel_file_name}, excel_file_url={excel_file_url}, scores数量={len(scores) if scores else 0}")
-    app_logger.info(f"[student-scores/save] 解析后的参数: class_id={class_id}, exam_name={exam_name}, term={term}, excel_file_name={excel_file_name}, excel_file_url={excel_file_url}, scores数量={len(scores) if scores else 0}")
+    print(f"[student-scores/save] ========== 解析后的参数 ==========")
+    print(f"[student-scores/save] class_id: {class_id}")
+    print(f"[student-scores/save] exam_name: {exam_name}")
+    print(f"[student-scores/save] term: {term}")
+    print(f"[student-scores/save] excel_file_name: {excel_file_name}")
+    print(f"[student-scores/save] excel_file_url: {excel_file_url}")
+    print(f"[student-scores/save] excel_file_url类型: {type(excel_file_url)}")
+    print(f"[student-scores/save] excel_file_url是否为空: {not excel_file_url}")
+    print(f"[student-scores/save] scores数量: {len(scores) if scores else 0}")
+    app_logger.info(f"[student-scores/save] 解析后的参数: class_id={class_id}, exam_name={exam_name}, term={term}, excel_file_name={excel_file_name}, excel_file_url={excel_file_url}, excel_file_url类型={type(excel_file_url)}, scores数量={len(scores) if scores else 0}")
 
     if not class_id or not exam_name:
         error_msg = '缺少必要参数 class_id 或 exam_name'
@@ -2665,15 +2934,24 @@ async def api_save_student_scores(request: Request):
         app_logger.warning(f"[student-scores/save] {error_msg}")
         return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
 
-    print(f"[student-scores/save] 开始调用 save_student_scores 函数")
-    app_logger.info(f"[student-scores/save] 开始调用 save_student_scores 函数")
+    print(f"[student-scores/save] ========== 准备调用 save_student_scores 函数 ==========")
+    app_logger.info(f"[student-scores/save] ========== 准备调用 save_student_scores 函数 ==========")
+    print(f"[student-scores/save] 📤 传递给save_student_scores的参数:")
+    print(f"[student-scores/save]   - class_id: {class_id}")
+    print(f"[student-scores/save]   - exam_name: {exam_name}")
+    print(f"[student-scores/save]   - term: {term}")
+    print(f"[student-scores/save]   - remark: {remark}")
+    print(f"[student-scores/save]   - excel_file_url: {excel_file_url}")
+    print(f"[student-scores/save]   - scores数量: {len(scores) if scores else 0}")
+    app_logger.info(f"[student-scores/save] 📤 传递给save_student_scores的参数: class_id={class_id}, exam_name={exam_name}, term={term}, remark={remark}, excel_file_url={excel_file_url}, scores数量={len(scores) if scores else 0}")
     result = save_student_scores(
         class_id=class_id,
         exam_name=exam_name,
         term=term,
         remark=remark,
         scores=scores,
-        excel_file_url=excel_file_url
+        excel_file_url=excel_file_url,
+        excel_file_name=excel_file_name
     )
 
     print(f"[student-scores/save] save_student_scores 返回结果: {result}")
