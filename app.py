@@ -2201,6 +2201,45 @@ async def api_get_course_schedule(
             app_logger.info("Database connection closed after fetching course schedule.")
 
 # ===== 学生成绩表 API =====
+def parse_excel_file_url(excel_file_url):
+    """
+    解析excel_file_url字段，将JSON格式转换为数组格式
+    支持旧格式（单个URL字符串）和新格式（JSON对象 {"文件名": "URL"}）
+    返回格式: [{"filename": "文件名", "url": "URL"}, ...]
+    """
+    if not excel_file_url:
+        return []
+    
+    try:
+        # 尝试解析为JSON
+        if isinstance(excel_file_url, str):
+            url_dict = json.loads(excel_file_url)
+        else:
+            url_dict = excel_file_url
+        
+        # 如果是字典格式（新格式）
+        if isinstance(url_dict, dict):
+            result = []
+            for filename, url in url_dict.items():
+                result.append({
+                    'filename': filename,
+                    'url': url
+                })
+            return result
+        # 如果是列表格式（可能未来扩展）
+        elif isinstance(url_dict, list):
+            return url_dict
+        # 如果是字符串（旧格式，单个URL）
+        elif isinstance(url_dict, str):
+            return [{'filename': 'excel_file', 'url': url_dict}]
+        else:
+            return []
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        # 如果解析失败，可能是旧的单个URL格式
+        if isinstance(excel_file_url, str):
+            return [{'filename': 'excel_file', 'url': excel_file_url}]
+        return []
+
 def save_student_scores(
     class_id: str,
     exam_name: str,
@@ -2983,7 +3022,20 @@ async def api_get_student_scores(
             "exam_name": "期中考试",
             "term": "2025-2026-1",
             "remark": "...",
+            "excel_file_url": [
+              {
+                "filename": "期中成绩单.xlsx",
+                "url": "https://..."
+              },
+              {
+                "filename": "学生体质统计表.xlsx",
+                "url": "https://..."
+              }
+            ],
+            "excel_file_url_raw": "{\"期中成绩单.xlsx\": \"https://...\", \"学生体质统计表.xlsx\": \"https://...\"}",
             "created_at": "...",
+            "updated_at": "...",
+            "fields": [...],
             "scores": [
               {
                 "id": 1,
@@ -3082,13 +3134,18 @@ async def api_get_student_scores(
                 
                 scores.append(score_dict)
             
+            # 解析excel_file_url为数组格式
+            excel_file_url_raw = header.get('excel_file_url')
+            excel_file_urls = parse_excel_file_url(excel_file_url_raw)
+            
             header_dict = {
                 'id': header['id'],
                 'class_id': header['class_id'],
                 'exam_name': header['exam_name'],
                 'term': header.get('term'),
                 'remark': header.get('remark'),
-                'excel_file_url': header.get('excel_file_url'),
+                'excel_file_url': excel_file_urls,  # 返回数组格式
+                'excel_file_url_raw': excel_file_url_raw,  # 保留原始值（可选，用于兼容）
                 'created_at': header.get('created_at'),
                 'updated_at': header.get('updated_at'),
                 'fields': fields,  # 字段定义列表
@@ -3130,8 +3187,20 @@ async def api_get_student_score(
         "exam_name": "期中考试",
         "term": "2025-2026-1",
         "remark": "...",
+        "excel_file_url": [
+          {
+            "filename": "期中成绩单.xlsx",
+            "url": "https://..."
+          },
+          {
+            "filename": "学生体质统计表.xlsx",
+            "url": "https://..."
+          }
+        ],
+        "excel_file_url_raw": "{\"期中成绩单.xlsx\": \"https://...\", \"学生体质统计表.xlsx\": \"https://...\"}",
         "created_at": "...",
         "updated_at": "...",
+        "fields": [...],
         "scores": [
           {
             "id": 1,
@@ -3168,7 +3237,7 @@ async def api_get_student_score(
         print(f"[student-scores/get] 查询成绩表头...")
         app_logger.info(f"[student-scores/get] 开始查询成绩表头 - class_id: {class_id}, exam_name: {exam_name}, term: {term}")
         cursor.execute(
-            "SELECT id, class_id, exam_name, term, remark, created_at, updated_at "
+            "SELECT id, class_id, exam_name, term, remark, excel_file_url, created_at, updated_at "
             "FROM ta_student_score_header "
             "WHERE class_id = %s AND exam_name = %s AND term = %s "
             "ORDER BY created_at DESC, updated_at DESC "
@@ -3271,13 +3340,18 @@ async def api_get_student_score(
         # 转换 header 中的 Decimal 类型（如果有）
         header = convert_decimal(header)
         
+        # 解析excel_file_url为数组格式
+        excel_file_url_raw = header.get('excel_file_url')
+        excel_file_urls = parse_excel_file_url(excel_file_url_raw)
+        
         result = {
             'id': header['id'],
             'class_id': header['class_id'],
             'exam_name': header['exam_name'],
             'term': header.get('term'),
             'remark': header.get('remark'),
-            'excel_file_url': header.get('excel_file_url'),
+            'excel_file_url': excel_file_urls,  # 返回数组格式
+            'excel_file_url_raw': excel_file_url_raw,  # 保留原始值（可选，用于兼容）
             'created_at': header.get('created_at'),
             'updated_at': header.get('updated_at'),
             'fields': fields,  # 字段定义列表
