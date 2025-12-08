@@ -90,6 +90,30 @@ print(f"[启动检查] SRS 服务器配置: 协议={'HTTPS' if SRS_USE_HTTPS els
 # ===== 停止事件，用于控制心跳协程退出 =====
 stop_event = asyncio.Event()
 
+# ===== 心跳检测函数 =====
+async def heartbeat_checker():
+    try:
+        while not stop_event.is_set():
+            now = time.time()
+            to_remove = []
+            for uid, conn in list(connections.items()):
+                if now - conn["last_heartbeat"] > 30:
+                    print(f"用户 {uid} 心跳超时，断开连接")
+                    await safe_close(conn["ws"], 1001, "Heartbeat timeout")
+                    to_remove.append(uid)
+            for uid in to_remove:
+                connections.pop(uid, None)  # 安全移除
+                # 清理用户从所有临时房间的成员列表中移除
+                # 注意：不再因为心跳超时自动解散房间，只移除成员，房间是否解散由业务消息控制（如 temp_room_owner_leave）
+                for group_id, room_info in list(active_temp_rooms.items()):
+                    members = room_info.get("members", [])
+                    if uid in members:
+                        members.remove(uid)
+                        print(f"[webrtc] 心跳超时：用户 {uid} 离开房间 {group_id}，当前成员数={len(members)}")
+            await asyncio.sleep(10)
+    except asyncio.CancelledError:
+        print("heartbeat_checker 已安全退出")
+
 from contextlib import asynccontextmanager
 # ===== 生命周期管理 =====
 @asynccontextmanager
@@ -1119,29 +1143,102 @@ async def notify_tencent_group_sync(user_id: str, groups: List[Dict[str, Any]]) 
                 if value not in (None, "", []):
                     payload[target_key] = value
                     break
+        
+        # 暂时移除 AppDefinedData 字段，因为可能导致错误码 10004
+        # 根据 is_class_group 字段构建 AppDefinedData（如果还没有设置）
+        # 注意：腾讯IM要求 Key 长度不超过32字节，Value 长度不超过4000字节
+        # if "AppDefinedData" not in payload or not payload.get("AppDefinedData"):
+        #     is_class_group = group.get("is_class_group")
+        #     if is_class_group is not None:
+        #         # 构建 AppDefinedData 数组，格式：[{"Key": "is_class_group", "Value": "1" 或 "0"}]
+        #         # 确保 Key 和 Value 都是字符串，且长度符合要求
+        #         key_str = "is_class_group"
+        #         value_str = "1" if int(is_class_group) else "0"
+        #         if len(key_str) <= 32 and len(value_str) <= 4000:
+        #             app_defined_data = [
+        #                 {
+        #                     "Key": key_str,
+        #                     "Value": value_str
+        #                 }
+        #             ]
+        #             payload["AppDefinedData"] = app_defined_data
+        #             app_logger.info(f"根据 is_class_group={is_class_group} 构建 AppDefinedData: {app_defined_data}")
+        #         else:
+        #             app_logger.warning(f"AppDefinedData Key 或 Value 长度超出限制: Key长度={len(key_str)}, Value长度={len(value_str)}")
+        #     elif group.get("classid") or group.get("class_id"):
+        #         # 如果有 classid，默认认为是班级群
+        #         key_str = "is_class_group"
+        #         value_str = "1"
+        #         if len(key_str) <= 32 and len(value_str) <= 4000:
+        #             app_defined_data = [
+        #                 {
+        #                     "Key": key_str,
+        #                     "Value": value_str
+        #                 }
+        #             ]
+        #             payload["AppDefinedData"] = app_defined_data
+        #             app_logger.info(f"根据 classid 存在，默认设置 is_class_group=1，AppDefinedData: {app_defined_data}")
+        #         else:
+        #             app_logger.warning(f"AppDefinedData Key 或 Value 长度超出限制: Key长度={len(key_str)}, Value长度={len(value_str)}")
 
-        member_info = group.get("member_info") or group.get("MemberList")
+        # 将本地角色值转换为腾讯IM的角色值
+        def convert_role_to_tencent(role_value):
+            """将本地角色值转换为腾讯IM的角色值
+            - 400 或 "Owner" -> "Owner" (群主)
+            - 300 或 "Admin" -> "Admin" (管理员)
+            - 其他 -> "Member" (普通成员)
+            """
+            if role_value is None:
+                return None
+            # 如果是字符串，尝试转换
+            if isinstance(role_value, str):
+                role_value = role_value.strip()
+                if role_value.upper() in ["OWNER", "400"]:
+                    return "Owner"
+                elif role_value.upper() in ["ADMIN", "300"]:
+                    return "Admin"
+                else:
+                    return "Member"
+            # 如果是数字
+            if isinstance(role_value, (int, float)):
+                if role_value == 400:
+                    return "Owner"
+                elif role_value == 300:
+                    return "Admin"
+                else:
+                    return "Member"
+            return "Member"
+        
         member_list = []
+        
+        # 处理 member_info（群主，dict）
+        member_info = group.get("member_info")
         if isinstance(member_info, dict):
             member_account = member_info.get("user_id") or member_info.get("Member_Account")
             if member_account:
                 member_entry = {"Member_Account": member_account}
                 role = member_info.get("self_role") or member_info.get("Role")
-                if role:
-                    member_entry["Role"] = str(role)
+                tencent_role = convert_role_to_tencent(role)
+                if tencent_role:
+                    member_entry["Role"] = tencent_role
                 member_list.append(member_entry)
-        elif isinstance(member_info, list):
-            for member in member_info:
+        
+        # 处理 members（成员列表，list）
+        members = group.get("members") or group.get("MemberList")
+        if isinstance(members, list):
+            for member in members:
                 if not isinstance(member, dict):
                     continue
                 member_account = member.get("user_id") or member.get("Member_Account")
                 if member_account:
                     entry = {"Member_Account": member_account}
-                    role = member.get("self_role") or member.get("Role")
-                    if role:
-                        entry["Role"] = str(role)
+                    role = member.get("self_role") or member.get("Role") or member.get("group_role")
+                    tencent_role = convert_role_to_tencent(role)
+                    if tencent_role:
+                        entry["Role"] = tencent_role
                     member_list.append(entry)
 
+        # 恢复 MemberList 字段，和群组一起添加
         if member_list:
             payload["MemberList"] = member_list
         owner_account = payload.get("Owner_Account")
@@ -1319,6 +1416,8 @@ async def notify_tencent_group_sync(user_id: str, groups: List[Dict[str, Any]]) 
 
         # 先尝试导入群组
         app_logger.info(f"发送群组导入请求: group_id={group_id}, payload_keys={list(group_payload.keys())}")
+        print(f"[send_single_group] 完整 payload: {group_payload}")
+        app_logger.info(f"[send_single_group] 完整 payload: {group_payload}")
         result = send_http_request(current_url, group_payload)
         
         # 检查响应中的错误信息
@@ -1337,6 +1436,7 @@ async def notify_tencent_group_sync(user_id: str, groups: List[Dict[str, Any]]) 
             elif action_status == "FAIL":
                 print(f"[send_single_group] 腾讯 API 返回错误: ErrorCode={error_code}, ErrorInfo={error_info}")
                 print(f"[send_single_group] 请求使用的 identifier: {actual_identifier}, group_id: {group_id}")
+                app_logger.error(f"[send_single_group] 腾讯 API 返回错误: ErrorCode={error_code}, ErrorInfo={error_info}, group_id={group_id}")
                 
                 # 如果是群组已存在的错误（10021），尝试使用更新 API
                 if error_code == 10021:
@@ -1382,9 +1482,24 @@ async def notify_tencent_group_sync(user_id: str, groups: List[Dict[str, Any]]) 
                         app_logger.error(f"群组 {group_id} 更新请求失败: {update_result.get('error')}")
                         # 返回原始导入结果
                         return result
+                else:
+                    # 其他错误码（如 10004），返回错误状态
+                    error_message = f"腾讯 API 错误: ErrorCode={error_code}, ErrorInfo={error_info}"
+                    print(f"[send_single_group] {error_message}")
+                    app_logger.error(f"[send_single_group] {error_message}, group_id={group_id}")
+                    # 修改 result 状态为错误
+                    result["status"] = "error"
+                    result["error"] = error_message
+                    result["error_code"] = error_code
+                    result["error_info"] = error_info
+                    return result
             else:
                 print(f"[send_single_group] import_group 返回未知状态: {parsed_body}")
                 app_logger.warning(f"[send_single_group] import_group 返回未知状态 group_id={group_id}: {parsed_body}")
+                # 未知状态也视为错误
+                result["status"] = "error"
+                result["error"] = f"未知状态: {action_status}"
+                return result
 
         app_logger.info(f"Tencent REST API 同步完成: group_id={group_id}")
         return result
@@ -1409,6 +1524,114 @@ async def notify_tencent_group_sync(user_id: str, groups: List[Dict[str, Any]]) 
         "error_count": error_count,
         "results": group_results
     }
+
+
+@app.post("/tencent/callback")
+async def tencent_im_callback(request: Request):
+    """
+    腾讯IM回调接口
+    接收腾讯IM的各种事件通知，包括群组解散、成员变动等
+    """
+    try:
+        body = await request.json()
+        print(f"[tencent/callback] 收到腾讯IM回调: {json.dumps(body, ensure_ascii=False, indent=2)}")
+        app_logger.info(f"[tencent/callback] 收到腾讯IM回调: {body}")
+        
+        # 获取回调类型
+        callback_command = body.get("CallbackCommand")
+        if not callback_command:
+            print("[tencent/callback] 警告: 回调数据中缺少 CallbackCommand")
+            app_logger.warning("[tencent/callback] 回调数据中缺少 CallbackCommand")
+            return JSONResponse({"ActionStatus": "OK", "ErrorCode": 0, "ErrorInfo": "OK"})
+        
+        # 处理群组解散回调
+        if callback_command == "Group.CallbackAfterGroupDestroyed":
+            print("[tencent/callback] 检测到群组解散回调")
+            app_logger.info("[tencent/callback] 检测到群组解散回调")
+            
+            # 获取群组ID
+            group_id = body.get("GroupId")
+            if not group_id:
+                print("[tencent/callback] 警告: 群组解散回调中缺少 GroupId")
+                app_logger.warning("[tencent/callback] 群组解散回调中缺少 GroupId")
+                return JSONResponse({"ActionStatus": "OK", "ErrorCode": 0, "ErrorInfo": "OK"})
+            
+            print(f"[tencent/callback] 开始处理群组解散: group_id={group_id}")
+            app_logger.info(f"[tencent/callback] 开始处理群组解散: group_id={group_id}")
+            
+            # 连接数据库
+            connection = get_db_connection()
+            if connection is None or not connection.is_connected():
+                print("[tencent/callback] 错误: 数据库连接失败")
+                app_logger.error("[tencent/callback] 数据库连接失败")
+                return JSONResponse({"ActionStatus": "OK", "ErrorCode": 0, "ErrorInfo": "OK"})
+            
+            cursor = None
+            try:
+                cursor = connection.cursor(dictionary=True)
+                
+                # 检查群组是否存在
+                cursor.execute("SELECT group_id FROM `groups` WHERE group_id = %s", (group_id,))
+                group_info = cursor.fetchone()
+                
+                if not group_info:
+                    print(f"[tencent/callback] 群组 {group_id} 在本地数据库中不存在，无需处理")
+                    app_logger.info(f"[tencent/callback] 群组 {group_id} 在本地数据库中不存在，无需处理")
+                    return JSONResponse({"ActionStatus": "OK", "ErrorCode": 0, "ErrorInfo": "OK"})
+                
+                # 开始事务
+                connection.start_transaction()
+                
+                # 1. 删除群组成员
+                print(f"[tencent/callback] 删除群组 {group_id} 的所有成员...")
+                cursor.execute("DELETE FROM `group_members` WHERE group_id = %s", (group_id,))
+                deleted_members = cursor.rowcount
+                print(f"[tencent/callback] 删除了 {deleted_members} 个群组成员")
+                
+                # 2. 删除群组
+                print(f"[tencent/callback] 删除群组 {group_id}...")
+                cursor.execute("DELETE FROM `groups` WHERE group_id = %s", (group_id,))
+                deleted_groups = cursor.rowcount
+                print(f"[tencent/callback] 删除了 {deleted_groups} 个群组")
+                
+                # 3. 删除临时语音房间（如果存在）
+                cursor.execute("DELETE FROM `temp_voice_rooms` WHERE group_id = %s", (group_id,))
+                deleted_rooms = cursor.rowcount
+                if deleted_rooms > 0:
+                    print(f"[tencent/callback] 删除了 {deleted_rooms} 个临时语音房间")
+                    cursor.execute("DELETE FROM `temp_voice_room_members` WHERE group_id = %s", (group_id,))
+                
+                # 提交事务
+                connection.commit()
+                print(f"[tencent/callback] 群组 {group_id} 解散处理完成")
+                app_logger.info(f"[tencent/callback] 群组 {group_id} 解散处理完成，删除了 {deleted_members} 个成员和 {deleted_groups} 个群组")
+                
+            except Exception as e:
+                if connection and connection.is_connected():
+                    connection.rollback()
+                print(f"[tencent/callback] 处理群组解散时发生错误: {e}")
+                app_logger.error(f"[tencent/callback] 处理群组解散时发生错误: {e}", exc_info=True)
+            finally:
+                if cursor:
+                    cursor.close()
+                if connection and connection.is_connected():
+                    connection.close()
+            
+            # 返回成功响应给腾讯IM
+            return JSONResponse({"ActionStatus": "OK", "ErrorCode": 0, "ErrorInfo": "OK"})
+        
+        # 其他类型的回调（可以在这里扩展）
+        else:
+            print(f"[tencent/callback] 收到未处理的回调类型: {callback_command}")
+            app_logger.info(f"[tencent/callback] 收到未处理的回调类型: {callback_command}")
+            # 仍然返回成功，避免腾讯IM重试
+            return JSONResponse({"ActionStatus": "OK", "ErrorCode": 0, "ErrorInfo": "OK"})
+            
+    except Exception as e:
+        print(f"[tencent/callback] 处理回调时发生异常: {e}")
+        app_logger.error(f"[tencent/callback] 处理回调时发生异常: {e}", exc_info=True)
+        # 返回成功，避免腾讯IM重试
+        return JSONResponse({"ActionStatus": "OK", "ErrorCode": 0, "ErrorInfo": "OK"})
 
 
 @app.post("/tencent/user_sig")
@@ -7251,7 +7474,154 @@ async def join_group(request: Request):
                     "message": "您已经在该群组中"
                 }, status_code=400)
             
-            # 3. 插入新成员（默认角色为普通成员，不是群主）
+            # 3. 先调用腾讯IM API添加成员
+            tencent_sync_success = False
+            tencent_error = None
+            
+            # 准备腾讯IM配置
+            identifier_to_use = TENCENT_API_IDENTIFIER
+            if not identifier_to_use:
+                # 尝试从用户信息中获取identifier
+                cursor.execute("SELECT id_number, phone FROM `users` WHERE user_id = %s", (user_id,))
+                user_info = cursor.fetchone()
+                if user_info:
+                    identifier_to_use = resolve_tencent_identifier(
+                        connection,
+                        id_number=user_info.get('id_number'),
+                        phone=user_info.get('phone')
+                    )
+            
+            if identifier_to_use and TENCENT_API_SDK_APP_ID:
+                try:
+                    # 生成或使用配置的 UserSig
+                    usersig_to_use: Optional[str] = None
+                    if TENCENT_API_SECRET_KEY:
+                        try:
+                            usersig_to_use = generate_tencent_user_sig(identifier_to_use)
+                            print(f"[groups/join] UserSig 生成成功")
+                        except Exception as e:
+                            print(f"[groups/join] UserSig 生成失败: {e}")
+                            usersig_to_use = TENCENT_API_USER_SIG
+                    else:
+                        usersig_to_use = TENCENT_API_USER_SIG
+                    
+                    if usersig_to_use:
+                        # 构建腾讯IM添加群成员的URL
+                        add_member_url = build_tencent_request_url(
+                            identifier=identifier_to_use,
+                            usersig=usersig_to_use,
+                            path_override="v4/group_open_http_svc/add_group_member"
+                        )
+                        
+                        if add_member_url:
+                            # 构建添加成员的payload
+                            add_member_payload = {
+                                "GroupId": group_id,
+                                "MemberList": [
+                                    {
+                                        "Member_Account": user_id,
+                                        "Role": "Member"  # 普通成员
+                                    }
+                                ],
+                                "Silence": 0  # 0表示添加时发送系统消息
+                            }
+                            
+                            print(f"[groups/join] 准备同步到腾讯IM - group_id={group_id}, user_id={user_id}")
+                            app_logger.info(f"[groups/join] 准备同步到腾讯IM - group_id={group_id}, user_id={user_id}")
+                            
+                            # 调用腾讯IM API
+                            def _add_tencent_member() -> Dict[str, Any]:
+                                """调用腾讯IM API添加成员"""
+                                headers = {
+                                    "Content-Type": "application/json; charset=utf-8"
+                                }
+                                encoded_payload = json.dumps(add_member_payload, ensure_ascii=False).encode("utf-8")
+                                request_obj = urllib.request.Request(
+                                    url=add_member_url,
+                                    data=encoded_payload,
+                                    headers=headers,
+                                    method="POST"
+                                )
+                                try:
+                                    with urllib.request.urlopen(request_obj, timeout=TENCENT_API_TIMEOUT) as response:
+                                        raw_body = response.read()
+                                        text_body = raw_body.decode("utf-8", errors="replace")
+                                        try:
+                                            parsed_body = json.loads(text_body)
+                                        except json.JSONDecodeError:
+                                            parsed_body = None
+                                        
+                                        result = {
+                                            "status": "success",
+                                            "http_status": response.status,
+                                            "response": parsed_body or text_body
+                                        }
+                                        return result
+                                except urllib.error.HTTPError as e:
+                                    raw_body = e.read() if e.fp else b""
+                                    text_body = raw_body.decode("utf-8", errors="replace")
+                                    try:
+                                        parsed_body = json.loads(text_body)
+                                    except json.JSONDecodeError:
+                                        parsed_body = None
+                                    
+                                    return {
+                                        "status": "error",
+                                        "http_status": e.code,
+                                        "response": parsed_body or text_body,
+                                        "error": f"HTTP {e.code}: {e.reason}"
+                                    }
+                                except Exception as e:
+                                    return {
+                                        "status": "error",
+                                        "http_status": None,
+                                        "error": str(e)
+                                    }
+                            
+                            tencent_result = await asyncio.to_thread(_add_tencent_member)
+                            
+                            if tencent_result.get("status") == "success":
+                                response_data = tencent_result.get("response")
+                                if isinstance(response_data, dict):
+                                    action_status = response_data.get("ActionStatus")
+                                    error_code = response_data.get("ErrorCode")
+                                    if action_status == "OK" and error_code == 0:
+                                        tencent_sync_success = True
+                                        print(f"[groups/join] 腾讯IM同步成功 - group_id={group_id}, user_id={user_id}")
+                                        app_logger.info(f"[groups/join] 腾讯IM同步成功 - group_id={group_id}, user_id={user_id}")
+                                    else:
+                                        tencent_error = f"腾讯IM返回错误: ErrorCode={error_code}, ErrorInfo={response_data.get('ErrorInfo')}"
+                                        print(f"[groups/join] {tencent_error}")
+                                        app_logger.warning(f"[groups/join] {tencent_error}")
+                                else:
+                                    tencent_error = f"腾讯IM返回格式错误: {response_data}"
+                                    print(f"[groups/join] {tencent_error}")
+                                    app_logger.warning(f"[groups/join] {tencent_error}")
+                            else:
+                                tencent_error = tencent_result.get("error", "未知错误")
+                                print(f"[groups/join] 腾讯IM API调用失败: {tencent_error}")
+                                app_logger.warning(f"[groups/join] 腾讯IM API调用失败: {tencent_error}")
+                        else:
+                            tencent_error = "无法构建腾讯IM URL"
+                            print(f"[groups/join] {tencent_error}")
+                            app_logger.warning(f"[groups/join] {tencent_error}")
+                    else:
+                        tencent_error = "缺少可用的UserSig"
+                        print(f"[groups/join] {tencent_error}")
+                        app_logger.warning(f"[groups/join] {tencent_error}")
+                except Exception as e:
+                    tencent_error = f"调用腾讯IM API时发生异常: {str(e)}"
+                    print(f"[groups/join] {tencent_error}")
+                    app_logger.error(f"[groups/join] {tencent_error}")
+                    import traceback
+                    traceback_str = traceback.format_exc()
+                    app_logger.error(f"[groups/join] 异常堆栈: {traceback_str}")
+            else:
+                tencent_error = "缺少腾讯IM配置（identifier或SDKAppID）"
+                print(f"[groups/join] {tencent_error}")
+                app_logger.warning(f"[groups/join] {tencent_error}")
+            
+            # 4. 插入新成员到数据库（默认角色为普通成员，不是群主）
             print(f"[groups/join] 插入新成员到群组 {group_id}...")
             current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             
@@ -7282,7 +7652,7 @@ async def join_group(request: Request):
             lastrowid = cursor.lastrowid
             print(f"[groups/join] 插入成员完成, 影响行数: {affected_rows}, lastrowid: {lastrowid}")
             
-            # 4. 更新群组的成员数量
+            # 5. 更新群组的成员数量
             print(f"[groups/join] 更新群组 {group_id} 的成员数量...")
             cursor.execute(
                 "UPDATE `groups` SET member_num = member_num + 1 WHERE group_id = %s",
@@ -7294,6 +7664,10 @@ async def join_group(request: Request):
             connection.commit()
             print(f"[groups/join] 事务提交成功")
             
+            # 记录腾讯IM同步结果
+            if not tencent_sync_success and tencent_error:
+                app_logger.warning(f"[groups/join] 数据库操作成功，但腾讯IM同步失败: {tencent_error}")
+            
             result = {
                 "code": 200,
                 "message": "成功加入群组",
@@ -7301,7 +7675,11 @@ async def join_group(request: Request):
                     "group_id": group_id,
                     "user_id": user_id,
                     "user_name": user_name,
-                    "join_time": current_time
+                    "join_time": current_time,
+                    "tencent_sync": {
+                        "success": tencent_sync_success,
+                        "error": tencent_error if not tencent_sync_success else None
+                    }
                 }
             }
             
@@ -8559,7 +8937,147 @@ async def dismiss_group(request: Request):
             
             print(f"[groups/dismiss] 验证通过: 用户 {user_id} 是群主，可以解散群组")
             
-            # 4. 删除群组的所有成员
+            # 4. 先调用腾讯IM API销毁群组
+            tencent_sync_success = False
+            tencent_error = None
+            
+            # 准备腾讯IM配置
+            identifier_to_use = TENCENT_API_IDENTIFIER
+            if not identifier_to_use:
+                # 尝试从用户信息中获取identifier
+                cursor.execute("SELECT id_number, phone FROM `users` WHERE user_id = %s", (user_id,))
+                user_info = cursor.fetchone()
+                if user_info:
+                    identifier_to_use = resolve_tencent_identifier(
+                        connection,
+                        id_number=user_info.get('id_number'),
+                        phone=user_info.get('phone')
+                    )
+            
+            if identifier_to_use and TENCENT_API_SDK_APP_ID:
+                try:
+                    # 生成或使用配置的 UserSig
+                    usersig_to_use: Optional[str] = None
+                    if TENCENT_API_SECRET_KEY:
+                        try:
+                            usersig_to_use = generate_tencent_user_sig(identifier_to_use)
+                            print(f"[groups/dismiss] UserSig 生成成功")
+                        except Exception as e:
+                            print(f"[groups/dismiss] UserSig 生成失败: {e}")
+                            usersig_to_use = TENCENT_API_USER_SIG
+                    else:
+                        usersig_to_use = TENCENT_API_USER_SIG
+                    
+                    if usersig_to_use:
+                        # 构建腾讯IM销毁群组的URL
+                        destroy_url = build_tencent_request_url(
+                            identifier=identifier_to_use,
+                            usersig=usersig_to_use,
+                            path_override="v4/group_open_http_svc/destroy_group"
+                        )
+                        
+                        if destroy_url:
+                            # 构建销毁群组的payload
+                            destroy_payload = {
+                                "GroupId": group_id
+                            }
+                            
+                            print(f"[groups/dismiss] 准备同步到腾讯IM - group_id={group_id}")
+                            app_logger.info(f"[groups/dismiss] 准备同步到腾讯IM - group_id={group_id}")
+                            
+                            # 调用腾讯IM API
+                            def _destroy_tencent_group() -> Dict[str, Any]:
+                                """调用腾讯IM API销毁群组"""
+                                headers = {
+                                    "Content-Type": "application/json; charset=utf-8"
+                                }
+                                encoded_payload = json.dumps(destroy_payload, ensure_ascii=False).encode("utf-8")
+                                request_obj = urllib.request.Request(
+                                    url=destroy_url,
+                                    data=encoded_payload,
+                                    headers=headers,
+                                    method="POST"
+                                )
+                                try:
+                                    with urllib.request.urlopen(request_obj, timeout=TENCENT_API_TIMEOUT) as response:
+                                        raw_body = response.read()
+                                        text_body = raw_body.decode("utf-8", errors="replace")
+                                        try:
+                                            parsed_body = json.loads(text_body)
+                                        except json.JSONDecodeError:
+                                            parsed_body = None
+                                        
+                                        result = {
+                                            "status": "success",
+                                            "http_status": response.status,
+                                            "response": parsed_body or text_body
+                                        }
+                                        return result
+                                except urllib.error.HTTPError as e:
+                                    raw_body = e.read() if e.fp else b""
+                                    text_body = raw_body.decode("utf-8", errors="replace")
+                                    try:
+                                        parsed_body = json.loads(text_body)
+                                    except json.JSONDecodeError:
+                                        parsed_body = None
+                                    
+                                    return {
+                                        "status": "error",
+                                        "http_status": e.code,
+                                        "response": parsed_body or text_body,
+                                        "error": f"HTTP {e.code}: {e.reason}"
+                                    }
+                                except Exception as e:
+                                    return {
+                                        "status": "error",
+                                        "http_status": None,
+                                        "error": str(e)
+                                    }
+                            
+                            tencent_result = _destroy_tencent_group()
+                            
+                            if tencent_result.get("status") == "success":
+                                response_data = tencent_result.get("response")
+                                if isinstance(response_data, dict):
+                                    action_status = response_data.get("ActionStatus")
+                                    error_code = response_data.get("ErrorCode")
+                                    if action_status == "OK" and error_code == 0:
+                                        tencent_sync_success = True
+                                        print(f"[groups/dismiss] 腾讯IM同步成功 - group_id={group_id}")
+                                        app_logger.info(f"[groups/dismiss] 腾讯IM同步成功 - group_id={group_id}")
+                                    else:
+                                        tencent_error = f"腾讯IM返回错误: ErrorCode={error_code}, ErrorInfo={response_data.get('ErrorInfo')}"
+                                        print(f"[groups/dismiss] {tencent_error}")
+                                        app_logger.warning(f"[groups/dismiss] {tencent_error}")
+                                else:
+                                    tencent_error = f"腾讯IM返回格式错误: {response_data}"
+                                    print(f"[groups/dismiss] {tencent_error}")
+                                    app_logger.warning(f"[groups/dismiss] {tencent_error}")
+                            else:
+                                tencent_error = tencent_result.get("error", "未知错误")
+                                print(f"[groups/dismiss] 腾讯IM API调用失败: {tencent_error}")
+                                app_logger.warning(f"[groups/dismiss] 腾讯IM API调用失败: {tencent_error}")
+                        else:
+                            tencent_error = "无法构建腾讯IM URL"
+                            print(f"[groups/dismiss] {tencent_error}")
+                            app_logger.warning(f"[groups/dismiss] {tencent_error}")
+                    else:
+                        tencent_error = "缺少可用的UserSig"
+                        print(f"[groups/dismiss] {tencent_error}")
+                        app_logger.warning(f"[groups/dismiss] {tencent_error}")
+                except Exception as e:
+                    tencent_error = f"调用腾讯IM API时发生异常: {str(e)}"
+                    print(f"[groups/dismiss] {tencent_error}")
+                    app_logger.error(f"[groups/dismiss] {tencent_error}")
+                    import traceback
+                    traceback_str = traceback.format_exc()
+                    app_logger.error(f"[groups/dismiss] 异常堆栈: {traceback_str}")
+            else:
+                tencent_error = "缺少腾讯IM配置（identifier或SDKAppID）"
+                print(f"[groups/dismiss] {tencent_error}")
+                app_logger.warning(f"[groups/dismiss] {tencent_error}")
+            
+            # 5. 删除群组的所有成员
             print(f"[groups/dismiss] 删除群组 {group_id} 的所有成员...")
             cursor.execute(
                 "DELETE FROM `group_members` WHERE group_id = %s",
@@ -8568,7 +9086,7 @@ async def dismiss_group(request: Request):
             deleted_members = cursor.rowcount
             print(f"[groups/dismiss] 已删除 {deleted_members} 个成员")
             
-            # 5. 删除群组本身
+            # 6. 删除群组本身
             print(f"[groups/dismiss] 删除群组 {group_id}...")
             cursor.execute(
                 "DELETE FROM `groups` WHERE group_id = %s",
@@ -8589,6 +9107,10 @@ async def dismiss_group(request: Request):
             connection.commit()
             print(f"[groups/dismiss] 事务提交成功")
             
+            # 记录腾讯IM同步结果
+            if not tencent_sync_success and tencent_error:
+                app_logger.warning(f"[groups/dismiss] 数据库操作成功，但腾讯IM同步失败: {tencent_error}")
+            
             result = {
                 "code": 200,
                 "message": "成功解散群组",
@@ -8596,7 +9118,11 @@ async def dismiss_group(request: Request):
                     "group_id": group_id,
                     "group_name": group_name,
                     "user_id": user_id,
-                    "deleted_members": deleted_members
+                    "deleted_members": deleted_members,
+                    "tencent_sync": {
+                        "success": tencent_sync_success,
+                        "error": tencent_error if not tencent_sync_success else None
+                    }
                 }
             }
             
@@ -11365,298 +11891,384 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                 connection.commit()
                         elif msg_data1['type'] == "3": 
                             print(" 创建群")   
-                            cursor = connection.cursor(dictionary=True)
-                            
-                            # 获取当前时间
-                            current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            
-                            # 字段映射：统一使用与 /groups/sync 相同的字段名
-                            # 兼容旧字段名（nickname, headImage_path, owner_id, school_id, class_id）
-                            group_name = msg_data1.get('group_name') or msg_data1.get('nickname', '')
-                            face_url = msg_data1.get('face_url') or msg_data1.get('headImage_path', '')
-                            detail_face_url = msg_data1.get('detail_face_url') or face_url
-                            # 转换 group_type：数据库中是整数类型，需要将字符串转换为整数
-                            group_type_raw = msg_data1.get('group_type', '')
-                            group_type = convert_group_type_to_int(group_type_raw)
-                            owner_identifier = msg_data1.get('owner_identifier') or msg_data1.get('owner_id', '')
-                            schoolid = msg_data1.get('schoolid') or msg_data1.get('school_id')
-                            classid = msg_data1.get('classid') or msg_data1.get('class_id')
-                            is_class_group = msg_data1.get('is_class_group')
-                            if is_class_group is None:
-                                is_class_group = 1 if classid else 0
-                            
-                            # 生成群ID：优先使用客户端传过来的，如果没有则使用班级ID+01，否则使用UUID
-                            unique_group_id = msg_data1.get('group_id')
-                            print(f"[创建群] 收到客户端传入的 group_id={unique_group_id}, classid={classid}")
-                            app_logger.info(f"[创建群] 收到客户端传入的 group_id={unique_group_id}, classid={classid}")
-                            if not unique_group_id:
-                                if classid:
-                                    # 班级群：使用班级ID + "01"
-                                    unique_group_id = str(classid) + "01"
-                                    print(f"[创建群] 使用班级ID生成群ID: {unique_group_id}")
-                                else:
-                                    # 非班级群：使用UUID
-                                    unique_group_id = str(uuid.uuid4())
-                                    print(f"[创建群] 使用UUID生成群ID: {unique_group_id}")
-                            else:
-                                print(f"[创建群] 使用客户端传入的群ID: {unique_group_id}")
-                            
-                            # 插入 groups 表
-                            insert_group_sql = """
-                                INSERT INTO `groups` (
-                                    group_id, group_name, group_type, face_url, detail_face_url,
-                                    owner_identifier, create_time, max_member_num, member_num,
-                                    introduction, notification, searchable, visible, add_option,
-                                    is_shutup_all, next_msg_seq, latest_seq, last_msg_time,
-                                    last_info_time, info_seq, detail_info_seq, detail_group_id,
-                                    detail_group_name, detail_group_type, detail_is_shutup_all,
-                                    online_member_num, classid, schoolid, is_class_group
-                                ) VALUES (
-                                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                                    %s, %s, %s, %s, %s, %s, %s, %s,
-                                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-                                )
-                            """
-                            insert_group_params = (
-                                unique_group_id,  # group_id
-                                group_name,  # group_name
-                                group_type,  # group_type
-                                face_url,  # face_url
-                                detail_face_url,  # detail_face_url
-                                owner_identifier,  # owner_identifier
-                                current_time,  # create_time
-                                500,  # max_member_num (默认500)
-                                len(msg_data1.get('members', [])),  # member_num
-                                '',  # introduction
-                                '',  # notification
-                                1,  # searchable (默认可搜索)
-                                1,  # visible (默认可见)
-                                0,  # add_option (默认0)
-                                0,  # is_shutup_all (默认0)
-                                0,  # next_msg_seq
-                                0,  # latest_seq
-                                current_time,  # last_msg_time
-                                current_time,  # last_info_time
-                                0,  # info_seq
-                                0,  # detail_info_seq
-                                None,  # detail_group_id
-                                None,  # detail_group_name
-                                None,  # detail_group_type
-                                None,  # detail_is_shutup_all
-                                0,  # online_member_num
-                                classid,  # classid
-                                schoolid,  # schoolid
-                                is_class_group  # is_class_group
-                            )
-                            
-                            print(f"[创建群] 插入 groups 表 - group_id={unique_group_id}, group_name={group_name}")
-                            cursor.execute(insert_group_sql, insert_group_params)
-                            
-                            # 插入群成员到 group_members 表
-                            # 1. 优先处理 member_info（群主，必须存在）
-                            # 2. 然后处理 members 数组（管理员和其他成员）
-                            members_list = msg_data1.get('members', [])
-                            member_info = msg_data1.get('member_info')
-                            
-                            # 记录已处理的成员ID，避免重复插入
-                            processed_member_ids = set()
-                            
-                            # 第一步：处理 member_info（群主，必须存在）
-                            if member_info:
-                                member_user_id = member_info.get('user_id')
-                                if member_user_id:
-                                    print(f"[创建群] 处理 member_info（群主）: user_id={member_user_id}")
-                                    member_user_name = member_info.get('user_name', '')
-                                    member_self_role = member_info.get('self_role', 400)  # 默认群主
-                                    
-                                    # 处理 join_time
-                                    member_join_time = current_time
-                                    if 'join_time' in member_info:
-                                        join_time_value = member_info.get('join_time')
-                                        if join_time_value:
-                                            try:
-                                                if isinstance(join_time_value, (int, float)):
-                                                    if join_time_value > 2147483647:
-                                                        join_time_value = int(join_time_value / 1000)
-                                                    dt = datetime.datetime.fromtimestamp(int(join_time_value))
-                                                    member_join_time = dt.strftime('%Y-%m-%d %H:%M:%S')
-                                                else:
-                                                    member_join_time = join_time_value
-                                            except (ValueError, OSError):
-                                                member_join_time = current_time
-                                    
-                                    insert_member_sql = """
-                                        INSERT INTO `group_members` (
-                                            group_id, user_id, user_name, self_role, join_time, msg_flag,
-                                            self_msg_flag, readed_seq, unread_num
-                                        ) VALUES (
-                                            %s, %s, %s, %s, %s, %s, %s, %s, %s
-                                        )
-                                    """
-                                    insert_member_params = (
-                                        unique_group_id,
-                                        member_user_id,
-                                        member_user_name if member_user_name else None,
-                                        member_self_role,
-                                        member_join_time,
-                                        member_info.get('msg_flag', 0),
-                                        member_info.get('self_msg_flag', 0),
-                                        member_info.get('readed_seq', 0),
-                                        member_info.get('unread_num', 0)
-                                    )
-                                    
-                                    print(f"[创建群] 插入群主 - group_id={unique_group_id}, user_id={member_user_id}, user_name={member_user_name}, self_role={member_self_role}")
-                                    app_logger.info(f"[创建群] 插入群主 - group_id={unique_group_id}, user_id={member_user_id}, user_name={member_user_name}, self_role={member_self_role}")
-                                    cursor.execute(insert_member_sql, insert_member_params)
-                                    processed_member_ids.add(member_user_id)
-                                else:
-                                    print(f"[创建群] 警告: member_info 缺少 user_id，跳过")
-                            else:
-                                print(f"[创建群] 警告: 缺少 member_info（群主信息），这是必需的")
-                            
-                            # 第二步：处理 members 数组（管理员和其他成员）
-                            if members_list:
-                            
-                                for m in members_list:
-                                    # 兼容新旧字段名
-                                    member_user_id = m.get('user_id') or m.get('unique_member_id')
-                                    member_user_name = m.get('user_name') or m.get('member_name', '')
-                                    
-                                    if not member_user_id:
-                                        print(f"[创建群] 警告: 成员信息缺少 user_id/unique_member_id，跳过")
-                                        continue
-                                    
-                                    # 如果该成员已经在 member_info 中处理过（群主），跳过避免重复
-                                    if member_user_id in processed_member_ids:
-                                        print(f"[创建群] 跳过已处理的成员（群主）: user_id={member_user_id}")
-                                        continue
-                                    
-                                    # self_role 字段：优先使用 self_role，否则从 group_role 转换
-                                    if 'self_role' in m:
-                                        self_role = m.get('self_role')
-                                    else:
-                                        # 从 group_role 转换：400=群主，300=管理员，其他=普通成员(200)
-                                        group_role = m.get('group_role')
-                                        if isinstance(group_role, int):
-                                            if group_role == 400:
-                                                self_role = 400  # 群主（但应该已经在 member_info 中处理）
-                                            elif group_role == 300:
-                                                self_role = 300  # 管理员（保持300）
-                                            else:
-                                                self_role = 200  # 普通成员
-                                        elif isinstance(group_role, str):
-                                            # 字符串格式的角色
-                                            if group_role in ['owner', '群主', '400'] or member_user_id == owner_identifier:
-                                                self_role = 400  # 群主（但应该已经在 member_info 中处理）
-                                            elif group_role in ['admin', '管理员', '300']:
-                                                self_role = 300  # 管理员
-                                            else:
-                                                self_role = 200  # 普通成员
-                                        else:
-                                            # 默认：如果是创建者则为群主，否则为普通成员
-                                            if member_user_id == owner_identifier:
-                                                self_role = 400  # 群主（但应该已经在 member_info 中处理）
-                                            else:
-                                                self_role = 200  # 普通成员
-                                    
-                                    insert_member_sql = """
-                                        INSERT INTO `group_members` (
-                                            group_id, user_id, user_name, self_role, join_time, msg_flag,
-                                            self_msg_flag, readed_seq, unread_num
-                                        ) VALUES (
-                                            %s, %s, %s, %s, %s, %s, %s, %s, %s
-                                        )
-                                    """
-                                    # 处理 join_time：支持时间戳格式（与 /groups/sync 一致）或直接使用当前时间
-                                    member_join_time = current_time
-                                    if 'join_time' in m:
-                                        join_time_value = m.get('join_time')
-                                        if join_time_value:
-                                            # 如果是时间戳，转换为 datetime 字符串
-                                            try:
-                                                if isinstance(join_time_value, (int, float)):
-                                                    if join_time_value > 2147483647:  # 毫秒级时间戳
-                                                        join_time_value = int(join_time_value / 1000)
-                                                    dt = datetime.datetime.fromtimestamp(int(join_time_value))
-                                                    member_join_time = dt.strftime('%Y-%m-%d %H:%M:%S')
-                                                else:
-                                                    member_join_time = join_time_value
-                                            except (ValueError, OSError):
-                                                member_join_time = current_time
-                                    
-                                    # 获取其他成员字段（与 /groups/sync 一致）
-                                    member_msg_flag = m.get('msg_flag', 0)
-                                    member_self_msg_flag = m.get('self_msg_flag', 0)
-                                    member_readed_seq = m.get('readed_seq', 0)
-                                    member_unread_num = m.get('unread_num', 0)
-                                    
-                                    insert_member_params = (
-                                        unique_group_id,  # group_id
-                                        member_user_id,  # user_id
-                                        member_user_name if member_user_name else None,  # user_name
-                                        self_role,  # self_role
-                                        member_join_time,  # join_time
-                                        member_msg_flag,  # msg_flag
-                                        member_self_msg_flag,  # self_msg_flag
-                                        member_readed_seq,  # readed_seq
-                                        member_unread_num   # unread_num
-                                    )
-                                    
-                                    print(f"[创建群] 插入成员 - group_id={unique_group_id}, user_id={member_user_id}, user_name={member_user_name}, self_role={self_role}")
-                                    app_logger.info(f"[创建群] 插入成员 - group_id={unique_group_id}, user_id={member_user_id}, user_name={member_user_name}, self_role={self_role}")
-                                    cursor.execute(insert_member_sql, insert_member_params)
-                                    processed_member_ids.add(member_user_id)
-
-                            connection.commit()
-                            
-                            # 同步到腾讯IM（异步执行，不阻塞响应）
+                            app_logger.info(f"[创建群] 开始处理创建群组请求 - user_id={user_id}")
                             try:
-                                # 构建腾讯IM需要的群组数据格式
-                                tencent_group_data = {
-                                    "GroupId": unique_group_id,
-                                    "group_id": unique_group_id,
-                                    "Name": group_name,
-                                    "group_name": group_name,
-                                    "Type": group_type_raw,  # 使用原始字符串类型，build_group_payload 会转换
-                                    "group_type": group_type_raw,
-                                    "Owner_Account": owner_identifier,
-                                    "owner_identifier": owner_identifier,
-                                    "FaceUrl": face_url,
-                                    "face_url": face_url,
-                                    "Introduction": msg_data1.get('introduction', ''),
-                                    "introduction": msg_data1.get('introduction', ''),
-                                    "Notification": msg_data1.get('notification', ''),
-                                    "notification": msg_data1.get('notification', ''),
-                                    "MaxMemberCount": msg_data1.get('max_member_num', 500),
-                                    "max_member_num": msg_data1.get('max_member_num', 500),
-                                    "ApplyJoinOption": msg_data1.get('add_option', 0),
-                                    "add_option": msg_data1.get('add_option', 0),
-                                    "member_info": member_info,  # 群主信息
-                                    "MemberList": []  # 成员列表（包含群主和管理员）
-                                }
+                                cursor = connection.cursor(dictionary=True)
                                 
-                                # 构建成员列表（包含群主和管理员）
-                                member_list = []
-                                # 添加群主（从 member_info）
+                                # 获取当前时间
+                                current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                
+                                # 字段映射：统一使用与 /groups/sync 相同的字段名
+                                # 兼容旧字段名（nickname, headImage_path, owner_id, school_id, class_id）
+                                group_name = msg_data1.get('group_name') or msg_data1.get('nickname', '')
+                                face_url = msg_data1.get('face_url') or msg_data1.get('headImage_path', '')
+                                detail_face_url = msg_data1.get('detail_face_url') or face_url
+                                # 转换 group_type：数据库中是整数类型，需要将字符串转换为整数
+                                group_type_raw = msg_data1.get('group_type', '')
+                                group_type = convert_group_type_to_int(group_type_raw)
+                                owner_identifier = msg_data1.get('owner_identifier') or msg_data1.get('owner_id', '')
+                                schoolid = msg_data1.get('schoolid') or msg_data1.get('school_id')
+                                classid = msg_data1.get('classid') or msg_data1.get('class_id')
+                                is_class_group = msg_data1.get('is_class_group')
+                                if is_class_group is None:
+                                    is_class_group = 1 if classid else 0
+                                
+                                # 生成群ID：优先使用客户端传过来的，如果没有则使用班级ID+01，否则使用UUID
+                                unique_group_id = msg_data1.get('group_id')
+                                print(f"[创建群] 收到客户端传入的 group_id={unique_group_id}, classid={classid}")
+                                app_logger.info(f"[创建群] 收到客户端传入的 group_id={unique_group_id}, classid={classid}")
+                                
+                                # 检查 classid 是否看起来像是一个群组ID（以"01"结尾），如果是则可能是客户端错误
+                                if classid and str(classid).endswith("01"):
+                                    # 检查这个 classid 是否在 groups 表中存在（说明是群组ID而不是班级ID）
+                                    cursor.execute("SELECT group_id FROM `groups` WHERE group_id = %s", (str(classid),))
+                                    existing_group = cursor.fetchone()
+                                    if existing_group:
+                                        error_msg = f"classid={classid} 是一个已存在的群组ID，而不是班级ID。请使用正确的班级ID创建群组。"
+                                        print(f"[创建群] 错误: {error_msg}")
+                                        app_logger.error(f"[创建群] {error_msg}")
+                                        # 拒绝创建，返回错误消息给客户端
+                                        error_response = {
+                                            "type": "error",
+                                            "message": error_msg,
+                                            "code": 400
+                                        }
+                                        error_response_json = json.dumps(error_response, ensure_ascii=False)
+                                        await websocket.send_text(error_response_json)
+                                        print(f"[创建群] 已拒绝创建请求并向客户端返回错误 - user_id={user_id}, classid={classid}")
+                                        continue  # 跳过后续处理
+                                
+                                if not unique_group_id:
+                                    if classid:
+                                        # 班级群：使用班级ID + "01"
+                                        unique_group_id = str(classid) + "01"
+                                        print(f"[创建群] 使用班级ID生成群ID: {unique_group_id}")
+                                    else:
+                                        # 非班级群：使用UUID
+                                        unique_group_id = str(uuid.uuid4())
+                                        print(f"[创建群] 使用UUID生成群ID: {unique_group_id}")
+                                else:
+                                    print(f"[创建群] 使用客户端传入的群ID: {unique_group_id}")
+                                
+                                # 插入 groups 表
+                                insert_group_sql = """
+                                    INSERT INTO `groups` (
+                                        group_id, group_name, group_type, face_url, detail_face_url,
+                                        owner_identifier, create_time, max_member_num, member_num,
+                                        introduction, notification, searchable, visible, add_option,
+                                        is_shutup_all, next_msg_seq, latest_seq, last_msg_time,
+                                        last_info_time, info_seq, detail_info_seq, detail_group_id,
+                                        detail_group_name, detail_group_type, detail_is_shutup_all,
+                                        online_member_num, classid, schoolid, is_class_group
+                                    ) VALUES (
+                                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                        %s, %s, %s, %s, %s, %s, %s, %s,
+                                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                                    )
+                                """
+                                insert_group_params = (
+                                    unique_group_id,  # group_id
+                                    group_name,  # group_name
+                                    group_type,  # group_type
+                                    face_url,  # face_url
+                                    detail_face_url,  # detail_face_url
+                                    owner_identifier,  # owner_identifier
+                                    current_time,  # create_time
+                                    500,  # max_member_num (默认500)
+                                    len(msg_data1.get('members', [])),  # member_num
+                                    '',  # introduction
+                                    '',  # notification
+                                    1,  # searchable (默认可搜索)
+                                    1,  # visible (默认可见)
+                                    0,  # add_option (默认0)
+                                    0,  # is_shutup_all (默认0)
+                                    0,  # next_msg_seq
+                                    0,  # latest_seq
+                                    current_time,  # last_msg_time
+                                    current_time,  # last_info_time
+                                    0,  # info_seq
+                                    0,  # detail_info_seq
+                                    None,  # detail_group_id
+                                    None,  # detail_group_name
+                                    None,  # detail_group_type
+                                    None,  # detail_is_shutup_all
+                                    0,  # online_member_num
+                                    classid,  # classid
+                                    schoolid,  # schoolid
+                                    is_class_group  # is_class_group
+                                )
+                                
+                                # 检查群组是否已存在
+                                cursor.execute(
+                                    "SELECT group_id FROM `groups` WHERE group_id = %s",
+                                    (unique_group_id,)
+                                )
+                                existing_group = cursor.fetchone()
+                                
+                                if existing_group:
+                                    print(f"[创建群] 群组 {unique_group_id} 已存在，跳过插入 groups 表")
+                                    app_logger.info(f"[创建群] 群组 {unique_group_id} 已存在，跳过插入 groups 表")
+                                else:
+                                    print(f"[创建群] 插入 groups 表 - group_id={unique_group_id}, group_name={group_name}")
+                                    app_logger.info(f"[创建群] 插入 groups 表 - group_id={unique_group_id}, group_name={group_name}, is_class_group={is_class_group}")
+                                    try:
+                                        cursor.execute(insert_group_sql, insert_group_params)
+                                        affected_rows = cursor.rowcount
+                                        print(f"[创建群] 插入 groups 表成功 - group_id={unique_group_id}, 影响行数: {affected_rows}")
+                                        app_logger.info(f"[创建群] 插入 groups 表成功 - group_id={unique_group_id}, 影响行数: {affected_rows}")
+                                    except Exception as insert_error:
+                                        error_msg = f"插入 groups 表失败 - group_id={unique_group_id}, error={insert_error}"
+                                        print(f"[创建群] {error_msg}")
+                                        app_logger.error(f"[创建群] {error_msg}", exc_info=True)
+                                        import traceback
+                                        traceback_str = traceback.format_exc()
+                                        print(f"[创建群] 错误堆栈: {traceback_str}")
+                                        raise  # 重新抛出异常，让外层处理
+                                
+                                # 插入群成员到 group_members 表
+                                # 1. 优先处理 member_info（群主，必须存在）
+                                # 2. 然后处理 members 数组（管理员和其他成员）
+                                members_list = msg_data1.get('members', [])
+                                member_info = msg_data1.get('member_info')
+                                
+                                # 记录已处理的成员ID，避免重复插入
+                                processed_member_ids = set()
+                                
+                                # 第一步：处理 member_info（群主，必须存在）
                                 if member_info:
-                                    owner_user_id = member_info.get('user_id')
-                                    if owner_user_id:
-                                        member_list.append({
-                                            "Member_Account": owner_user_id,
-                                            "user_id": owner_user_id,
-                                            "Role": "Owner",
-                                            "self_role": 400
-                                        })
-                                # 添加管理员和其他成员（从 members 数组）
+                                    member_user_id = member_info.get('user_id')
+                                    if member_user_id:
+                                        print(f"[创建群] 处理 member_info（群主）: user_id={member_user_id}")
+                                        member_user_name = member_info.get('user_name', '')
+                                        member_self_role = member_info.get('self_role', 400)  # 默认群主
+                                        
+                                        # 处理 join_time
+                                        member_join_time = current_time
+                                        if 'join_time' in member_info:
+                                            join_time_value = member_info.get('join_time')
+                                            if join_time_value:
+                                                try:
+                                                    if isinstance(join_time_value, (int, float)):
+                                                        if join_time_value > 2147483647:
+                                                            join_time_value = int(join_time_value / 1000)
+                                                        dt = datetime.datetime.fromtimestamp(int(join_time_value))
+                                                        member_join_time = dt.strftime('%Y-%m-%d %H:%M:%S')
+                                                    else:
+                                                        member_join_time = join_time_value
+                                                except (ValueError, OSError):
+                                                    member_join_time = current_time
+                                        
+                                        insert_member_sql = """
+                                            INSERT INTO `group_members` (
+                                                group_id, user_id, user_name, self_role, join_time, msg_flag,
+                                                self_msg_flag, readed_seq, unread_num
+                                            ) VALUES (
+                                                %s, %s, %s, %s, %s, %s, %s, %s, %s
+                                            )
+                                        """
+                                        insert_member_params = (
+                                            unique_group_id,
+                                            member_user_id,
+                                            member_user_name if member_user_name else None,
+                                            member_self_role,
+                                            member_join_time,
+                                            member_info.get('msg_flag', 0),
+                                            member_info.get('self_msg_flag', 0),
+                                            member_info.get('readed_seq', 0),
+                                            member_info.get('unread_num', 0)
+                                        )
+                                        
+                                        # 检查群主是否已在群组中
+                                        cursor.execute(
+                                            "SELECT user_id FROM `group_members` WHERE group_id = %s AND user_id = %s",
+                                            (unique_group_id, member_user_id)
+                                        )
+                                        existing_owner = cursor.fetchone()
+                                        
+                                        if existing_owner:
+                                            print(f"[创建群] 群主 {member_user_id} 已在群组 {unique_group_id} 中，跳过插入")
+                                            app_logger.info(f"[创建群] 群主 {member_user_id} 已在群组 {unique_group_id} 中，跳过插入")
+                                        else:
+                                            print(f"[创建群] 插入群主 - group_id={unique_group_id}, user_id={member_user_id}, user_name={member_user_name}, self_role={member_self_role}")
+                                            app_logger.info(f"[创建群] 插入群主 - group_id={unique_group_id}, user_id={member_user_id}, user_name={member_user_name}, self_role={member_self_role}")
+                                            cursor.execute(insert_member_sql, insert_member_params)
+                                        processed_member_ids.add(member_user_id)
+                                    else:
+                                        print(f"[创建群] 警告: member_info 缺少 user_id，跳过")
+                                else:
+                                    print(f"[创建群] 警告: 缺少 member_info（群主信息），这是必需的")
+                                
+                                # 第二步：处理 members 数组（管理员和其他成员）
+                                print(f"[创建群] 开始处理 members 数组 - group_id={unique_group_id}, members数量={len(members_list) if members_list else 0}")
                                 if members_list:
+                                    print(f"[创建群] members 数组内容: {members_list}")
                                     for m in members_list:
+                                        # 兼容新旧字段名
                                         member_user_id = m.get('user_id') or m.get('unique_member_id')
+                                        member_user_name = m.get('user_name') or m.get('member_name', '')
+                                        
                                         if not member_user_id:
+                                            print(f"[创建群] 警告: 成员信息缺少 user_id/unique_member_id，跳过")
                                             continue
                                         
-                                        # 如果已经在 member_info 中处理过（群主），跳过
+                                        # 如果该成员已经在 member_info 中处理过（群主），跳过避免重复
                                         if member_user_id in processed_member_ids:
+                                            print(f"[创建群] 跳过已处理的成员（群主）: user_id={member_user_id}")
                                             continue
+                                        
+                                        # self_role 字段：优先使用 self_role，否则从 group_role 转换
+                                        if 'self_role' in m:
+                                            self_role = m.get('self_role')
+                                        else:
+                                            # 从 group_role 转换：400=群主，300=管理员，其他=普通成员(200)
+                                            group_role = m.get('group_role')
+                                            if isinstance(group_role, int):
+                                                if group_role == 400:
+                                                    self_role = 400  # 群主（但应该已经在 member_info 中处理）
+                                                elif group_role == 300:
+                                                    self_role = 300  # 管理员（保持300）
+                                                else:
+                                                    self_role = 200  # 普通成员
+                                            elif isinstance(group_role, str):
+                                                # 字符串格式的角色
+                                                if group_role in ['owner', '群主', '400'] or member_user_id == owner_identifier:
+                                                    self_role = 400  # 群主（但应该已经在 member_info 中处理）
+                                                elif group_role in ['admin', '管理员', '300']:
+                                                    self_role = 300  # 管理员
+                                                else:
+                                                    self_role = 200  # 普通成员
+                                            else:
+                                                # 默认：如果是创建者则为群主，否则为普通成员
+                                                if member_user_id == owner_identifier:
+                                                    self_role = 400  # 群主（但应该已经在 member_info 中处理）
+                                                else:
+                                                    self_role = 200  # 普通成员
+                                        
+                                        insert_member_sql = """
+                                            INSERT INTO `group_members` (
+                                                group_id, user_id, user_name, self_role, join_time, msg_flag,
+                                                self_msg_flag, readed_seq, unread_num
+                                            ) VALUES (
+                                                %s, %s, %s, %s, %s, %s, %s, %s, %s
+                                            )
+                                        """
+                                        # 处理 join_time：支持时间戳格式（与 /groups/sync 一致）或直接使用当前时间
+                                        member_join_time = current_time
+                                        if 'join_time' in m:
+                                            join_time_value = m.get('join_time')
+                                            if join_time_value:
+                                                # 如果是时间戳，转换为 datetime 字符串
+                                                try:
+                                                    if isinstance(join_time_value, (int, float)):
+                                                        if join_time_value > 2147483647:  # 毫秒级时间戳
+                                                            join_time_value = int(join_time_value / 1000)
+                                                        dt = datetime.datetime.fromtimestamp(int(join_time_value))
+                                                        member_join_time = dt.strftime('%Y-%m-%d %H:%M:%S')
+                                                    else:
+                                                        member_join_time = join_time_value
+                                                except (ValueError, OSError):
+                                                    member_join_time = current_time
+                                        
+                                        # 获取其他成员字段（与 /groups/sync 一致）
+                                        member_msg_flag = m.get('msg_flag', 0)
+                                        member_self_msg_flag = m.get('self_msg_flag', 0)
+                                        member_readed_seq = m.get('readed_seq', 0)
+                                        member_unread_num = m.get('unread_num', 0)
+                                        
+                                        insert_member_params = (
+                                            unique_group_id,  # group_id
+                                            member_user_id,  # user_id
+                                            member_user_name if member_user_name else None,  # user_name
+                                            self_role,  # self_role
+                                            member_join_time,  # join_time
+                                            member_msg_flag,  # msg_flag
+                                            member_self_msg_flag,  # self_msg_flag
+                                            member_readed_seq,  # readed_seq
+                                            member_unread_num   # unread_num
+                                        )
+                                        
+                                        # 检查成员是否已在群组中
+                                        cursor.execute(
+                                            "SELECT user_id FROM `group_members` WHERE group_id = %s AND user_id = %s",
+                                            (unique_group_id, member_user_id)
+                                        )
+                                        existing_member = cursor.fetchone()
+                                        
+                                        if existing_member:
+                                            print(f"[创建群] 成员 {member_user_id} 已在群组 {unique_group_id} 中，跳过插入")
+                                            app_logger.info(f"[创建群] 成员 {member_user_id} 已在群组 {unique_group_id} 中，跳过插入")
+                                        else:
+                                            print(f"[创建群] 插入成员 - group_id={unique_group_id}, user_id={member_user_id}, user_name={member_user_name}, self_role={self_role}")
+                                            app_logger.info(f"[创建群] 插入成员 - group_id={unique_group_id}, user_id={member_user_id}, user_name={member_user_name}, self_role={self_role}")
+                                            cursor.execute(insert_member_sql, insert_member_params)
+                                        processed_member_ids.add(member_user_id)
+                                
+                                print(f"[创建群] 成员列表处理完成 - group_id={unique_group_id}, 已处理成员数={len(processed_member_ids)}")
+                                app_logger.info(f"[创建群] 成员列表处理完成 - group_id={unique_group_id}, 已处理成员数={len(processed_member_ids)}, 成员列表={list(processed_member_ids)}")
+                                
+                                print(f"[创建群] 准备提交事务 - group_id={unique_group_id}")
+                                app_logger.info(f"[创建群] 准备提交事务 - group_id={unique_group_id}")
+                                connection.commit()
+                                print(f"[创建群] 事务提交成功 - group_id={unique_group_id}")
+                                app_logger.info(f"[创建群] 事务提交成功 - group_id={unique_group_id}, group_name={group_name}")
+                                
+                                # 同步到腾讯IM（异步执行，不阻塞响应）
+                                try:
+                                    # 构建腾讯IM需要的群组数据格式
+                                    tencent_group_data = {
+                                        "GroupId": unique_group_id,
+                                        "group_id": unique_group_id,
+                                        "Name": group_name,
+                                        "group_name": group_name,
+                                        "Type": group_type_raw,  # 使用原始字符串类型，build_group_payload 会转换
+                                        "group_type": group_type_raw,
+                                        "Owner_Account": owner_identifier,
+                                        "owner_identifier": owner_identifier,
+                                        "FaceUrl": face_url,
+                                        "face_url": face_url,
+                                        "Introduction": msg_data1.get('introduction', ''),
+                                        "introduction": msg_data1.get('introduction', ''),
+                                        "Notification": msg_data1.get('notification', ''),
+                                        "notification": msg_data1.get('notification', ''),
+                                        "MaxMemberCount": msg_data1.get('max_member_num', 500),
+                                        "max_member_num": msg_data1.get('max_member_num', 500),
+                                        "ApplyJoinOption": msg_data1.get('add_option', 0),
+                                        "add_option": msg_data1.get('add_option', 0),
+                                        "is_class_group": is_class_group,  # 添加 is_class_group 字段，用于区分班级群和普通群
+                                        "classid": classid,  # 添加 classid 字段，用于辅助判断
+                                        "member_info": member_info,  # 群主信息
+                                        "MemberList": []  # 成员列表（包含群主和管理员）
+                                    }
+                                    
+                                    # 构建成员列表（包含群主和管理员）
+                                    member_list = []
+                                    added_member_accounts = set()  # 用于跟踪已添加的成员，避免重复
+                                    
+                                    # 添加群主（从 member_info）
+                                    if member_info:
+                                        owner_user_id = member_info.get('user_id')
+                                        if owner_user_id:
+                                            member_list.append({
+                                                "Member_Account": owner_user_id,
+                                                "user_id": owner_user_id,
+                                                "Role": "Owner",
+                                                "self_role": 400
+                                            })
+                                            added_member_accounts.add(owner_user_id)
+                                            print(f"[创建群] 腾讯IM数据：添加群主 - user_id={owner_user_id}")
+                                    
+                                    # 添加管理员和其他成员（从 members 数组）
+                                    if members_list:
+                                        for m in members_list:
+                                            member_user_id = m.get('user_id') or m.get('unique_member_id')
+                                            if not member_user_id:
+                                                continue
+                                            
+                                            # 如果已经在 member_list 中添加过，跳过避免重复
+                                            if member_user_id in added_member_accounts:
+                                                print(f"[创建群] 腾讯IM数据：跳过重复成员 - user_id={member_user_id}")
+                                                continue
+                                            
                                             # 确定角色
                                             if 'self_role' in m:
                                                 role_value = m.get('self_role')
@@ -11686,81 +12298,88 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                                 "Role": role_str,
                                                 "self_role": role_value
                                             })
+                                            added_member_accounts.add(member_user_id)
+                                            print(f"[创建群] 腾讯IM数据：添加成员 - user_id={member_user_id}, Role={role_str}")
+                                    
+                                    tencent_group_data["MemberList"] = member_list
+                                    print(f"[创建群] 腾讯IM数据构建完成 - group_id={unique_group_id}, 成员数={len(member_list)}")
+                                    app_logger.info(f"[创建群] 腾讯IM数据构建完成 - group_id={unique_group_id}, 成员数={len(member_list)}, 成员列表={member_list}")
+                                    
+                                    # 异步调用同步函数（不阻塞当前流程）
+                                    print(f"[创建群] 准备同步到腾讯IM - group_id={unique_group_id}")
+                                    app_logger.info(f"[创建群] 准备同步到腾讯IM - group_id={unique_group_id}, group_name={group_name}")
+                                    
+                                    # 使用 asyncio.create_task 异步执行，不等待结果
+                                    print(f"[创建群] 创建异步任务同步到腾讯IM - group_id={unique_group_id}")
+                                    async def sync_to_tencent():
+                                        try:
+                                            print(f"[创建群] 异步任务开始 - group_id={unique_group_id}")
+                                            # 调用同步函数（需要传入列表格式）
+                                            result = await notify_tencent_group_sync(owner_identifier, [tencent_group_data])
+                                            print(f"[创建群] 异步任务完成 - group_id={unique_group_id}, result_status={result.get('status')}")
+                                            if result.get("status") == "success":
+                                                print(f"[创建群] 腾讯IM同步成功 - group_id={unique_group_id}")
+                                                app_logger.info(f"[创建群] 腾讯IM同步成功 - group_id={unique_group_id}")
+                                            else:
+                                                print(f"[创建群] 腾讯IM同步失败 - group_id={unique_group_id}, error={result.get('error')}")
+                                                app_logger.warning(f"[创建群] 腾讯IM同步失败 - group_id={unique_group_id}, error={result.get('error')}")
+                                        except Exception as sync_error:
+                                            print(f"[创建群] 腾讯IM同步异常 - group_id={unique_group_id}, error={sync_error}")
+                                            app_logger.error(f"[创建群] 腾讯IM同步异常 - group_id={unique_group_id}, error={sync_error}", exc_info=True)
+                                    
+                                    # 创建异步任务，不等待完成
+                                    asyncio.create_task(sync_to_tencent())
+                                    
+                                except Exception as tencent_sync_error:
+                                    # 同步失败不影响群组创建
+                                    print(f"[创建群] 准备腾讯IM同步时出错 - group_id={unique_group_id}, error={tencent_sync_error}")
+                                    app_logger.error(f"[创建群] 准备腾讯IM同步时出错 - group_id={unique_group_id}, error={tencent_sync_error}", exc_info=True)
                                 
-                                tencent_group_data["MemberList"] = member_list
-                                
-                                # 异步调用同步函数（不阻塞当前流程）
-                                print(f"[创建群] 准备同步到腾讯IM - group_id={unique_group_id}")
-                                app_logger.info(f"[创建群] 准备同步到腾讯IM - group_id={unique_group_id}, group_name={group_name}")
-                                
-                                # 使用 asyncio.create_task 异步执行，不等待结果
-                                async def sync_to_tencent():
-                                    try:
-                                        # 调用同步函数（需要传入列表格式）
-                                        result = await notify_tencent_group_sync(owner_identifier, [tencent_group_data])
-                                        if result.get("status") == "success":
-                                            print(f"[创建群] 腾讯IM同步成功 - group_id={unique_group_id}")
-                                            app_logger.info(f"[创建群] 腾讯IM同步成功 - group_id={unique_group_id}")
-                                        else:
-                                            print(f"[创建群] 腾讯IM同步失败 - group_id={unique_group_id}, error={result.get('error')}")
-                                            app_logger.warning(f"[创建群] 腾讯IM同步失败 - group_id={unique_group_id}, error={result.get('error')}")
-                                    except Exception as sync_error:
-                                        print(f"[创建群] 腾讯IM同步异常 - group_id={unique_group_id}, error={sync_error}")
-                                        app_logger.error(f"[创建群] 腾讯IM同步异常 - group_id={unique_group_id}, error={sync_error}", exc_info=True)
-                                
-                                # 创建异步任务，不等待完成
-                                asyncio.create_task(sync_to_tencent())
-                                
-                            except Exception as tencent_sync_error:
-                                # 同步失败不影响群组创建
-                                print(f"[创建群] 准备腾讯IM同步时出错 - group_id={unique_group_id}, error={tencent_sync_error}")
-                                app_logger.error(f"[创建群] 准备腾讯IM同步时出错 - group_id={unique_group_id}, error={tencent_sync_error}", exc_info=True)
-                            
-                            # 如果是班级群（有 classid 或 class_id），自动创建临时语音群
-                            temp_room_info = None
-                            class_id = classid  # 使用统一后的 classid 变量
-                            if class_id:
-                                # 检查是否已经有临时语音群（使用 unique_group_id 作为 group_id）
-                                if unique_group_id not in active_temp_rooms:
-                                    try:
-                                        print(f"[创建班级群] 检测到班级群，自动创建临时语音群 - group_id={unique_group_id}, class_id={class_id}")
-                                        app_logger.info(f"[创建班级群] 自动创建临时语音群 - group_id={unique_group_id}, class_id={class_id}, owner_id={user_id}")
-                                        
-                                        # 获取创建者信息
-                                        owner_id = user_id
-                                        owner_name = msg_data1.get('owner_name', '') or ''
-                                        owner_icon = msg_data1.get('owner_icon', '') or ''
-                                        
-                                        # 尝试从数据库获取创建者信息
-                                        if not owner_name or not owner_icon:
-                                            try:
-                                                cursor.execute(
-                                                    "SELECT name, icon FROM ta_teacher WHERE teacher_unique_id = %s",
-                                                    (owner_id,)
-                                                )
-                                                owner_info = cursor.fetchone()
-                                                if owner_info:
-                                                    if not owner_name:
-                                                        owner_name = owner_info.get('name', '') or owner_name
-                                                    if not owner_icon:
-                                                        owner_icon = owner_info.get('icon', '') or owner_icon
-                                            except Exception as db_error:
-                                                app_logger.error(f"[创建班级群] 查询创建者信息失败 - user_id={user_id}, error={db_error}")
-                                        
-                                        # 生成唯一的房间ID和流名称
-                                        room_id = str(uuid.uuid4())
-                                        stream_name = f"room_{unique_group_id}_{int(time.time())}"
-                                        
-                                        # 生成传统 WebRTC API 地址（推流和拉流）
-                                        publish_url = f"{SRS_WEBRTC_API_URL}/rtc/v1/publish/?app={SRS_APP}&stream={stream_name}"
-                                        play_url = f"{SRS_WEBRTC_API_URL}/rtc/v1/play/?app={SRS_APP}&stream={stream_name}"
-                                        
-                                        # 保留 WHIP/WHEP 地址用于向后兼容
-                                        whip_url = f"{SRS_BASE_URL}/rtc/v1/whip/?app={SRS_APP}&stream={stream_name}"
-                                        whep_url = f"{SRS_BASE_URL}/rtc/v1/whep/?app={SRS_APP}&stream={stream_name}"
-                                        
-                                        # 创建临时语音群
-                                        active_temp_rooms[unique_group_id] = {
+                                # 如果是班级群（有 classid 或 class_id），自动创建临时语音群
+                                temp_room_info = None
+                                class_id = classid  # 使用统一后的 classid 变量
+                                if class_id:
+                                    # 检查是否已经有临时语音群（使用 unique_group_id 作为 group_id）
+                                    if unique_group_id not in active_temp_rooms:
+                                        try:
+                                            print(f"[创建班级群] 检测到班级群，自动创建临时语音群 - group_id={unique_group_id}, class_id={class_id}")
+                                            app_logger.info(f"[创建班级群] 自动创建临时语音群 - group_id={unique_group_id}, class_id={class_id}, owner_id={user_id}")
+                                            
+                                            # 获取创建者信息
+                                            owner_id = user_id
+                                            owner_name = msg_data1.get('owner_name', '') or ''
+                                            owner_icon = msg_data1.get('owner_icon', '') or ''
+                                            
+                                            # 尝试从数据库获取创建者信息
+                                            if not owner_name or not owner_icon:
+                                                try:
+                                                    cursor.execute(
+                                                        "SELECT name, icon FROM ta_teacher WHERE teacher_unique_id = %s",
+                                                        (owner_id,)
+                                                    )
+                                                    owner_info = cursor.fetchone()
+                                                    if owner_info:
+                                                        if not owner_name:
+                                                            owner_name = owner_info.get('name', '') or owner_name
+                                                        if not owner_icon:
+                                                            owner_icon = owner_info.get('icon', '') or owner_icon
+                                                except Exception as db_error:
+                                                    app_logger.error(f"[创建班级群] 查询创建者信息失败 - user_id={user_id}, error={db_error}")
+                                            
+                                            # 生成唯一的房间ID和流名称
+                                            room_id = str(uuid.uuid4())
+                                            stream_name = f"room_{unique_group_id}_{int(time.time())}"
+                                            
+                                            # 生成传统 WebRTC API 地址（推流和拉流）
+                                            publish_url = f"{SRS_WEBRTC_API_URL}/rtc/v1/publish/?app={SRS_APP}&stream={stream_name}"
+                                            play_url = f"{SRS_WEBRTC_API_URL}/rtc/v1/play/?app={SRS_APP}&stream={stream_name}"
+                                            
+                                            # 保留 WHIP/WHEP 地址用于向后兼容
+                                            whip_url = f"{SRS_BASE_URL}/rtc/v1/whip/?app={SRS_APP}&stream={stream_name}"
+                                            whep_url = f"{SRS_BASE_URL}/rtc/v1/whep/?app={SRS_APP}&stream={stream_name}"
+                                            
+                                            # 创建临时语音群
+                                            active_temp_rooms[unique_group_id] = {
                                             "room_id": room_id,
                                             "owner_id": owner_id,
                                             "owner_name": owner_name,
@@ -11775,10 +12394,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                             "members": [owner_id]  # 初始化成员列表，包含创建者
                                         }
                                         
-                                        # 保存临时语音房间到数据库
-                                        try:
-                                            # 插入临时语音房间信息
-                                            insert_room_sql = """
+                                            # 保存临时语音房间到数据库
+                                            try:
+                                                # 插入临时语音房间信息
+                                                insert_room_sql = """
                                                 INSERT INTO `temp_voice_rooms` (
                                                     room_id, group_id, owner_id, owner_name, owner_icon,
                                                     whip_url, whep_url, stream_name, status, create_time
@@ -11786,43 +12405,43 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                                     %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
                                                 )
                                             """
-                                            cursor.execute(insert_room_sql, (
-                                                room_id,
-                                                unique_group_id,
-                                                owner_id,
-                                                owner_name if owner_name else None,
-                                                owner_icon if owner_icon else None,
-                                                whip_url,
-                                                whep_url,
-                                                stream_name,
-                                                1  # status = 1 (活跃)
-                                            ))
+                                                cursor.execute(insert_room_sql, (
+                                                    room_id,
+                                                    unique_group_id,
+                                                    owner_id,
+                                                    owner_name if owner_name else None,
+                                                    owner_icon if owner_icon else None,
+                                                    whip_url,
+                                                    whep_url,
+                                                    stream_name,
+                                                    1  # status = 1 (活跃)
+                                                ))
+                                                
+                                                # 插入房间创建者（群主）到成员表
+                                                insert_member_sql = """
+                                                    INSERT INTO `temp_voice_room_members` (
+                                                        room_id, user_id, user_name, status, join_time
+                                                    ) VALUES (
+                                                        %s, %s, %s, %s, NOW()
+                                                    )
+                                                """
+                                                cursor.execute(insert_member_sql, (
+                                                    room_id,
+                                                    owner_id,
+                                                    owner_name if owner_name else None,
+                                                    1  # status = 1 (在线)
+                                                ))
+                                                
+                                                connection.commit()
+                                                print(f"[创建班级群] 临时语音房间已保存到数据库 - room_id={room_id}, group_id={unique_group_id}")
+                                                app_logger.info(f"[创建班级群] 临时语音房间已保存到数据库 - room_id={room_id}, group_id={unique_group_id}")
+                                            except Exception as db_save_error:
+                                                # 数据库保存失败不影响内存中的房间创建
+                                                print(f"[创建班级群] 保存临时语音房间到数据库失败 - room_id={room_id}, error={db_save_error}")
+                                                app_logger.error(f"[创建班级群] 保存临时语音房间到数据库失败 - room_id={room_id}, error={db_save_error}", exc_info=True)
+                                                connection.rollback()
                                             
-                                            # 插入房间创建者（群主）到成员表
-                                            insert_member_sql = """
-                                                INSERT INTO `temp_voice_room_members` (
-                                                    room_id, user_id, user_name, status, join_time
-                                                ) VALUES (
-                                                    %s, %s, %s, %s, NOW()
-                                                )
-                                            """
-                                            cursor.execute(insert_member_sql, (
-                                                room_id,
-                                                owner_id,
-                                                owner_name if owner_name else None,
-                                                1  # status = 1 (在线)
-                                            ))
-                                            
-                                            connection.commit()
-                                            print(f"[创建班级群] 临时语音房间已保存到数据库 - room_id={room_id}, group_id={unique_group_id}")
-                                            app_logger.info(f"[创建班级群] 临时语音房间已保存到数据库 - room_id={room_id}, group_id={unique_group_id}")
-                                        except Exception as db_save_error:
-                                            # 数据库保存失败不影响内存中的房间创建
-                                            print(f"[创建班级群] 保存临时语音房间到数据库失败 - room_id={room_id}, error={db_save_error}")
-                                            app_logger.error(f"[创建班级群] 保存临时语音房间到数据库失败 - room_id={room_id}, error={db_save_error}", exc_info=True)
-                                            connection.rollback()
-                                        
-                                        temp_room_info = {
+                                            temp_room_info = {
                                             "room_id": room_id,
                                             "publish_url": publish_url,  # 推流地址（传统 WebRTC API）
                                             "play_url": play_url,  # 拉流地址（传统 WebRTC API）
@@ -11831,79 +12450,106 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                             "owner_id": owner_id,
                                             "owner_name": owner_name,
                                             "owner_icon": owner_icon
+                                            }
+                                            
+                                            print(f"[创建班级群] 临时语音群创建成功 - group_id={unique_group_id}, room_id={room_id}, stream_name={stream_name}")
+                                            app_logger.info(f"[创建班级群] 临时语音群创建成功 - group_id={unique_group_id}, room_id={room_id}")
+                                        except Exception as temp_room_error:
+                                            app_logger.error(f"[创建班级群] 创建临时语音群失败 - group_id={unique_group_id}, error={temp_room_error}")
+                                            print(f"[创建班级群] 创建临时语音群失败: {temp_room_error}")
+                                            # 临时语音群创建失败不影响班级群创建
+                                    else:
+                                        # 如果已存在临时语音群，获取其信息
+                                        existing_room = active_temp_rooms[unique_group_id]
+                                        temp_room_info = {
+                                            "room_id": existing_room.get("room_id"),
+                                            "publish_url": existing_room.get("publish_url"),  # 推流地址（传统 WebRTC API）
+                                            "play_url": existing_room.get("play_url"),  # 拉流地址（传统 WebRTC API）
+                                            "stream_name": existing_room.get("stream_name"),
+                                            "group_id": unique_group_id,
+                                            "owner_id": existing_room.get("owner_id"),
+                                            "owner_name": existing_room.get("owner_name"),
+                                            "owner_icon": existing_room.get("owner_icon")
                                         }
-                                        
-                                        print(f"[创建班级群] 临时语音群创建成功 - group_id={unique_group_id}, room_id={room_id}, stream_name={stream_name}")
-                                        app_logger.info(f"[创建班级群] 临时语音群创建成功 - group_id={unique_group_id}, room_id={room_id}")
-                                    except Exception as temp_room_error:
-                                        app_logger.error(f"[创建班级群] 创建临时语音群失败 - group_id={unique_group_id}, error={temp_room_error}")
-                                        print(f"[创建班级群] 创建临时语音群失败: {temp_room_error}")
-                                        # 临时语音群创建失败不影响班级群创建
-                                else:
-                                    # 如果已存在临时语音群，获取其信息
-                                    existing_room = active_temp_rooms[unique_group_id]
-                                    temp_room_info = {
-                                        "room_id": existing_room.get("room_id"),
-                                        "publish_url": existing_room.get("publish_url"),  # 推流地址（传统 WebRTC API）
-                                        "play_url": existing_room.get("play_url"),  # 拉流地址（传统 WebRTC API）
-                                        "stream_name": existing_room.get("stream_name"),
-                                        "group_id": unique_group_id,
-                                        "owner_id": existing_room.get("owner_id"),
-                                        "owner_name": existing_room.get("owner_name"),
-                                        "owner_icon": existing_room.get("owner_icon")
-                                    }
-                                    print(f"[创建班级群] 临时语音群已存在 - group_id={unique_group_id}, room_id={temp_room_info.get('room_id')}")
-                            
-                            # 给在线成员推送
-                            # 兼容新旧字段名：user_id 或 unique_member_id
-                            members_to_notify = msg_data1.get('members', [])
-                            for m in members_to_notify:
-                                # 兼容新旧字段名
-                                member_id = m.get('user_id') or m.get('unique_member_id')
-                                if not member_id:
-                                    continue
+                                        print(f"[创建班级群] 临时语音群已存在 - group_id={unique_group_id}, room_id={temp_room_info.get('room_id')}")
                                 
-                                target_conn = connections.get(member_id)
-                                if target_conn:
-                                    await target_conn["ws"].send_text(json.dumps({
-                                        "type":"notify",
-                                        "message":f"你已加入群: {msg_data1.get('group_name') or msg_data1.get('nickname', '')}",
-                                        "group_id": unique_group_id,
-                                        "groupname": msg_data1.get('group_name') or msg_data1.get('nickname', '')
-                                    }))
-                                else:
-                                    print(f"[创建群] 成员 {member_id} 不在线，插入通知")
-                                    cursor = connection.cursor(dictionary=True)
+                                # 给在线成员推送
+                                # 兼容新旧字段名：user_id 或 unique_member_id
+                                members_to_notify = msg_data1.get('members', [])
+                                for m in members_to_notify:
+                                    # 兼容新旧字段名
+                                    member_id = m.get('user_id') or m.get('unique_member_id')
+                                    if not member_id:
+                                        continue
+                                    
+                                    target_conn = connections.get(member_id)
+                                    if target_conn:
+                                        await target_conn["ws"].send_text(json.dumps({
+                                            "type":"notify",
+                                            "message":f"你已加入群: {msg_data1.get('group_name') or msg_data1.get('nickname', '')}",
+                                            "group_id": unique_group_id,
+                                            "groupname": msg_data1.get('group_name') or msg_data1.get('nickname', '')
+                                        }))
+                                    else:
+                                        print(f"[创建群] 成员 {member_id} 不在线，插入通知")
+                                        cursor = connection.cursor(dictionary=True)
 
-                                    update_query = """
-                                            INSERT INTO ta_notification (sender_id, sender_name, receiver_id, unique_group_id, group_name, content, content_text)
-                                            VALUES (%s, %s, %s, %s, %s, %s, %s)
-                                        """
-                                    cursor.execute(update_query, (user_id, msg_data1.get('owner_name'), member_id, unique_group_id, msg_data1.get("group_name") or msg_data1.get("nickname", ""), "邀请你加入了群", msg_data1['type']))
-                                    connection.commit()
+                                        update_query = """
+                                                INSERT INTO ta_notification (sender_id, sender_name, receiver_id, unique_group_id, group_name, content, content_text)
+                                                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                            """
+                                        cursor.execute(update_query, (user_id, msg_data1.get('owner_name'), member_id, unique_group_id, msg_data1.get("group_name") or msg_data1.get("nickname", ""), "邀请你加入了群", msg_data1['type']))
+                                        connection.commit()
 
-                            #把创建成功的群信息发回给创建者（包含临时语音群信息）
-                            # 兼容新旧字段名：group_name 或 nickname
-                            group_name_for_response = msg_data1.get('group_name') or msg_data1.get('nickname', '')
-                            response_data = {
-                                "type":"3",
-                                "message":f"你创建了群: {group_name_for_response}",
-                                "group_id": unique_group_id,
-                                "groupname": group_name_for_response
-                            }
-                            
-                            # 如果有临时语音群信息，添加到响应中
-                            if temp_room_info:
-                                response_data["temp_room"] = temp_room_info
-                            
-                            # 打印返回给客户端的消息
-                            response_json = json.dumps(response_data, ensure_ascii=False)
-                            print(f"[创建群] 返回给客户端 - user_id={user_id}, group_id={unique_group_id}, response={response_json}")
-                            app_logger.info(f"[创建群] 返回给客户端 - user_id={user_id}, group_id={unique_group_id}, response={response_json}")
-                            
-                            await websocket.send_text(response_json)
+                                #把创建成功的群信息发回给创建者（包含临时语音群信息）
+                                print(f"[创建群] 准备构建返回给客户端的响应 - group_id={unique_group_id}")
+                                # 兼容新旧字段名：group_name 或 nickname
+                                group_name_for_response = msg_data1.get('group_name') or msg_data1.get('nickname', '')
+                                response_data = {
+                                    "type":"3",
+                                    "message":f"你创建了群: {group_name_for_response}",
+                                    "group_id": unique_group_id,
+                                    "groupname": group_name_for_response
+                                }
+                                
+                                # 如果有临时语音群信息，添加到响应中
+                                if temp_room_info:
+                                    response_data["temp_room"] = temp_room_info
+                                
+                                # 打印返回给客户端的消息
+                                response_json = json.dumps(response_data, ensure_ascii=False)
+                                print(f"[创建群] 返回给客户端 - user_id={user_id}, group_id={unique_group_id}, response={response_json}")
+                                app_logger.info(f"[创建群] 返回给客户端 - user_id={user_id}, group_id={unique_group_id}, response={response_json}")
+                                
+                                print(f"[创建群] 准备发送响应给客户端 - group_id={unique_group_id}")
+                                await websocket.send_text(response_json)
+                                print(f"[创建群] 响应已发送给客户端 - group_id={unique_group_id}")
+                                print(f"[创建群] 创建群组流程完成 - group_id={unique_group_id}")
+                                app_logger.info(f"[创建群] 创建群组流程完成 - group_id={unique_group_id}, user_id={user_id}")
+                            except Exception as create_group_error:
+                                error_msg = f"创建群组时发生异常 - user_id={user_id}, error={create_group_error}"
+                                print(f"[创建群] {error_msg}")
+                                app_logger.error(f"[创建群] {error_msg}", exc_info=True)
+                                import traceback
+                                traceback_str = traceback.format_exc()
+                                print(f"[创建群] 错误堆栈: {traceback_str}")
+                                # 回滚事务
+                                if connection and connection.is_connected():
+                                    connection.rollback()
+                                    print(f"[创建群] 已回滚事务")
+                                # 发送错误消息给客户端
+                                try:
+                                    error_response = {
+                                        "type": "3",
+                                        "status": "error",
+                                        "message": f"创建群组失败: {str(create_group_error)}",
+                                        "group_id": msg_data1.get('group_id', '')
+                                    }
+                                    await websocket.send_text(json.dumps(error_response, ensure_ascii=False))
+                                except Exception as send_error:
+                                    app_logger.error(f"[创建群] 发送错误消息失败: {send_error}")
 
-                                    # 群消息: 群主发消息，发给除群主外的所有群成员
+                        # 群消息: 群主发消息，发给除群主外的所有群成员
                         elif msg_data1['type'] == "5":
                             print("群消息发送")
                             cursor = connection.cursor(dictionary=True)
@@ -12404,31 +13050,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 # @app.on_event("startup")
 # async def startup_event():
 #     import asyncio
-#     asyncio.create_task(heartbeat_checker())
-
-# ===== 心跳检测线程 =====
-async def heartbeat_checker():
-    try:
-        while not stop_event.is_set():
-            now = time.time()
-            to_remove = []
-            for uid, conn in list(connections.items()):
-                if now - conn["last_heartbeat"] > 30:
-                    print(f"用户 {uid} 心跳超时，断开连接")
-                    await safe_close(conn["ws"], 1001, "Heartbeat timeout")
-                    to_remove.append(uid)
-            for uid in to_remove:
-                connections.pop(uid, None)  # 安全移除
-                # 清理用户从所有临时房间的成员列表中移除
-                # 注意：不再因为心跳超时自动解散房间，只移除成员，房间是否解散由业务消息控制（如 temp_room_owner_leave）
-                for group_id, room_info in list(active_temp_rooms.items()):
-                    members = room_info.get("members", [])
-                    if uid in members:
-                        members.remove(uid)
-                        print(f"[webrtc] 心跳超时：用户 {uid} 离开房间 {group_id}，当前成员数={len(members)}")
-            await asyncio.sleep(10)
-    except asyncio.CancelledError:
-        print("heartbeat_checker 已安全退出")
+# heartbeat_checker 函数已移到文件前面（lifespan 函数之前）
 
 
 # ====== 像 Flask 那样可直接运行 ======
