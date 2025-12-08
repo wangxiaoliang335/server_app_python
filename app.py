@@ -146,6 +146,129 @@ connections: Dict[str, Dict] = {}  # {user_id: {"ws": WebSocket, "last_heartbeat
 active_temp_rooms: Dict[str, Dict[str, Any]] = {}  # {group_id: {...room info...}}
 
 
+@app.post("/temp_rooms/query")
+async def query_temp_rooms(request: Request):
+    """
+    根据班级群ID列表查询对应的临时语音房间信息。
+    请求体示例：
+    {
+        "group_ids": ["65402939701", "49274627501"]
+    }
+    返回示例：
+    {
+        "data": {
+            "rooms": [
+                {
+                    "group_id": "...",
+                    "room_id": "...",
+                    "publish_url": "...",
+                    "play_url": "...",
+                    "stream_name": "...",
+                    "owner_id": "...",
+                    "owner_name": "...",
+                    "owner_icon": "...",
+                    "members": ["110001", ...]
+                }
+            ]
+        },
+        "code": 200
+    }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"data": {"message": "请求体必须为 JSON", "code": 400}}, status_code=400)
+
+    group_ids = body.get("group_ids") or body.get("groupIds") or []
+    if not isinstance(group_ids, list) or not group_ids:
+        return JSONResponse({"data": {"message": "group_ids 必须为非空数组", "code": 400}}, status_code=400)
+
+    # 去重、清理
+    group_ids = list({str(gid).strip() for gid in group_ids if str(gid).strip()})
+    if not group_ids:
+        return JSONResponse({"data": {"message": "group_ids 不能为空", "code": 400}}, status_code=400)
+
+    results = []
+
+    # 先从内存 active_temp_rooms 读取
+    for gid in group_ids:
+        room = active_temp_rooms.get(gid)
+        if room:
+            results.append({
+                "group_id": gid,
+                "room_id": room.get("room_id"),
+                "publish_url": room.get("publish_url"),
+                "play_url": room.get("play_url"),
+                "stream_name": room.get("stream_name"),
+                "owner_id": room.get("owner_id"),
+                "owner_name": room.get("owner_name"),
+                "owner_icon": room.get("owner_icon"),
+                "members": room.get("members", [])
+            })
+
+    # 对于内存中不存在的，再查数据库（status=1）
+    missing = [gid for gid in group_ids if gid not in active_temp_rooms]
+    if missing:
+        connection = get_db_connection()
+        if connection and connection.is_connected():
+            try:
+                cursor = connection.cursor(dictionary=True)
+                query = """
+                    SELECT room_id, group_id, owner_id, owner_name, owner_icon,
+                           whip_url, whep_url, stream_name, status, create_time
+                    FROM temp_voice_rooms
+                    WHERE status = 1 AND group_id IN ({})
+                """.format(", ".join(["%s"] * len(missing)))
+                cursor.execute(query, missing)
+                rows = cursor.fetchall() or []
+
+                # 拉取成员
+                room_ids = [r.get("room_id") for r in rows if r.get("room_id")]
+                members_map: Dict[str, list] = {}
+                if room_ids:
+                    member_query = """
+                        SELECT room_id, user_id
+                        FROM temp_voice_room_members
+                        WHERE status = 1 AND room_id IN ({})
+                    """.format(", ".join(["%s"] * len(room_ids)))
+                    cursor.execute(member_query, room_ids)
+                    member_rows = cursor.fetchall() or []
+                    for m in member_rows:
+                        rid = m.get("room_id")
+                        uid = m.get("user_id")
+                        if rid and uid:
+                            members_map.setdefault(rid, []).append(uid)
+
+                for r in rows:
+                    gid = r.get("group_id")
+                    stream = r.get("stream_name")
+                    publish_url = f"{SRS_WEBRTC_API_URL}/rtc/v1/publish/?app={SRS_APP}&stream={stream}"
+                    play_url = f"{SRS_WEBRTC_API_URL}/rtc/v1/play/?app={SRS_APP}&stream={stream}"
+                    rid = r.get("room_id")
+                    results.append({
+                        "group_id": gid,
+                        "room_id": rid,
+                        "publish_url": publish_url,
+                        "play_url": play_url,
+                        "stream_name": stream,
+                        "owner_id": r.get("owner_id"),
+                        "owner_name": r.get("owner_name"),
+                        "owner_icon": r.get("owner_icon"),
+                        "members": members_map.get(rid, [])
+                    })
+            finally:
+                try:
+                    if 'cursor' in locals() and cursor:
+                        cursor.close()
+                    if connection and connection.is_connected():
+                        connection.close()
+                except Exception:
+                    pass
+
+    return JSONResponse({"data": {"rooms": results, "count": len(results)}, "code": 200})
+
+
+
 def load_active_temp_rooms_from_db() -> None:
     """
     应用启动时，从数据库加载仍然处于活跃状态的临时语音房间到内存 active_temp_rooms。
@@ -1532,104 +1655,204 @@ async def tencent_im_callback(request: Request):
     腾讯IM回调接口
     接收腾讯IM的各种事件通知，包括群组解散、成员变动等
     """
+    print("=" * 80)
+    print("[tencent/callback] ========== 收到腾讯IM回调请求 ==========")
+    print(f"[tencent/callback] 请求时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"[tencent/callback] 请求来源IP: {request.client.host if request.client else 'Unknown'}")
+    print(f"[tencent/callback] 请求方法: {request.method}")
+    print(f"[tencent/callback] 请求路径: {request.url.path}")
+    app_logger.info("=" * 80)
+    app_logger.info("[tencent/callback] ========== 收到腾讯IM回调请求 ==========")
+    app_logger.info(f"[tencent/callback] 请求时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    app_logger.info(f"[tencent/callback] 请求来源IP: {request.client.host if request.client else 'Unknown'}")
+    
     try:
         body = await request.json()
-        print(f"[tencent/callback] 收到腾讯IM回调: {json.dumps(body, ensure_ascii=False, indent=2)}")
-        app_logger.info(f"[tencent/callback] 收到腾讯IM回调: {body}")
+        print(f"[tencent/callback] 收到腾讯IM回调数据:")
+        print(f"[tencent/callback] {json.dumps(body, ensure_ascii=False, indent=2)}")
+        app_logger.info(f"[tencent/callback] 收到腾讯IM回调数据: {json.dumps(body, ensure_ascii=False)}")
         
         # 获取回调类型
         callback_command = body.get("CallbackCommand")
+        print(f"[tencent/callback] 回调类型: {callback_command}")
+        app_logger.info(f"[tencent/callback] 回调类型: {callback_command}")
+        
         if not callback_command:
-            print("[tencent/callback] 警告: 回调数据中缺少 CallbackCommand")
+            print("[tencent/callback] ⚠️ 警告: 回调数据中缺少 CallbackCommand")
             app_logger.warning("[tencent/callback] 回调数据中缺少 CallbackCommand")
+            print("[tencent/callback] 返回成功响应（避免腾讯IM重试）")
             return JSONResponse({"ActionStatus": "OK", "ErrorCode": 0, "ErrorInfo": "OK"})
         
         # 处理群组解散回调
         if callback_command == "Group.CallbackAfterGroupDestroyed":
-            print("[tencent/callback] 检测到群组解散回调")
+            print("[tencent/callback] ✅ 检测到群组解散回调: Group.CallbackAfterGroupDestroyed")
             app_logger.info("[tencent/callback] 检测到群组解散回调")
             
             # 获取群组ID
             group_id = body.get("GroupId")
+            operator_account = body.get("Operator_Account", "Unknown")
+            event_time = body.get("EventTime", "Unknown")
+            
+            print(f"[tencent/callback] 回调详情:")
+            print(f"[tencent/callback]   - GroupId: {group_id}")
+            print(f"[tencent/callback]   - Operator_Account: {operator_account}")
+            print(f"[tencent/callback]   - EventTime: {event_time}")
+            app_logger.info(f"[tencent/callback] 回调详情 - GroupId: {group_id}, Operator: {operator_account}, EventTime: {event_time}")
+            
             if not group_id:
-                print("[tencent/callback] 警告: 群组解散回调中缺少 GroupId")
+                print("[tencent/callback] ⚠️ 警告: 群组解散回调中缺少 GroupId")
                 app_logger.warning("[tencent/callback] 群组解散回调中缺少 GroupId")
+                print("[tencent/callback] 返回成功响应（避免腾讯IM重试）")
                 return JSONResponse({"ActionStatus": "OK", "ErrorCode": 0, "ErrorInfo": "OK"})
             
-            print(f"[tencent/callback] 开始处理群组解散: group_id={group_id}")
+            print(f"[tencent/callback] 🔄 开始处理群组解散: group_id={group_id}")
             app_logger.info(f"[tencent/callback] 开始处理群组解散: group_id={group_id}")
             
             # 连接数据库
+            print(f"[tencent/callback] 📊 连接数据库...")
             connection = get_db_connection()
             if connection is None or not connection.is_connected():
-                print("[tencent/callback] 错误: 数据库连接失败")
+                print("[tencent/callback] ❌ 错误: 数据库连接失败")
                 app_logger.error("[tencent/callback] 数据库连接失败")
+                print("[tencent/callback] 返回成功响应（避免腾讯IM重试）")
                 return JSONResponse({"ActionStatus": "OK", "ErrorCode": 0, "ErrorInfo": "OK"})
+            print(f"[tencent/callback] ✅ 数据库连接成功")
             
             cursor = None
             try:
                 cursor = connection.cursor(dictionary=True)
                 
                 # 检查群组是否存在
-                cursor.execute("SELECT group_id FROM `groups` WHERE group_id = %s", (group_id,))
+                print(f"[tencent/callback] 🔍 检查群组 {group_id} 是否存在于本地数据库...")
+                cursor.execute("SELECT group_id, group_name, member_num FROM `groups` WHERE group_id = %s", (group_id,))
                 group_info = cursor.fetchone()
                 
                 if not group_info:
-                    print(f"[tencent/callback] 群组 {group_id} 在本地数据库中不存在，无需处理")
+                    print(f"[tencent/callback] ⚠️ 群组 {group_id} 在本地数据库中不存在，无需处理")
                     app_logger.info(f"[tencent/callback] 群组 {group_id} 在本地数据库中不存在，无需处理")
+                    print("[tencent/callback] 返回成功响应（避免腾讯IM重试）")
                     return JSONResponse({"ActionStatus": "OK", "ErrorCode": 0, "ErrorInfo": "OK"})
                 
-                # 开始事务
-                connection.start_transaction()
+                print(f"[tencent/callback] ✅ 找到群组: {group_info.get('group_name', 'N/A')} (成员数: {group_info.get('member_num', 0)})")
+                app_logger.info(f"[tencent/callback] 找到群组: {group_info}")
+                
+                # 开始事务（如果连接已经在事务中，先提交或回滚）
+                print(f"[tencent/callback] 🔄 检查并开始数据库事务...")
+                try:
+                    # 检查连接是否已经在事务中（通过尝试开始事务来判断）
+                    connection.start_transaction()
+                    print(f"[tencent/callback] ✅ 新事务已开始")
+                except Exception as e:
+                    error_msg = str(e)
+                    if "Transaction already in progress" in error_msg or "already in progress" in error_msg.lower():
+                        print(f"[tencent/callback] ⚠️  连接已在事务中，先提交当前事务...")
+                        try:
+                            connection.commit()
+                            connection.start_transaction()
+                            print(f"[tencent/callback] ✅ 已提交旧事务并开始新事务")
+                        except Exception as commit_error:
+                            print(f"[tencent/callback] ⚠️  提交旧事务失败: {commit_error}，尝试回滚...")
+                            connection.rollback()
+                            connection.start_transaction()
+                            print(f"[tencent/callback] ✅ 已回滚旧事务并开始新事务")
+                    else:
+                        raise
                 
                 # 1. 删除群组成员
-                print(f"[tencent/callback] 删除群组 {group_id} 的所有成员...")
+                print(f"[tencent/callback] 🗑️  步骤1: 删除群组 {group_id} 的所有成员...")
                 cursor.execute("DELETE FROM `group_members` WHERE group_id = %s", (group_id,))
                 deleted_members = cursor.rowcount
-                print(f"[tencent/callback] 删除了 {deleted_members} 个群组成员")
+                print(f"[tencent/callback] ✅ 删除了 {deleted_members} 个群组成员")
+                app_logger.info(f"[tencent/callback] 删除了 {deleted_members} 个群组成员")
                 
                 # 2. 删除群组
-                print(f"[tencent/callback] 删除群组 {group_id}...")
+                print(f"[tencent/callback] 🗑️  步骤2: 删除群组 {group_id}...")
                 cursor.execute("DELETE FROM `groups` WHERE group_id = %s", (group_id,))
                 deleted_groups = cursor.rowcount
-                print(f"[tencent/callback] 删除了 {deleted_groups} 个群组")
+                print(f"[tencent/callback] ✅ 删除了 {deleted_groups} 个群组")
+                app_logger.info(f"[tencent/callback] 删除了 {deleted_groups} 个群组")
                 
                 # 3. 删除临时语音房间（如果存在）
-                cursor.execute("DELETE FROM `temp_voice_rooms` WHERE group_id = %s", (group_id,))
-                deleted_rooms = cursor.rowcount
-                if deleted_rooms > 0:
-                    print(f"[tencent/callback] 删除了 {deleted_rooms} 个临时语音房间")
-                    cursor.execute("DELETE FROM `temp_voice_room_members` WHERE group_id = %s", (group_id,))
+                print(f"[tencent/callback] 🗑️  步骤3: 检查并删除临时语音房间...")
+                # 先查询该群组对应的 room_id
+                cursor.execute("SELECT room_id FROM `temp_voice_rooms` WHERE group_id = %s", (group_id,))
+                room_ids = [row['room_id'] for row in cursor.fetchall()]
+                
+                if room_ids:
+                    print(f"[tencent/callback] 找到 {len(room_ids)} 个临时语音房间，room_ids: {room_ids}")
+                    # 先删除临时语音房间成员（通过 room_id）
+                    placeholders = ', '.join(['%s'] * len(room_ids))
+                    cursor.execute(f"DELETE FROM `temp_voice_room_members` WHERE room_id IN ({placeholders})", room_ids)
+                    deleted_room_members = cursor.rowcount
+                    print(f"[tencent/callback] ✅ 删除了 {deleted_room_members} 个临时语音房间成员")
+                    
+                    # 然后删除临时语音房间
+                    cursor.execute("DELETE FROM `temp_voice_rooms` WHERE group_id = %s", (group_id,))
+                    deleted_rooms = cursor.rowcount
+                    print(f"[tencent/callback] ✅ 删除了 {deleted_rooms} 个临时语音房间")
+                    app_logger.info(f"[tencent/callback] 删除了 {deleted_rooms} 个临时语音房间和 {deleted_room_members} 个成员")
+                else:
+                    print(f"[tencent/callback] ℹ️  未找到临时语音房间，跳过")
                 
                 # 提交事务
+                print(f"[tencent/callback] 💾 提交数据库事务...")
                 connection.commit()
-                print(f"[tencent/callback] 群组 {group_id} 解散处理完成")
+                print(f"[tencent/callback] ✅ 群组 {group_id} 解散处理完成！")
+                print(f"[tencent/callback] 📊 处理结果统计:")
+                print(f"[tencent/callback]   - 删除成员数: {deleted_members}")
+                print(f"[tencent/callback]   - 删除群组数: {deleted_groups}")
+                print(f"[tencent/callback]   - 删除临时房间数: {deleted_rooms}")
                 app_logger.info(f"[tencent/callback] 群组 {group_id} 解散处理完成，删除了 {deleted_members} 个成员和 {deleted_groups} 个群组")
                 
             except Exception as e:
                 if connection and connection.is_connected():
+                    print(f"[tencent/callback] ⚠️  发生错误，回滚事务...")
                     connection.rollback()
-                print(f"[tencent/callback] 处理群组解散时发生错误: {e}")
+                print(f"[tencent/callback] ❌ 处理群组解散时发生错误: {e}")
+                import traceback
+                traceback_str = traceback.format_exc()
+                print(f"[tencent/callback] 错误堆栈:\n{traceback_str}")
                 app_logger.error(f"[tencent/callback] 处理群组解散时发生错误: {e}", exc_info=True)
             finally:
                 if cursor:
                     cursor.close()
+                    print(f"[tencent/callback] 🔒 数据库游标已关闭")
                 if connection and connection.is_connected():
                     connection.close()
+                    print(f"[tencent/callback] 🔒 数据库连接已关闭")
             
             # 返回成功响应给腾讯IM
+            print(f"[tencent/callback] 📤 返回成功响应给腾讯IM")
+            print("=" * 80)
+            app_logger.info("[tencent/callback] ========== 回调处理完成 ==========")
             return JSONResponse({"ActionStatus": "OK", "ErrorCode": 0, "ErrorInfo": "OK"})
         
         # 其他类型的回调（可以在这里扩展）
         else:
-            print(f"[tencent/callback] 收到未处理的回调类型: {callback_command}")
+            print(f"[tencent/callback] ⚠️  收到未处理的回调类型: {callback_command}")
+            print(f"[tencent/callback] 完整回调数据: {json.dumps(body, ensure_ascii=False, indent=2)}")
             app_logger.info(f"[tencent/callback] 收到未处理的回调类型: {callback_command}")
+            app_logger.info(f"[tencent/callback] 完整回调数据: {body}")
+            print(f"[tencent/callback] 📤 返回成功响应（避免腾讯IM重试）")
+            print("=" * 80)
             # 仍然返回成功，避免腾讯IM重试
             return JSONResponse({"ActionStatus": "OK", "ErrorCode": 0, "ErrorInfo": "OK"})
             
+    except json.JSONDecodeError as e:
+        print(f"[tencent/callback] ❌ JSON解析失败: {e}")
+        app_logger.error(f"[tencent/callback] JSON解析失败: {e}")
+        print(f"[tencent/callback] 📤 返回成功响应（避免腾讯IM重试）")
+        print("=" * 80)
+        # 返回成功，避免腾讯IM重试
+        return JSONResponse({"ActionStatus": "OK", "ErrorCode": 0, "ErrorInfo": "OK"})
     except Exception as e:
-        print(f"[tencent/callback] 处理回调时发生异常: {e}")
+        print(f"[tencent/callback] ❌ 处理回调时发生异常: {e}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[tencent/callback] 错误堆栈:\n{traceback_str}")
         app_logger.error(f"[tencent/callback] 处理回调时发生异常: {e}", exc_info=True)
+        print(f"[tencent/callback] 📤 返回成功响应（避免腾讯IM重试）")
+        print("=" * 80)
         # 返回成功，避免腾讯IM重试
         return JSONResponse({"ActionStatus": "OK", "ErrorCode": 0, "ErrorInfo": "OK"})
 
@@ -7067,33 +7290,36 @@ def get_groups_by_teacher(
 
 @app.get("/groups/search")
 def search_groups(
-    schoolid: str = Query(..., description="学校ID，必需参数"),
+    schoolid: str = Query(None, description="学校ID，可选参数"),
     group_id: str = Query(None, description="群组ID，与group_name二选一"),
     group_name: str = Query(None, description="群组名称，与group_id二选一，支持模糊查询")
 ):
     """
     搜索群组
     根据 schoolid 和 group_id 或 group_name 搜索 groups 表
-    - schoolid: 必需参数
+    - schoolid: 可选参数（如果不提供，则搜索所有学校）
     - group_id 或 group_name: 二选一，不会同时上传
     """
     print("=" * 80)
-    print("[groups/search] 收到搜索群组请求")
-    print(f"[groups/search] 请求参数 - schoolid: {schoolid}, group_id: {group_id}, group_name: {group_name}")
+    print("[groups/search] ========== 收到搜索群组请求 ==========")
+    print(f"[groups/search] 请求时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"[groups/search] 请求参数:")
+    print(f"[groups/search]   - schoolid: {schoolid}")
+    print(f"[groups/search]   - group_id: {group_id}")
+    print(f"[groups/search]   - group_name: {group_name}")
+    app_logger.info("=" * 80)
+    app_logger.info("[groups/search] ========== 收到搜索群组请求 ==========")
+    app_logger.info(f"[groups/search] 请求参数 - schoolid: {schoolid}, group_id: {group_id}, group_name: {group_name}")
     
     # 参数验证
     if not schoolid:
-        print("[groups/search] 错误: 缺少必需参数 schoolid")
-        return JSONResponse({
-            "data": {
-                "message": "缺少必需参数 schoolid",
-                "code": 400
-            }
-        }, status_code=400)
+        print("[groups/search] ⚠️  警告: 未提供 schoolid 参数，将搜索所有学校")
+        app_logger.warning("[groups/search] 未提供 schoolid 参数，将搜索所有学校")
     
     # group_id 和 group_name 必须至少提供一个
     if not group_id and not group_name:
-        print("[groups/search] 错误: group_id 和 group_name 必须至少提供一个")
+        print("[groups/search] ❌ 错误: group_id 和 group_name 必须至少提供一个")
+        app_logger.warning("[groups/search] group_id 和 group_name 必须至少提供一个")
         return JSONResponse({
             "data": {
                 "message": "group_id 和 group_name 必须至少提供一个",
@@ -7103,7 +7329,8 @@ def search_groups(
     
     # group_id 和 group_name 不能同时提供
     if group_id and group_name:
-        print("[groups/search] 错误: group_id 和 group_name 不能同时提供")
+        print("[groups/search] ❌ 错误: group_id 和 group_name 不能同时提供")
+        app_logger.warning("[groups/search] group_id 和 group_name 不能同时提供")
         return JSONResponse({
             "data": {
                 "message": "group_id 和 group_name 不能同时提供",
@@ -7111,10 +7338,11 @@ def search_groups(
             }
         }, status_code=400)
     
-    print("[groups/search] 开始连接数据库...")
+    print("[groups/search] 📊 开始连接数据库...")
+    app_logger.info("[groups/search] 开始连接数据库...")
     connection = get_db_connection()
     if connection is None or not connection.is_connected():
-        print("[groups/search] 错误: 数据库连接失败")
+        print("[groups/search] ❌ 错误: 数据库连接失败")
         app_logger.error(f"[groups/search] 数据库连接失败 for schoolid={schoolid}")
         return JSONResponse({
             "data": {
@@ -7122,7 +7350,8 @@ def search_groups(
                 "code": 500
             }
         }, status_code=500)
-    print("[groups/search] 数据库连接成功")
+    print("[groups/search] ✅ 数据库连接成功")
+    app_logger.info("[groups/search] 数据库连接成功")
 
     cursor = None
     try:
@@ -7131,34 +7360,73 @@ def search_groups(
         # 构建查询条件
         if group_id:
             # 根据 group_id 精确查询
-            print(f"[groups/search] 根据 group_id 精确查询: {group_id}")
-            sql = """
-                SELECT *
-                FROM `groups`
-                WHERE schoolid = %s AND group_id = %s
-            """
-            params = (schoolid, group_id)
+            print(f"[groups/search] 🔍 根据 group_id 精确查询: {group_id}")
+            app_logger.info(f"[groups/search] 根据 group_id 精确查询: {group_id}")
+            if schoolid:
+                sql = """
+                    SELECT *
+                    FROM `groups`
+                    WHERE schoolid = %s AND group_id = %s
+                """
+                params = (schoolid, group_id)
+            else:
+                sql = """
+                    SELECT *
+                    FROM `groups`
+                    WHERE group_id = %s
+                """
+                params = (group_id,)
         else:
             # 根据 group_name 模糊查询
-            print(f"[groups/search] 根据 group_name 模糊查询: {group_name}")
-            sql = """
-                SELECT *
-                FROM `groups`
-                WHERE schoolid = %s AND group_name LIKE %s
-            """
-            params = (schoolid, f"%{group_name}%")
+            print(f"[groups/search] 🔍 根据 group_name 模糊查询: {group_name}")
+            print(f"[groups/search]   - 原始 group_name: {repr(group_name)}")
+            print(f"[groups/search]   - group_name 长度: {len(group_name) if group_name else 0}")
+            app_logger.info(f"[groups/search] 根据 group_name 模糊查询: {group_name}")
+            
+            if schoolid:
+                sql = """
+                    SELECT *
+                    FROM `groups`
+                    WHERE schoolid = %s AND group_name LIKE %s
+                """
+                params = (schoolid, f"%{group_name}%")
+            else:
+                sql = """
+                    SELECT *
+                    FROM `groups`
+                    WHERE group_name LIKE %s
+                """
+                params = (f"%{group_name}%",)
         
-        print(f"[groups/search] 执行SQL查询: {sql}")
-        print(f"[groups/search] 查询参数: {params}")
+        print(f"[groups/search] 📝 执行SQL查询:")
+        print(f"[groups/search]   SQL: {sql}")
+        print(f"[groups/search]   参数: {params}")
+        app_logger.info(f"[groups/search] 执行SQL: {sql}, 参数: {params}")
         
         cursor.execute(sql, params)
         groups = cursor.fetchall()
         
-        print(f"[groups/search] 查询结果: 找到 {len(groups)} 个群组")
+        print(f"[groups/search] ✅ 查询完成: 找到 {len(groups)} 个群组")
+        app_logger.info(f"[groups/search] 查询完成: 找到 {len(groups)} 个群组")
+        
+        # 如果没找到结果，尝试查看数据库中的实际数据
+        if len(groups) == 0:
+            print(f"[groups/search] ⚠️  未找到匹配的群组，尝试查看数据库中的实际数据...")
+            app_logger.warning(f"[groups/search] 未找到匹配的群组，查询条件: schoolid={schoolid}, group_name={group_name}")
+            
+            # 查看数据库中是否有包含该关键词的群组
+            debug_sql = "SELECT group_id, group_name, schoolid FROM `groups` WHERE group_name LIKE %s LIMIT 10"
+            debug_params = (f"%{group_name}%",)
+            cursor.execute(debug_sql, debug_params)
+            debug_groups = cursor.fetchall()
+            print(f"[groups/search] 🔍 调试查询（不限制schoolid）: 找到 {len(debug_groups)} 个包含 '{group_name}' 的群组")
+            for idx, dg in enumerate(debug_groups):
+                print(f"[groups/search]   群组 {idx+1}: group_id={dg.get('group_id')}, group_name={dg.get('group_name')}, schoolid={dg.get('schoolid')}")
+            app_logger.info(f"[groups/search] 调试查询结果: {debug_groups}")
         
         # 转换 datetime 为字符串
         for idx, group in enumerate(groups):
-            print(f"[groups/search] 处理第 {idx+1} 个群组: group_id={group.get('group_id')}, group_name={group.get('group_name')}")
+            print(f"[groups/search] 📋 处理第 {idx+1} 个群组: group_id={group.get('group_id')}, group_name={group.get('group_name')}, schoolid={group.get('schoolid')}")
             for key, value in group.items():
                 if isinstance(value, datetime.datetime):
                     group[key] = value.strftime("%Y-%m-%d %H:%M:%S")
@@ -7175,18 +7443,22 @@ def search_groups(
             }
         }
         
-        print(result)
-        print(f"[groups/search] 返回结果: 找到 {len(groups)} 个群组")
+        print(f"[groups/search] 📤 返回结果:")
+        print(f"[groups/search]   - 找到群组数: {len(groups)}")
+        print(f"[groups/search]   - schoolid: {schoolid}")
+        print(f"[groups/search]   - 搜索关键词: {group_id if group_id else group_name}")
+        print(f"[groups/search]   - 搜索类型: {'group_id' if group_id else 'group_name'}")
+        app_logger.info(f"[groups/search] 返回结果: 找到 {len(groups)} 个群组, schoolid={schoolid}, search_key={group_id if group_id else group_name}")
         print("=" * 80)
         
         return JSONResponse(result, status_code=200)
 
     except mysql.connector.Error as e:
-        error_msg = f"搜索群组错误: {e}"
-        print(f"[groups/search] {error_msg}")
+        error_msg = f"搜索群组数据库错误: {e}"
+        print(f"[groups/search] ❌ {error_msg}")
         import traceback
         traceback_str = traceback.format_exc()
-        print(f"[groups/search] 错误堆栈: {traceback_str}")
+        print(f"[groups/search] 错误堆栈:\n{traceback_str}")
         app_logger.error(f"[groups/search] {error_msg}\n{traceback_str}")
         return JSONResponse({
             "data": {
@@ -7196,10 +7468,10 @@ def search_groups(
         }, status_code=500)
     except Exception as e:
         error_msg = f"搜索群组时发生异常: {e}"
-        print(f"[groups/search] {error_msg}")
+        print(f"[groups/search] ❌ {error_msg}")
         import traceback
         traceback_str = traceback.format_exc()
-        print(f"[groups/search] 错误堆栈: {traceback_str}")
+        print(f"[groups/search] 错误堆栈:\n{traceback_str}")
         app_logger.error(f"[groups/search] {error_msg}\n{traceback_str}")
         return JSONResponse({
             "data": {
@@ -7210,38 +7482,43 @@ def search_groups(
     finally:
         if cursor:
             cursor.close()
-            print("[groups/search] 游标已关闭")
+            print("[groups/search] 🔒 游标已关闭")
         if connection and connection.is_connected():
             connection.close()
-            print("[groups/search] 数据库连接已关闭")
-            app_logger.info(f"[groups/search] Database connection closed after search groups attempt for schoolid={schoolid}.")
+            print("[groups/search] 🔒 数据库连接已关闭")
+        print("[groups/search] ========== 搜索群组请求处理完成 ==========")
+        print("=" * 80)
+        app_logger.info(f"[groups/search] Database connection closed after search groups attempt for schoolid={schoolid}.")
 
 @app.get("/teachers/search")
 def search_teachers(
-    schoolid: str = Query(..., description="学校ID，必需参数"),
+    schoolid: str = Query(None, description="学校ID，可选参数"),
     teacher_id: str = Query(None, description="老师ID，与teacher_unique_id和name三选一"),
     teacher_unique_id: str = Query(None, description="老师唯一ID，与teacher_id和name三选一"),
     name: str = Query(None, description="老师姓名，与teacher_id和teacher_unique_id三选一，支持模糊查询")
 ):
     """
-    搜索同一学校的老师
+    搜索老师
     根据 schoolid 和 teacher_id 或 teacher_unique_id 或 name 搜索 ta_teacher 表
-    - schoolid: 必需参数
+    - schoolid: 可选参数（如果不提供，则搜索所有学校）
     - teacher_id、teacher_unique_id、name: 三选一，不会同时上传
     """
     print("=" * 80)
-    print("[teachers/search] 收到搜索老师请求")
-    print(f"[teachers/search] 请求参数 - schoolid: {schoolid}, teacher_id: {teacher_id}, teacher_unique_id: {teacher_unique_id}, name: {name}")
+    print("[teachers/search] ========== 收到搜索老师请求 ==========")
+    print(f"[teachers/search] 请求时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"[teachers/search] 请求参数:")
+    print(f"[teachers/search]   - schoolid: {schoolid}")
+    print(f"[teachers/search]   - teacher_id: {teacher_id}")
+    print(f"[teachers/search]   - teacher_unique_id: {teacher_unique_id}")
+    print(f"[teachers/search]   - name: {name}")
+    app_logger.info("=" * 80)
+    app_logger.info("[teachers/search] ========== 收到搜索老师请求 ==========")
+    app_logger.info(f"[teachers/search] 请求参数 - schoolid: {schoolid}, teacher_id: {teacher_id}, teacher_unique_id: {teacher_unique_id}, name: {name}")
     
     # 参数验证
     if not schoolid:
-        print("[teachers/search] 错误: 缺少必需参数 schoolid")
-        return JSONResponse({
-            "data": {
-                "message": "缺少必需参数 schoolid",
-                "code": 400
-            }
-        }, status_code=400)
+        print("[teachers/search] ⚠️  警告: 未提供 schoolid 参数，将搜索所有学校")
+        app_logger.warning("[teachers/search] 未提供 schoolid 参数，将搜索所有学校")
     
     # teacher_id、teacher_unique_id 和 name 必须至少提供一个
     search_params_count = sum([bool(teacher_id), bool(teacher_unique_id), bool(name)])
@@ -7264,10 +7541,11 @@ def search_teachers(
             }
         }, status_code=400)
     
-    print("[teachers/search] 开始连接数据库...")
+    print("[teachers/search] 📊 开始连接数据库...")
+    app_logger.info("[teachers/search] 开始连接数据库...")
     connection = get_db_connection()
     if connection is None or not connection.is_connected():
-        print("[teachers/search] 错误: 数据库连接失败")
+        print("[teachers/search] ❌ 错误: 数据库连接失败")
         app_logger.error(f"[teachers/search] 数据库连接失败 for schoolid={schoolid}")
         return JSONResponse({
             "data": {
@@ -7275,7 +7553,8 @@ def search_teachers(
                 "code": 500
             }
         }, status_code=500)
-    print("[teachers/search] 数据库连接成功")
+    print("[teachers/search] ✅ 数据库连接成功")
+    app_logger.info("[teachers/search] 数据库连接成功")
 
     cursor = None
     try:
@@ -7284,53 +7563,100 @@ def search_teachers(
         # 构建查询条件
         if teacher_id:
             # 根据 teacher_id 精确查询
-            print(f"[teachers/search] 根据 teacher_id 精确查询: {teacher_id}")
-            sql = """
-                SELECT *
-                FROM `ta_teacher`
-                WHERE schoolId = %s AND id = %s
-            """
-            params = (schoolid, teacher_id)
+            print(f"[teachers/search] 🔍 根据 teacher_id 精确查询: {teacher_id}")
+            app_logger.info(f"[teachers/search] 根据 teacher_id 精确查询: {teacher_id}")
+            if schoolid:
+                sql = """
+                    SELECT *
+                    FROM `ta_teacher`
+                    WHERE schoolId = %s AND id = %s
+                """
+                params = (schoolid, teacher_id)
+            else:
+                sql = """
+                    SELECT *
+                    FROM `ta_teacher`
+                    WHERE id = %s
+                """
+                params = (teacher_id,)
             search_key = teacher_id
             search_type = "teacher_id"
         elif teacher_unique_id:
             # 根据 teacher_unique_id 精确查询
-            print(f"[teachers/search] 根据 teacher_unique_id 精确查询: {teacher_unique_id}")
-            sql = """
-                SELECT *
-                FROM `ta_teacher`
-                WHERE schoolId = %s AND teacher_unique_id = %s
-            """
-            params = (schoolid, teacher_unique_id)
+            print(f"[teachers/search] 🔍 根据 teacher_unique_id 精确查询: {teacher_unique_id}")
+            app_logger.info(f"[teachers/search] 根据 teacher_unique_id 精确查询: {teacher_unique_id}")
+            if schoolid:
+                sql = """
+                    SELECT *
+                    FROM `ta_teacher`
+                    WHERE schoolId = %s AND teacher_unique_id = %s
+                """
+                params = (schoolid, teacher_unique_id)
+            else:
+                sql = """
+                    SELECT *
+                    FROM `ta_teacher`
+                    WHERE teacher_unique_id = %s
+                """
+                params = (teacher_unique_id,)
             search_key = teacher_unique_id
             search_type = "teacher_unique_id"
         else:
             # 根据 name 模糊查询
-            print(f"[teachers/search] 根据 name 模糊查询: {name}")
-            sql = """
-                SELECT *
-                FROM `ta_teacher`
-                WHERE schoolId = %s AND name LIKE %s
-            """
-            params = (schoolid, f"%{name}%")
+            print(f"[teachers/search] 🔍 根据 name 模糊查询: {name}")
+            print(f"[teachers/search]   - 原始 name: {repr(name)}")
+            print(f"[teachers/search]   - name 长度: {len(name) if name else 0}")
+            app_logger.info(f"[teachers/search] 根据 name 模糊查询: {name}")
+            if schoolid:
+                sql = """
+                    SELECT *
+                    FROM `ta_teacher`
+                    WHERE schoolId = %s AND name LIKE %s
+                """
+                params = (schoolid, f"%{name}%")
+            else:
+                sql = """
+                    SELECT *
+                    FROM `ta_teacher`
+                    WHERE name LIKE %s
+                """
+                params = (f"%{name}%",)
             search_key = name
             search_type = "name"
         
-        print(f"[teachers/search] 执行SQL查询: {sql}")
-        print(f"[teachers/search] 查询参数: {params}")
+        print(f"[teachers/search] 📝 执行SQL查询:")
+        print(f"[teachers/search]   SQL: {sql}")
+        print(f"[teachers/search]   参数: {params}")
+        app_logger.info(f"[teachers/search] 执行SQL: {sql}, 参数: {params}")
         
         cursor.execute(sql, params)
         teachers = cursor.fetchall()
         
-        print(f"[teachers/search] 查询结果: 找到 {len(teachers)} 个老师")
+        print(f"[teachers/search] ✅ 查询完成: 找到 {len(teachers)} 个老师")
+        app_logger.info(f"[teachers/search] 查询完成: 找到 {len(teachers)} 个老师")
+        
+        # 如果没找到结果，尝试查看数据库中的实际数据
+        if len(teachers) == 0:
+            print(f"[teachers/search] ⚠️  未找到匹配的老师，尝试查看数据库中的实际数据...")
+            app_logger.warning(f"[teachers/search] 未找到匹配的老师，查询条件: schoolid={schoolid}, search_key={search_key}")
+            
+            # 查看数据库中是否有包含该关键词的老师
+            if name:
+                debug_sql = "SELECT id, name, teacher_unique_id, schoolId FROM `ta_teacher` WHERE name LIKE %s LIMIT 10"
+                debug_params = (f"%{name}%",)
+                cursor.execute(debug_sql, debug_params)
+                debug_teachers = cursor.fetchall()
+                print(f"[teachers/search] 🔍 调试查询（不限制schoolid）: 找到 {len(debug_teachers)} 个包含 '{name}' 的老师")
+                for idx, dt in enumerate(debug_teachers):
+                    print(f"[teachers/search]   老师 {idx+1}: id={dt.get('id')}, name={dt.get('name')}, teacher_unique_id={dt.get('teacher_unique_id')}, schoolId={dt.get('schoolId')}")
+                app_logger.info(f"[teachers/search] 调试查询结果: {debug_teachers}")
         
         # 转换 datetime 为字符串
         for idx, teacher in enumerate(teachers):
-            print(f"[teachers/search] 处理第 {idx+1} 个老师: id={teacher.get('id')}, name={teacher.get('name')}, teacher_unique_id={teacher.get('teacher_unique_id')}")
+            print(f"[teachers/search] 📋 处理第 {idx+1} 个老师: id={teacher.get('id')}, name={teacher.get('name')}, teacher_unique_id={teacher.get('teacher_unique_id')}, schoolId={teacher.get('schoolId')}")
             for key, value in teacher.items():
                 if isinstance(value, datetime.datetime):
                     teacher[key] = value.strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"[teachers/search]   转换时间字段 {key}: {teacher[key]}")
         
         result = {
             "data": {
@@ -7344,17 +7670,22 @@ def search_teachers(
             }
         }
         
-        print(f"[teachers/search] 返回结果: 找到 {len(teachers)} 个老师")
+        print(f"[teachers/search] 📤 返回结果:")
+        print(f"[teachers/search]   - 找到老师数: {len(teachers)}")
+        print(f"[teachers/search]   - schoolid: {schoolid}")
+        print(f"[teachers/search]   - 搜索关键词: {search_key}")
+        print(f"[teachers/search]   - 搜索类型: {search_type}")
+        app_logger.info(f"[teachers/search] 返回结果: 找到 {len(teachers)} 个老师, schoolid={schoolid}, search_key={search_key}")
         print("=" * 80)
         
         return JSONResponse(result, status_code=200)
 
     except mysql.connector.Error as e:
-        error_msg = f"搜索老师错误: {e}"
-        print(f"[teachers/search] {error_msg}")
+        error_msg = f"搜索老师数据库错误: {e}"
+        print(f"[teachers/search] ❌ {error_msg}")
         import traceback
         traceback_str = traceback.format_exc()
-        print(f"[teachers/search] 错误堆栈: {traceback_str}")
+        print(f"[teachers/search] 错误堆栈:\n{traceback_str}")
         app_logger.error(f"[teachers/search] {error_msg}\n{traceback_str}")
         return JSONResponse({
             "data": {
@@ -7364,10 +7695,10 @@ def search_teachers(
         }, status_code=500)
     except Exception as e:
         error_msg = f"搜索老师时发生异常: {e}"
-        print(f"[teachers/search] {error_msg}")
+        print(f"[teachers/search] ❌ {error_msg}")
         import traceback
         traceback_str = traceback.format_exc()
-        print(f"[teachers/search] 错误堆栈: {traceback_str}")
+        print(f"[teachers/search] 错误堆栈:\n{traceback_str}")
         app_logger.error(f"[teachers/search] {error_msg}\n{traceback_str}")
         return JSONResponse({
             "data": {
@@ -7378,11 +7709,13 @@ def search_teachers(
     finally:
         if cursor:
             cursor.close()
-            print("[teachers/search] 游标已关闭")
+            print("[teachers/search] 🔒 游标已关闭")
         if connection and connection.is_connected():
             connection.close()
-            print("[teachers/search] 数据库连接已关闭")
-            app_logger.info(f"[teachers/search] Database connection closed after search teachers attempt for schoolid={schoolid}.")
+            print("[teachers/search] 🔒 数据库连接已关闭")
+        print("[teachers/search] ========== 搜索老师请求处理完成 ==========")
+        print("=" * 80)
+        app_logger.info(f"[teachers/search] Database connection closed after search teachers attempt for schoolid={schoolid}.")
 
 @app.post("/groups/join")
 async def join_group(request: Request):
@@ -11450,6 +11783,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 
                 # 返回房间信息，包含推流和拉流地址
                 # 如果用户已经在房间中，仍然返回房间信息（可能是客户端重试）
+                # 为避免客户端重复弹窗，重复加入时使用 status=duplicate 且 message 为空
                 join_room_response = {
                     "type": "6",
                     "room_id": room_info.get("room_id", ""),
@@ -11461,8 +11795,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     "stream_name": room_info.get("stream_name", ""),  # 流名称
                     "group_id": group_key,
                     "members": room_info.get("members", []),
-                    "status": "success",  # 添加状态字段，表示加入成功
-                    "message": f"已加入临时房间（班级: {group_key}）" + ("（重复加入）" if was_member else "")
+                    "status": "duplicate" if was_member else "success",
+                    "message": "" if was_member else f"已加入临时房间（班级: {group_key}）"
                 }
                 join_room_response_json = json.dumps(join_room_response, ensure_ascii=False)
                 
