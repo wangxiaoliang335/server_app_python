@@ -2315,6 +2315,10 @@ async def api_save_course_schedule(request: Request):
 
 # ===== 座位安排 API =====
 async def _handle_save_seat_arrangement_payload(data: Dict[str, Any]):
+    # 如果前面未获取到excel_files（如multipart场景），从data中提取
+    if excel_files is None:
+        excel_files = data.get('excel_files')
+
     class_id = data.get('class_id')
     seats = data.get('seats', [])
 
@@ -2653,8 +2657,8 @@ def parse_excel_file_url(excel_file_url):
     支持多种格式：
     1. 旧格式（单个URL字符串）: "https://..."
     2. 旧格式（JSON对象）: {"文件名": "URL"}
-    3. 新格式（带说明）: {"文件名": {"url": "URL", "description": "说明"}}
-    返回格式: [{"filename": "文件名", "url": "URL", "description": "说明"}, ...]
+    3. 新格式（带说明与字段映射）: {"文件名": {"url": "URL", "description": "说明", "fields": ["语文", ...]}}
+    返回格式: [{"filename": "文件名", "url": "URL", "description": "说明", "fields": [...]}, ...]
     """
     if not excel_file_url:
         return []
@@ -2672,32 +2676,44 @@ def parse_excel_file_url(excel_file_url):
             for filename, value in url_dict.items():
                 # 判断是新格式（对象）还是旧格式（字符串）
                 if isinstance(value, dict):
-                    # 新格式: {"文件名": {"url": "URL", "description": "说明"}}
+                    # 新格式: {"文件名": {"url": "URL", "description": "说明", "fields": []}}
                     result.append({
                         'filename': filename,
                         'url': value.get('url', ''),
-                        'description': value.get('description', '')
+                        'description': value.get('description', ''),
+                        'fields': value.get('fields', []) or []
                     })
                 else:
                     # 旧格式: {"文件名": "URL"}
                     result.append({
                         'filename': filename,
                         'url': value,
-                        'description': ''
+                        'description': '',
+                        'fields': []
                     })
             return result
         # 如果是列表格式（可能未来扩展）
         elif isinstance(url_dict, list):
-            return url_dict
+            # 确保每个元素都包含必需字段
+            normalized = []
+            for item in url_dict:
+                if isinstance(item, dict):
+                    normalized.append({
+                        'filename': item.get('filename', ''),
+                        'url': item.get('url', ''),
+                        'description': item.get('description', ''),
+                        'fields': item.get('fields', []) or []
+                    })
+            return normalized
         # 如果是字符串（旧格式，单个URL）
         elif isinstance(url_dict, str):
-            return [{'filename': 'excel_file', 'url': url_dict, 'description': ''}]
+            return [{'filename': 'excel_file', 'url': url_dict, 'description': '', 'fields': []}]
         else:
             return []
     except (json.JSONDecodeError, TypeError, AttributeError):
         # 如果解析失败，可能是旧的单个URL格式
         if isinstance(excel_file_url, str):
-            return [{'filename': 'excel_file', 'url': excel_file_url, 'description': ''}]
+            return [{'filename': 'excel_file', 'url': excel_file_url, 'description': '', 'fields': []}]
         return []
 
 def save_student_scores(
@@ -2709,6 +2725,7 @@ def save_student_scores(
     excel_file_url: Optional[str] = None,
     excel_file_name: Optional[str] = None,
     excel_file_description: Optional[str] = None,
+    excel_files: Optional[List[Dict]] = None,
     operation_mode: str = 'append',
     fields: List[Dict] = None
 ) -> Dict[str, object]:
@@ -2772,6 +2789,13 @@ def save_student_scores(
         connection.start_transaction()
         cursor = connection.cursor(dictionary=True)
 
+        # 预先收集excel文件中的字段，用于替换模式下避免误删其他excel对应的字段
+        keep_fields_from_excel_urls = set()  # 最终用于保留“其他”Excel的字段
+        other_excels_fields = set()          # 其他Excel的字段集合
+        current_excel_old_fields = set()     # 本次上传对应Excel在旧数据中的字段
+        current_excel_new_fields = set()     # 本次上传对应Excel在新数据中的字段
+        uploaded_filenames = set()           # 本次上传涉及的文件名
+
         # 1. 插入或获取成绩表头
         print(f"[save_student_scores] 查询成绩表头 - class_id={class_id}, exam_name={exam_name}, term={term}")
         app_logger.info(f"[save_student_scores] 查询成绩表头 - class_id={class_id}, exam_name={exam_name}, term={term}")
@@ -2797,14 +2821,28 @@ def save_student_scores(
             print(f"[save_student_scores]   - excel_file_url类型: {type(excel_file_url)}")
             app_logger.info(f"[save_student_scores] 📝 准备插入新表头 - class_id={class_id}, exam_name={exam_name}, term={term}, remark={remark}, excel_file_url={excel_file_url}, excel_file_name={excel_file_name}, excel_file_url类型={type(excel_file_url)}")
             
-            # 如果有excel_file_url，使用JSON格式存储（支持多个文件，新格式包含description）
+            # 处理excel文件信息，使用JSON格式存储（支持多个文件，包含description与fields）
             final_excel_file_url = None
-            if excel_file_url:
+            if excel_files and isinstance(excel_files, list) and len(excel_files) > 0:
+                url_dict = {}
+                for ef in excel_files:
+                    fn = ef.get('filename') or ef.get('name') or ef.get('file_name')
+                    if not fn:
+                        continue
+                    url_dict[fn] = {
+                        'url': ef.get('url', ''),
+                        'description': ef.get('description', ''),
+                        'fields': ef.get('fields', []) or []
+                    }
+                if url_dict:
+                    final_excel_file_url = json.dumps(url_dict, ensure_ascii=False)
+            elif excel_file_url:
                 if excel_file_name:
-                    # 使用新格式: {"文件名": {"url": "URL", "description": "说明"}}
+                    # 使用新格式: {"文件名": {"url": "URL", "description": "说明", "fields": []}}
                     file_info = {
                         'url': excel_file_url,
-                        'description': excel_file_description if excel_file_description else ''
+                        'description': excel_file_description if excel_file_description else '',
+                        'fields': []
                     }
                     url_dict = {excel_file_name: file_info}
                 else:
@@ -2812,14 +2850,27 @@ def save_student_scores(
                     timestamp = int(time.time())
                     file_info = {
                         'url': excel_file_url,
-                        'description': excel_file_description if excel_file_description else ''
+                        'description': excel_file_description if excel_file_description else '',
+                        'fields': []
                     }
                     url_dict = {f"excel_file_{timestamp}": file_info}
                 final_excel_file_url = json.dumps(url_dict, ensure_ascii=False)
+            
+            if final_excel_file_url:
                 print(f"[save_student_scores] 📝 新表头的excel_file_url（JSON格式）: {final_excel_file_url}")
                 app_logger.info(f"[save_student_scores] 📝 新表头的excel_file_url（JSON格式）: {final_excel_file_url}")
+                try:
+                    parsed_dict = json.loads(final_excel_file_url)
+                    if isinstance(parsed_dict, dict):
+                        for _, v in parsed_dict.items():
+                            if isinstance(v, dict):
+                                keep_fields_from_excel_urls.update(v.get('fields', []) or [])
+                except Exception as e:
+                    print(f"[save_student_scores] ⚠️ 解析excel_file_url失败: {e}")
+                    app_logger.warning(f"[save_student_scores] 解析excel_file_url失败: {e}")
             else:
-                final_excel_file_url = excel_file_url
+                print(f"[save_student_scores] ℹ️ 未提供excel文件信息，将excel_file_url置为空")
+                app_logger.info(f"[save_student_scores] ℹ️ 未提供excel文件信息，将excel_file_url置为空")
             
             insert_header_sql = (
                 "INSERT INTO ta_student_score_header (class_id, exam_name, term, remark, excel_file_url, created_at) "
@@ -2847,84 +2898,110 @@ def save_student_scores(
                 update_values.append(remark)
                 print(f"[save_student_scores] 📝 将更新remark字段: {remark}")
                 app_logger.info(f"[save_student_scores] 📝 将更新remark字段: {remark}")
-            # 更新 excel_file_url（如果提供了有效的 URL）
-            # 支持多个Excel文件的URL管理：如果文件名相同则更新，否则追加
-            print(f"[save_student_scores] 🔍 检查excel_file_url是否需要更新:")
+            # 更新 excel_file_url（支持excel_files数组，或单个excel_file_url）：
+            # - 同名文件则覆盖（url/description/fields）
+            # - 不同文件追加
+            print(f"[save_student_scores] 🔍 检查excel文件信息是否需要更新:")
+            print(f"[save_student_scores]   - excel_files数量: {len(excel_files) if excel_files else 0}")
             print(f"[save_student_scores]   - excel_file_url值: {excel_file_url}")
             print(f"[save_student_scores]   - excel_file_name值: {excel_file_name}")
-            print(f"[save_student_scores]   - excel_file_url类型: {type(excel_file_url)}")
-            app_logger.info(f"[save_student_scores] 🔍 检查excel_file_url是否需要更新: excel_file_url={excel_file_url}, excel_file_name={excel_file_name}, 类型={type(excel_file_url)}")
+            app_logger.info(f"[save_student_scores] 🔍 检查excel文件信息是否需要更新: excel_files数量={len(excel_files) if excel_files else 0}, excel_file_url={excel_file_url}, excel_file_name={excel_file_name}")
             
-            if excel_file_url:
+            # 记录本次上传涉及的文件名
+            if excel_files and isinstance(excel_files, list) and len(excel_files) > 0:
+                for ef in excel_files:
+                    fn = ef.get('filename') or ef.get('name') or ef.get('file_name')
+                    if fn:
+                        uploaded_filenames.add(fn)
+            elif excel_file_name:
+                uploaded_filenames.add(excel_file_name)
+
+            if (excel_files and isinstance(excel_files, list) and len(excel_files) > 0) or excel_file_url:
                 # 获取现有的excel_file_url值
                 existing_excel_file_url = header_row.get('excel_file_url') if header_row else None
                 print(f"[save_student_scores] 📋 现有的excel_file_url值: {existing_excel_file_url}")
                 app_logger.info(f"[save_student_scores] 📋 现有的excel_file_url值: {existing_excel_file_url}")
                 
-                # 解析现有的URL列表（支持旧格式和新格式）
-                # 旧格式: {"文件名1": "URL1", "文件名2": "URL2"}
-                # 新格式: {"文件名1": {"url": "URL1", "description": "说明1"}, "文件名2": {"url": "URL2", "description": "说明2"}}
+                # 解析现有的URL列表（兼容旧格式），转换为新格式，补齐fields
                 url_dict = {}
                 if existing_excel_file_url:
                     try:
-                        # 尝试解析为JSON对象
                         existing_dict = json.loads(existing_excel_file_url)
                         if not isinstance(existing_dict, dict):
-                            # 如果不是字典，可能是旧的单个URL格式，转换为字典
                             existing_dict = {}
-                            if excel_file_name:
-                                existing_dict[excel_file_name] = existing_excel_file_url
-                            else:
-                                existing_dict['excel_file'] = existing_excel_file_url
-                        
-                        # 将旧格式转换为新格式
+                        # 归一化为新格式
                         for filename, value in existing_dict.items():
                             if isinstance(value, dict):
-                                # 已经是新格式
-                                url_dict[filename] = value
+                                url_dict[filename] = {
+                                    'url': value.get('url', ''),
+                                    'description': value.get('description', ''),
+                                    'fields': value.get('fields', []) or []
+                                }
+                                if filename in uploaded_filenames:
+                                    current_excel_old_fields.update(url_dict[filename]['fields'])
+                                else:
+                                    other_excels_fields.update(url_dict[filename]['fields'])
                             else:
-                                # 旧格式，转换为新格式
                                 url_dict[filename] = {
                                     'url': value,
-                                    'description': ''
+                                    'description': '',
+                                    'fields': []
                                 }
-                        
                         print(f"[save_student_scores] ✅ 成功解析现有的URL字典: {url_dict}")
                         app_logger.info(f"[save_student_scores] ✅ 成功解析现有的URL字典: {url_dict}")
                     except (json.JSONDecodeError, TypeError):
-                        # 如果解析失败，说明是旧的单个URL格式
+                        # 旧的单URL格式
                         print(f"[save_student_scores] ⚠️ 现有值不是JSON格式，转换为字典格式")
                         app_logger.warning(f"[save_student_scores] ⚠️ 现有值不是JSON格式，转换为字典格式")
-                        if excel_file_name:
-                            url_dict[excel_file_name] = {
-                                'url': existing_excel_file_url,
-                                'description': ''
-                            }
+                        key_name = excel_file_name or 'excel_file'
+                        url_dict[key_name] = {
+                            'url': existing_excel_file_url,
+                            'description': '',
+                            'fields': []
+                        }
+                        if key_name in uploaded_filenames:
+                            current_excel_old_fields.update(url_dict[key_name]['fields'])
                         else:
-                            url_dict['excel_file'] = {
-                                'url': existing_excel_file_url,
-                                'description': ''
-                            }
+                            other_excels_fields.update(url_dict[key_name]['fields'])
                 
-                # 更新或添加新的URL（使用新格式）
-                if excel_file_name:
-                    # 如果提供了文件名，使用文件名作为key
-                    url_dict[excel_file_name] = {
-                        'url': excel_file_url,
-                        'description': excel_file_description if excel_file_description else ''
-                    }
-                    print(f"[save_student_scores] 📝 更新/添加URL: {excel_file_name} -> {excel_file_url}, description: {excel_file_description}")
-                    app_logger.info(f"[save_student_scores] 📝 更新/添加URL: {excel_file_name} -> {excel_file_url}, description: {excel_file_description}")
-                else:
-                    # 如果没有提供文件名，使用默认key
-                    timestamp = int(time.time())
-                    default_key = f"excel_file_{timestamp}"
-                    url_dict[default_key] = {
-                        'url': excel_file_url,
-                        'description': excel_file_description if excel_file_description else ''
-                    }
-                    print(f"[save_student_scores] 📝 添加URL（无文件名）: {default_key} -> {excel_file_url}, description: {excel_file_description}")
-                    app_logger.info(f"[save_student_scores] 📝 添加URL（无文件名）: {default_key} -> {excel_file_url}, description: {excel_file_description}")
+                # 更新或添加新的文件信息
+                if excel_files and isinstance(excel_files, list) and len(excel_files) > 0:
+                    for ef in excel_files:
+                        fn = ef.get('filename') or ef.get('name') or ef.get('file_name')
+                        if not fn:
+                            continue
+                        url_dict[fn] = {
+                            'url': ef.get('url', ''),
+                            'description': ef.get('description', ''),
+                            'fields': ef.get('fields', []) or []
+                        }
+                        if fn in uploaded_filenames:
+                            current_excel_new_fields.update(url_dict[fn]['fields'])
+                        else:
+                            other_excels_fields.update(url_dict[fn]['fields'])
+                        print(f"[save_student_scores] 📝 更新/添加URL: {fn} -> {ef.get('url','')}, description: {ef.get('description','')}, fields_count={len(ef.get('fields',[]) or [])}")
+                        app_logger.info(f"[save_student_scores] 📝 更新/添加URL: {fn} -> {ef.get('url','')}, description: {ef.get('description','')}, fields_count={len(ef.get('fields',[]) or [])}")
+                elif excel_file_url:
+                    if excel_file_name:
+                        url_dict[excel_file_name] = {
+                            'url': excel_file_url,
+                            'description': excel_file_description if excel_file_description else '',
+                            'fields': []
+                        }
+                        current_excel_new_fields.update(url_dict[excel_file_name]['fields'])
+                        print(f"[save_student_scores] 📝 更新/添加URL: {excel_file_name} -> {excel_file_url}, description: {excel_file_description}")
+                        app_logger.info(f"[save_student_scores] 📝 更新/添加URL: {excel_file_name} -> {excel_file_url}, description: {excel_file_description}")
+                    else:
+                        timestamp = int(time.time())
+                        default_key = f"excel_file_{timestamp}"
+                        url_dict[default_key] = {
+                            'url': excel_file_url,
+                            'description': excel_file_description if excel_file_description else '',
+                            'fields': []
+                        }
+                        current_excel_new_fields.update(url_dict[default_key]['fields'])
+                        print(f"[save_student_scores] 📝 添加URL（无文件名）: {default_key} -> {excel_file_url}, description: {excel_file_description}")
+                        app_logger.info(f"[save_student_scores] 📝 添加URL（无文件名）: {default_key} -> {excel_file_url}, description: {excel_file_description}")
                 
                 # 将字典转换为JSON字符串保存
                 updated_excel_file_url = json.dumps(url_dict, ensure_ascii=False)
@@ -2933,9 +3010,12 @@ def save_student_scores(
                 
                 update_fields.append("excel_file_url = %s")
                 update_values.append(updated_excel_file_url)
+                
+                # 仅保留其他excel的字段，当前上传excel的字段不加入保留集
+                keep_fields_from_excel_urls = set(other_excels_fields)
             else:
-                print(f"[save_student_scores] ⚠️ excel_file_url为空或None，不更新该字段，保留原有值")
-                app_logger.info(f"[save_student_scores] ⚠️ excel_file_url为空或None，不更新该字段，保留原有值")
+                print(f"[save_student_scores] ⚠️ 未提供excel文件信息，不更新excel_file_url字段，保留原值")
+                app_logger.info(f"[save_student_scores] ⚠️ 未提供excel文件信息，不更新excel_file_url字段，保留原值")
             if update_fields:
                 update_values.append(score_header_id)
                 update_sql = f"UPDATE ta_student_score_header SET {', '.join(update_fields)}, updated_at = NOW() WHERE id = %s"
@@ -2969,7 +3049,7 @@ def save_student_scores(
         print(f"[save_student_scores] 开始处理字段定义 - score_header_id={score_header_id}, operation_mode={operation_mode}")
         app_logger.info(f"[save_student_scores] 开始处理字段定义 - score_header_id={score_header_id}, operation_mode={operation_mode}")
         
-        # 如果提供了fields参数，使用fields；否则从scores中提取
+        # 如果提供了fields参数，使用fields；否则从scores中提取。并合并excel_file_url中的字段，避免误删其他excel字段。
         if fields and isinstance(fields, list) and len(fields) > 0:
             # 使用提供的字段定义
             field_definitions = fields
@@ -2996,6 +3076,34 @@ def save_student_scores(
             field_name_set = field_set
             print(f"[save_student_scores] 从scores中提取的字段: {[f.get('field_name') for f in field_definitions]}")
             app_logger.info(f"[save_student_scores] 从scores中提取的字段: {[f.get('field_name') for f in field_definitions]}")
+
+        # 合并excel_file_url中的“其他excel字段”，防止替换模式误删它们；当前上传的excel字段不加入保留集
+        if keep_fields_from_excel_urls:
+            field_name_set = set(field_name_set) if 'field_name_set' in locals() else set()
+            field_name_set.update(keep_fields_from_excel_urls)
+            # 将缺失在field_definitions中的“其他excel字段”补充到定义列表（保持基础属性，顺序追加）
+            existing_def_names = {f.get('field_name') for f in field_definitions if f.get('field_name')}
+            append_idx = len(field_definitions)
+            for fname in sorted(list(keep_fields_from_excel_urls)):
+                if fname not in existing_def_names:
+                    append_idx += 1
+                    field_definitions.append({
+                        'field_name': fname,
+                        'field_type': 'number',
+                        'field_order': append_idx,
+                        'is_total': 1 if '总分' in fname or 'total' in fname.lower() else 0
+                    })
+            print(f"[save_student_scores] 合并“其他excel字段”后保留字段: {sorted(list(field_name_set))}")
+            app_logger.info(f"[save_student_scores] 合并“其他excel字段”后保留字段: {sorted(list(field_name_set))}")
+
+        # 当前上传中涉及的字段集合（用于替换模式时保留其他excel的字段）
+        upload_field_set = set()
+        for score_item in scores:
+            for key in score_item.keys():
+                if key not in ['student_id', 'student_name']:
+                    upload_field_set.add(key)
+        if not upload_field_set and fields:
+            upload_field_set = {f.get('field_name') for f in fields if f.get('field_name')}
         
         # 4. 在替换模式下，删除不在新数据中的字段
         deleted_field_count = 0
@@ -3008,8 +3116,8 @@ def save_student_scores(
             existing_fields = cursor.fetchall()
             existing_field_names = {f['field_name'] for f in existing_fields}
             
-            # 找出需要删除的字段（存在于数据库但不在新数据中）
-            fields_to_delete = existing_field_names - field_name_set
+            # 找出需要删除的字段（存在于数据库但不在新数据中 + 不在“其他excel字段”保留集中）
+            fields_to_delete = existing_field_names - field_name_set - other_excels_fields
             if fields_to_delete:
                 delete_field_sql = "DELETE FROM ta_student_score_field WHERE score_header_id = %s AND field_name = %s"
                 for field_name in fields_to_delete:
@@ -3190,11 +3298,10 @@ def save_student_scores(
                             pass
             
             # 在追加模式下，如果记录已存在，合并JSON数据（保留旧字段，添加新字段）
-            # 在替换模式下，完全使用新数据，不合并
+            # 在替换模式下，仅替换本次上传涉及的字段，保留其他excel的字段
             if operation_mode == 'append' and existing_record and existing_record.get('scores_json'):
                 try:
                     existing_json = json.loads(existing_record['scores_json']) if isinstance(existing_record['scores_json'], str) else existing_record['scores_json']
-                    # 合并JSON：新字段覆盖旧字段，保留旧字段中没有的字段
                     merged_json = {**existing_json, **scores_json}
                     scores_json = merged_json
                     print(f"[save_student_scores] 合并已有成绩数据 - student_name={student_name}, 旧字段数={len(existing_json)}, 新字段数={len(scores_json)}")
@@ -3202,10 +3309,17 @@ def save_student_scores(
                 except (json.JSONDecodeError, TypeError) as e:
                     print(f"[save_student_scores] 解析已有JSON失败，使用新数据 - student_name={student_name}, error={e}")
                     app_logger.warning(f"[save_student_scores] 解析已有JSON失败，使用新数据 - student_name={student_name}, error={e}")
-            elif operation_mode == 'replace':
-                # 替换模式：完全使用新数据，不合并
-                print(f"[save_student_scores] 替换模式 - 完全使用新数据，不合并 - student_name={student_name}")
-                app_logger.info(f"[save_student_scores] 替换模式 - 完全使用新数据，不合并 - student_name={student_name}")
+            elif operation_mode == 'replace' and existing_record and existing_record.get('scores_json'):
+                try:
+                    existing_json = json.loads(existing_record['scores_json']) if isinstance(existing_record['scores_json'], str) else existing_record['scores_json']
+                    # 保留“其他excel”的字段，仅用本次上传字段覆盖
+                    preserved = {k: v for k, v in existing_json.items() if k in other_excels_fields}
+                    scores_json = {**preserved, **scores_json}
+                    print(f"[save_student_scores] 替换模式保留其他excel字段 - student_name={student_name}, 保留字段数={len(preserved)}, 新字段数={len(scores_json)}")
+                    app_logger.info(f"[save_student_scores] 替换模式保留其他excel字段 - student_name={student_name}")
+                except (json.JSONDecodeError, TypeError) as e:
+                    print(f"[save_student_scores] 替换模式解析已有JSON失败，使用新数据 - student_name={student_name}, error={e}")
+                    app_logger.warning(f"[save_student_scores] 替换模式解析已有JSON失败，使用新数据 - student_name={student_name}, error={e}")
             
             # 如果没有找到总分字段，自动计算总分（所有数字字段的和）
             if total_score is None:
@@ -3358,6 +3472,7 @@ async def api_save_student_scores(request: Request):
     excel_file = None
     excel_file_name = None
     excel_file_url = None
+    excel_files = None
     
     # 检查Content-Type
     content_type = request.headers.get("content-type", "").lower()
@@ -3601,6 +3716,17 @@ async def api_save_student_scores(request: Request):
     scores = data.get('scores', [])
     operation_mode = data.get('operation_mode', 'append')  # 默认为追加模式
     fields = data.get('fields')  # 字段定义列表（可选）
+    excel_files = data.get('excel_files')  # 多个excel文件信息（可选）
+
+    # 调试：打印客户端传入的excel文件信息
+    try:
+        print(f"[student-scores/save] 接收到的excel_files: {json.dumps(excel_files, ensure_ascii=False) if excel_files else None}")
+        print(f"[student-scores/save] 接收到的excel_file_url: {excel_file_url}")
+        app_logger.info(f"[student-scores/save] 接收到的excel_files: {json.dumps(excel_files, ensure_ascii=False) if excel_files else None}")
+        app_logger.info(f"[student-scores/save] 接收到的excel_file_url: {excel_file_url}")
+    except Exception as log_err:
+        print(f"[student-scores/save] ⚠️ 打印excel文件信息时出错: {log_err}")
+        app_logger.warning(f"[student-scores/save] 打印excel文件信息时出错: {log_err}")
 
     print(f"[student-scores/save] ========== 解析后的参数 ==========")
     print(f"[student-scores/save] class_id: {class_id}")
@@ -3612,9 +3738,10 @@ async def api_save_student_scores(request: Request):
     print(f"[student-scores/save] excel_file_description: {excel_file_description}")
     print(f"[student-scores/save] excel_file_url类型: {type(excel_file_url)}")
     print(f"[student-scores/save] excel_file_url是否为空: {not excel_file_url}")
+    print(f"[student-scores/save] excel_files数量: {len(excel_files) if excel_files else 0}")
     print(f"[student-scores/save] fields数量: {len(fields) if fields else 0}")
     print(f"[student-scores/save] scores数量: {len(scores) if scores else 0}")
-    app_logger.info(f"[student-scores/save] 解析后的参数: class_id={class_id}, exam_name={exam_name}, term={term}, operation_mode={operation_mode}, excel_file_name={excel_file_name}, excel_file_url={excel_file_url}, excel_file_description={excel_file_description}, fields数量={len(fields) if fields else 0}, scores数量={len(scores) if scores else 0}")
+    app_logger.info(f"[student-scores/save] 解析后的参数: class_id={class_id}, exam_name={exam_name}, term={term}, operation_mode={operation_mode}, excel_file_name={excel_file_name}, excel_file_url={excel_file_url}, excel_file_description={excel_file_description}, excel_files数量={len(excel_files) if excel_files else 0}, fields数量={len(fields) if fields else 0}, scores数量={len(scores) if scores else 0}")
 
     if not class_id or not exam_name:
         error_msg = '缺少必要参数 class_id 或 exam_name'
@@ -3633,9 +3760,17 @@ async def api_save_student_scores(request: Request):
     print(f"[student-scores/save]   - excel_file_url: {excel_file_url}")
     print(f"[student-scores/save]   - excel_file_name: {excel_file_name}")
     print(f"[student-scores/save]   - excel_file_description: {excel_file_description}")
+    print(f"[student-scores/save]   - excel_files数量: {len(excel_files) if excel_files else 0}")
     print(f"[student-scores/save]   - fields数量: {len(fields) if fields else 0}")
     print(f"[student-scores/save]   - scores数量: {len(scores) if scores else 0}")
-    app_logger.info(f"[student-scores/save] 📤 传递给save_student_scores的参数: class_id={class_id}, exam_name={exam_name}, term={term}, remark={remark}, operation_mode={operation_mode}, excel_file_url={excel_file_url}, excel_file_name={excel_file_name}, excel_file_description={excel_file_description}, fields数量={len(fields) if fields else 0}, scores数量={len(scores) if scores else 0}")
+    app_logger.info(f"[student-scores/save] 📤 传递给save_student_scores的参数: class_id={class_id}, exam_name={exam_name}, term={term}, remark={remark}, operation_mode={operation_mode}, excel_file_url={excel_file_url}, excel_file_name={excel_file_name}, excel_file_description={excel_file_description}, excel_files数量={len(excel_files) if excel_files else 0}, fields数量={len(fields) if fields else 0}, scores数量={len(scores) if scores else 0}")
+    # 如果上传了excel文件且excel_files里对应文件url为空，则回填上传得到的excel_file_url
+    if excel_files and excel_file_url and excel_file_name:
+        for ef in excel_files:
+            fn = ef.get('filename') or ef.get('name') or ef.get('file_name')
+            if fn == excel_file_name and (not ef.get('url')):
+                ef['url'] = excel_file_url
+
     result = save_student_scores(
         class_id=class_id,
         exam_name=exam_name,
@@ -3645,6 +3780,7 @@ async def api_save_student_scores(request: Request):
         excel_file_url=excel_file_url,
         excel_file_name=excel_file_name,
         excel_file_description=excel_file_description,
+        excel_files=excel_files,
         operation_mode=operation_mode,
         fields=fields
     )
