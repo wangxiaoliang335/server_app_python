@@ -3544,7 +3544,7 @@ async def api_get_student_scores(
             
             # 查询成绩明细
             cursor.execute(
-                "SELECT id, student_id, student_name, scores_json, total_score "
+                "SELECT id, student_id, student_name, scores_json, comments_json, total_score "
                 "FROM ta_student_score_detail "
                 "WHERE score_header_id = %s "
                 "ORDER BY total_score DESC, student_name ASC",
@@ -3562,7 +3562,7 @@ async def api_get_student_scores(
                     'total_score': float(row['total_score']) if row['total_score'] is not None else None
                 }
                 
-                # 解析JSON字段
+                # 解析成绩JSON字段
                 if row.get('scores_json'):
                     try:
                         if isinstance(row['scores_json'], str):
@@ -3577,6 +3577,27 @@ async def api_get_student_scores(
                     except (json.JSONDecodeError, TypeError) as e:
                         print(f"[api_get_student_scores] 解析JSON失败: {e}, scores_json={row.get('scores_json')}")
                         app_logger.warning(f"[api_get_student_scores] 解析JSON失败: {e}")
+                
+                # 解析注释JSON字段
+                comments_dict = {}
+                if row.get('comments_json'):
+                    try:
+                        if isinstance(row['comments_json'], str):
+                            comments_dict = json.loads(row['comments_json'])
+                        else:
+                            comments_dict = row['comments_json']
+                    except (json.JSONDecodeError, TypeError) as e:
+                        print(f"[api_get_student_scores] 解析注释JSON失败: {e}, comments_json={row.get('comments_json')}")
+                        app_logger.warning(f"[api_get_student_scores] 解析注释JSON失败: {e}")
+                
+                # 为每个字段添加注释（如果存在）
+                for field_name in field_names:
+                    comment_key = f"{field_name}_comment"
+                    if field_name in comments_dict:
+                        score_dict[comment_key] = comments_dict[field_name]
+                
+                # 同时返回完整的注释对象（可选，方便前端使用）
+                score_dict['comments'] = comments_dict
                 
                 scores.append(score_dict)
             
@@ -3723,7 +3744,7 @@ async def api_get_student_score(
         print(f"[student-scores/get] 查询成绩明细 - score_header_id: {score_header_id}")
         app_logger.info(f"[student-scores/get] 开始查询成绩明细 - score_header_id: {score_header_id}")
         cursor.execute(
-            "SELECT id, student_id, student_name, scores_json, total_score "
+            "SELECT id, student_id, student_name, scores_json, comments_json, total_score "
             "FROM ta_student_score_detail "
             "WHERE score_header_id = %s "
             "ORDER BY total_score DESC, student_name ASC",
@@ -3744,7 +3765,7 @@ async def api_get_student_score(
                 'total_score': float(row['total_score']) if row['total_score'] is not None else None
             }
             
-            # 解析JSON字段
+            # 解析成绩JSON字段
             if row.get('scores_json'):
                 try:
                     if isinstance(row['scores_json'], str):
@@ -3759,6 +3780,27 @@ async def api_get_student_score(
                 except (json.JSONDecodeError, TypeError) as e:
                     print(f"[api_get_student_score] 解析JSON失败: {e}, scores_json={row.get('scores_json')}")
                     app_logger.warning(f"[api_get_student_score] 解析JSON失败: {e}")
+            
+            # 解析注释JSON字段
+            comments_dict = {}
+            if row.get('comments_json'):
+                try:
+                    if isinstance(row['comments_json'], str):
+                        comments_dict = json.loads(row['comments_json'])
+                    else:
+                        comments_dict = row['comments_json']
+                except (json.JSONDecodeError, TypeError) as e:
+                    print(f"[api_get_student_score] 解析注释JSON失败: {e}, comments_json={row.get('comments_json')}")
+                    app_logger.warning(f"[api_get_student_score] 解析注释JSON失败: {e}")
+            
+            # 为每个字段添加注释（如果存在）
+            for field_name in field_names:
+                comment_key = f"{field_name}_comment"
+                if field_name in comments_dict:
+                    score_dict[comment_key] = comments_dict[field_name]
+            
+            # 同时返回完整的注释对象（可选，方便前端使用）
+            score_dict['comments'] = comments_dict
             
             scores.append(score_dict)
         
@@ -3847,6 +3889,181 @@ async def api_get_student_score(
             connection.close()
             print("[student-scores/get] 数据库连接已关闭")
             app_logger.info(f"[student-scores/get] 数据库连接已关闭 - class_id: {class_id}")
+
+@app.post("/student-scores/set-comment")
+async def api_set_student_score_comment(request: Request):
+    """
+    设置特定学生特定属性的注释
+    请求体 JSON:
+    {
+      "score_header_id": 1,              // 成绩表头ID（必需）
+      "student_name": "张子晨",           // 学生姓名（必需）
+      "student_id": "2024001",           // 学号（可选，如果提供会更精确匹配）
+      "field_name": "数学",               // 字段名称（必需，如：数学、早读、语文等）
+      "comment": "需要加强练习"           // 注释内容（必需，如果要删除注释可以传空字符串）
+    }
+    """
+    print("=" * 80)
+    print("[student-scores/set-comment] ========== 收到设置注释请求 ==========")
+    
+    try:
+        body = await request.json()
+        score_header_id = body.get('score_header_id')
+        student_name = body.get('student_name')
+        student_id = body.get('student_id')  # 可选
+        field_name = body.get('field_name')
+        comment = body.get('comment')
+        
+        # 参数验证
+        if not score_header_id:
+            return safe_json_response({
+                'message': '缺少必需参数: score_header_id',
+                'code': 400
+            }, status_code=400)
+        
+        if not student_name:
+            return safe_json_response({
+                'message': '缺少必需参数: student_name',
+                'code': 400
+            }, status_code=400)
+        
+        if not field_name:
+            return safe_json_response({
+                'message': '缺少必需参数: field_name',
+                'code': 400
+            }, status_code=400)
+        
+        if comment is None:
+            return safe_json_response({
+                'message': '缺少必需参数: comment',
+                'code': 400
+            }, status_code=400)
+        
+        print(f"[student-scores/set-comment] 参数 - score_header_id: {score_header_id}, student_name: {student_name}, student_id: {student_id}, field_name: {field_name}, comment: {comment}")
+        app_logger.info(f"[student-scores/set-comment] 收到设置注释请求 - score_header_id: {score_header_id}, student_name: {student_name}, student_id: {student_id}, field_name: {field_name}")
+        
+        connection = get_db_connection()
+        if connection is None:
+            return safe_json_response({
+                'message': '数据库连接失败',
+                'code': 500
+            }, status_code=500)
+        
+        cursor = connection.cursor(dictionary=True)
+        
+        # 查询学生成绩记录
+        if student_id:
+            cursor.execute(
+                "SELECT id, comments_json FROM ta_student_score_detail "
+                "WHERE score_header_id = %s AND student_name = %s AND student_id = %s "
+                "LIMIT 1",
+                (score_header_id, student_name, student_id)
+            )
+        else:
+            cursor.execute(
+                "SELECT id, comments_json FROM ta_student_score_detail "
+                "WHERE score_header_id = %s AND student_name = %s "
+                "LIMIT 1",
+                (score_header_id, student_name)
+            )
+        
+        record = cursor.fetchone()
+        
+        if not record:
+            return safe_json_response({
+                'message': f'未找到学生成绩记录: {student_name}',
+                'code': 404
+            }, status_code=404)
+        
+        record_id = record['id']
+        existing_comments_json = record.get('comments_json')
+        
+        # 解析现有的注释JSON
+        if existing_comments_json:
+            if isinstance(existing_comments_json, str):
+                try:
+                    comments_dict = json.loads(existing_comments_json)
+                except json.JSONDecodeError:
+                    comments_dict = {}
+            else:
+                comments_dict = existing_comments_json
+        else:
+            comments_dict = {}
+        
+        # 更新或添加注释
+        if comment.strip():  # 如果注释不为空，则设置
+            comments_dict[field_name] = comment
+        else:  # 如果注释为空字符串，则删除该字段的注释
+            comments_dict.pop(field_name, None)
+        
+        # 将更新后的字典转换为JSON字符串
+        comments_json_str = json.dumps(comments_dict, ensure_ascii=False)
+        
+        # 更新数据库
+        cursor.execute(
+            "UPDATE ta_student_score_detail "
+            "SET comments_json = %s, updated_at = NOW() "
+            "WHERE id = %s",
+            (comments_json_str, record_id)
+        )
+        
+        connection.commit()
+        
+        print(f"[student-scores/set-comment] ✅ 注释设置成功 - record_id: {record_id}, field_name: {field_name}, comment: {comment}")
+        app_logger.info(f"[student-scores/set-comment] ✅ 注释设置成功 - record_id: {record_id}, student_name: {student_name}, field_name: {field_name}, comment: {comment}")
+        
+        return safe_json_response({
+            'message': '注释设置成功',
+            'code': 200,
+            'data': {
+                'record_id': record_id,
+                'student_name': student_name,
+                'field_name': field_name,
+                'comment': comment if comment.strip() else None,
+                'comments_json': comments_dict
+            }
+        })
+        
+    except json.JSONDecodeError:
+        error_msg = '请求体JSON格式错误'
+        print(f"[student-scores/set-comment] ❌ {error_msg}")
+        app_logger.error(f"[student-scores/set-comment] ❌ {error_msg}")
+        return safe_json_response({
+            'message': error_msg,
+            'code': 400
+        }, status_code=400)
+    except mysql.connector.Error as e:
+        error_msg = f"数据库错误: {e}"
+        print(f"[student-scores/set-comment] ❌ {error_msg}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[student-scores/set-comment] 错误堆栈:\n{traceback_str}")
+        app_logger.error(f"[student-scores/set-comment] ❌ {error_msg}\n{traceback_str}")
+        return safe_json_response({
+            'message': f'数据库错误: {str(e)}',
+            'code': 500
+        }, status_code=500)
+    except Exception as e:
+        error_msg = f"未知错误: {e}"
+        print(f"[student-scores/set-comment] ❌ {error_msg}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[student-scores/set-comment] 错误堆栈:\n{traceback_str}")
+        app_logger.error(f"[student-scores/set-comment] ❌ {error_msg}\n{traceback_str}")
+        return safe_json_response({
+            'message': f'未知错误: {str(e)}',
+            'code': 500
+        }, status_code=500)
+    finally:
+        if 'cursor' in locals() and cursor:
+            cursor.close()
+            print("[student-scores/set-comment] 🔒 游标已关闭")
+        if 'connection' in locals() and connection and connection.is_connected():
+            connection.close()
+            print("[student-scores/set-comment] 🔒 数据库连接已关闭")
+            app_logger.info(f"[student-scores/set-comment] 数据库连接已关闭")
+        print("[student-scores/set-comment] ========== 设置注释请求处理完成 ==========")
+        print("=" * 80)
 
 # ===== 小组管理表 API =====
 def save_group_scores(
