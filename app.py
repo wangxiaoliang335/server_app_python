@@ -4414,136 +4414,488 @@ async def api_set_student_score_comment(request: Request):
 # ===== 小组管理表 API =====
 def save_group_scores(
     class_id: str,
+    exam_name: str,
     term: Optional[str] = None,
     remark: Optional[str] = None,
-    group_scores: List[Dict] = None
+    scores: List[Dict] = None,
+    excel_file_url: Optional[str] = None,
+    excel_file_name: Optional[str] = None,
+    excel_file_description: Optional[str] = None,
+    operation_mode: str = 'append',
+    fields: List[Dict] = None,
+    excel_files: List[Dict] = None
 ) -> Dict[str, object]:
     """
-    保存小组管理表
+    保存小组成绩表（支持动态字段，使用JSON存储）
     参数说明：
     - class_id: 班级ID（必需）
+    - exam_name: 考试名称（必需，如"期中考试"、"期末考试"）
     - term: 学期（可选，如 '2025-2026-1'）
     - remark: 备注（可选）
-    - group_scores: 小组评分明细列表，每个元素包含:
+    - excel_file_url: Excel文件在OSS的URL（可选）
+    - excel_file_name: Excel文件名（可选，用于管理多个文件）
+    - excel_file_description: Excel文件说明（可选）
+    - operation_mode: 操作模式，'append'（追加，默认）或 'replace'（替换）
+    - fields: 字段定义列表（可选），每个元素包含:
       {
-        'group_number': int,           # 小组编号（必需）
-        'student_id': str,             # 学号（可选）
-        'student_name': str,           # 姓名（必需）
-        'hygiene': int,                # 卫生评分（可选）
-        'participation': int,          # 课堂发言评分（可选）
-        'discipline': int,             # 纪律评分（可选）
-        'homework': int,               # 作业评分（可选）
-        'recitation': int,             # 背诵评分（可选）
-        'total_score': int             # 个人总分（可选，可自动计算）
+        'field_name': str,      # 字段名称（必需）
+        'field_type': str,       # 字段类型（可选，默认'number'）
+        'field_order': int,      # 字段顺序（可选）
+        'is_total': int          # 是否为总分字段（可选，0或1）
+      }
+    - excel_files: Excel文件列表（可选），每个元素包含:
+      {
+        'filename': str,         # 文件名（必需）
+        'url': str,              # 文件URL（必需）
+        'description': str,       # 文件说明（可选）
+        'fields': [str]          # 该文件对应的字段列表（可选）
+      }
+    - scores: 成绩明细列表，每个元素包含:
+      {
+        'group_name': str,       # 小组名称/编号（必需，如"1"或"1组"）
+        'student_id': str,       # 学号（可选）
+        'student_name': str,     # 姓名（必需）
+        '语文': int,              # 各科成绩（动态字段）
+        '数学': int,
+        '英语': int,
+        '总分': float,            # 个人总分（可选，可自动计算）
+        'group_total_score': float  # 小组总分（可选，可自动计算）
       }
     
     返回：
-    - { success, score_header_id, inserted_count, message }
+    - { success, score_header_id, inserted_count, updated_count, deleted_count, message }
     """
-    if not class_id:
-        return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '缺少必要参数 class_id' }
+    if not class_id or not exam_name:
+        return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '缺少必要参数 class_id 或 exam_name' }
     
-    if not group_scores or not isinstance(group_scores, list):
-        return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '小组评分明细列表不能为空' }
+    # 验证operation_mode
+    if operation_mode not in ['append', 'replace']:
+        operation_mode = 'append'  # 默认使用追加模式
+    
+    # 在替换模式下，scores可以为空（用于删除所有数据）
+    if operation_mode == 'replace' and (not scores or not isinstance(scores, list)):
+        scores = []
+    elif operation_mode == 'append' and (not scores or not isinstance(scores, list)):
+        return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '成绩明细列表不能为空' }
 
+    print(f"[save_group_scores] 开始保存小组成绩 - class_id={class_id}, exam_name={exam_name}, term={term}, operation_mode={operation_mode}, scores数量={len(scores) if scores else 0}")
+    app_logger.info(f"[save_group_scores] 开始保存小组成绩 - class_id={class_id}, exam_name={exam_name}, term={term}, operation_mode={operation_mode}, scores数量={len(scores) if scores else 0}")
+    
     connection = get_db_connection()
     if connection is None:
-        app_logger.error("Save group scores failed: Database connection error.")
+        error_msg = "Save group scores failed: Database connection error."
+        print(f"[save_group_scores] 错误: {error_msg}")
+        app_logger.error(error_msg)
         return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '数据库连接失败' }
 
+    print(f"[save_group_scores] 数据库连接成功，开始事务")
+    app_logger.info(f"[save_group_scores] 数据库连接成功，开始事务")
     try:
         connection.start_transaction()
         cursor = connection.cursor(dictionary=True)
 
-        # 1. 插入或获取小组管理表头（每个班级每个学期一个表头）
+        # 1. 插入或获取小组成绩表头
+        print(f"[save_group_scores] 查询小组成绩表头 - class_id={class_id}, exam_name={exam_name}, term={term}")
+        app_logger.info(f"[save_group_scores] 查询小组成绩表头 - class_id={class_id}, exam_name={exam_name}, term={term}")
         cursor.execute(
-            "SELECT id FROM ta_group_score_header WHERE class_id = %s AND (%s IS NULL OR term = %s) LIMIT 1",
-            (class_id, term, term)
+            "SELECT id, excel_file_url FROM ta_group_score_header WHERE class_id = %s AND exam_name = %s AND (%s IS NULL OR term = %s) LIMIT 1",
+            (class_id, exam_name, term, term)
         )
         header_row = cursor.fetchone()
+        print(f"[save_group_scores] 查询小组成绩表头结果: {header_row}")
+        app_logger.info(f"[save_group_scores] 查询小组成绩表头结果: {header_row}")
+
+        # 收集需要保留的字段（来自其他Excel文件）
+        keep_fields_from_excel_urls = set()
+        current_excel_filenames = set()
+        if excel_files and isinstance(excel_files, list):
+            for ef in excel_files:
+                fn = ef.get('filename') or ef.get('name') or ef.get('file_name')
+                if fn:
+                    current_excel_filenames.add(fn)
+        elif excel_file_name:
+            current_excel_filenames.add(excel_file_name)
 
         if header_row is None:
             # 插入新表头
+            print(f"[save_group_scores] ========== 插入新小组成绩表头 ==========")
+            app_logger.info(f"[save_group_scores] ========== 插入新小组成绩表头 ==========")
+            
+            # 处理Excel文件URL（类似学生成绩接口）
+            final_excel_file_url = None
+            if excel_files and isinstance(excel_files, list) and len(excel_files) > 0:
+                url_dict = {}
+                for ef in excel_files:
+                    fn = ef.get('filename') or ef.get('name') or ef.get('file_name')
+                    if not fn:
+                        continue
+                    # 如果URL为空但excel_file_url有值，使用excel_file_url
+                    file_url = ef.get('url', '')
+                    if not file_url and excel_file_url:
+                        file_url = excel_file_url
+                        print(f"[save_group_scores] ✅ 创建表头时使用excel_file_url填充excel_files中的URL: {fn} -> {file_url}")
+                        app_logger.info(f"[save_group_scores] ✅ 创建表头时使用excel_file_url填充excel_files中的URL: {fn} -> {file_url}")
+                    url_dict[fn] = {
+                        'url': file_url,
+                        'description': ef.get('description', ''),
+                        'fields': ef.get('fields', []) or []
+                    }
+                final_excel_file_url = json.dumps(url_dict, ensure_ascii=False)
+            elif excel_file_url:
+                if excel_file_name:
+                    file_info = {
+                        'url': excel_file_url,
+                        'description': excel_file_description if excel_file_description else '',
+                        'fields': []
+                    }
+                    url_dict = {excel_file_name: file_info}
+                else:
+                    timestamp = int(time.time())
+                    file_info = {
+                        'url': excel_file_url,
+                        'description': excel_file_description if excel_file_description else '',
+                        'fields': []
+                    }
+                    url_dict = {f"excel_file_{timestamp}": file_info}
+                final_excel_file_url = json.dumps(url_dict, ensure_ascii=False)
+            
             insert_header_sql = (
-                "INSERT INTO ta_group_score_header (class_id, term, remark, created_at) "
-                "VALUES (%s, %s, %s, NOW())"
+                "INSERT INTO ta_group_score_header (class_id, exam_name, term, remark, excel_file_url, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, NOW())"
             )
-            cursor.execute(insert_header_sql, (class_id, term, remark))
+            cursor.execute(insert_header_sql, (class_id, exam_name, term, remark, final_excel_file_url))
             score_header_id = cursor.lastrowid
+            print(f"[save_group_scores] ✅ 插入小组成绩表头成功 - score_header_id={score_header_id}")
+            app_logger.info(f"[save_group_scores] ✅ 插入小组成绩表头成功 - score_header_id={score_header_id}")
         else:
             score_header_id = header_row['id']
-            # 更新表头信息（若存在）
+            print(f"[save_group_scores] ========== 小组成绩表头已存在，准备更新 ==========")
+            app_logger.info(f"[save_group_scores] ========== 小组成绩表头已存在，准备更新 ==========")
+            
+            # 更新表头信息（类似学生成绩接口的Excel文件处理逻辑）
+            update_fields = []
+            update_values = []
             if remark is not None:
-                cursor.execute(
-                    "UPDATE ta_group_score_header SET remark = %s, updated_at = NOW() WHERE id = %s",
-                    (remark, score_header_id)
-                )
-            # 删除旧的评分明细（重新上传时覆盖）
-            cursor.execute("DELETE FROM ta_group_score_detail WHERE score_header_id = %s", (score_header_id,))
+                update_fields.append("remark = %s")
+                update_values.append(remark)
+            
+            # 处理Excel文件URL更新（参考学生成绩接口的实现）
+            if (excel_files and isinstance(excel_files, list) and len(excel_files) > 0) or excel_file_url:
+                existing_excel_file_url = header_row.get('excel_file_url')
+                url_dict = {}
+                if existing_excel_file_url:
+                    try:
+                        existing_dict = json.loads(existing_excel_file_url)
+                        if isinstance(existing_dict, dict):
+                            for filename, value in existing_dict.items():
+                                if isinstance(value, dict):
+                                    url_dict[filename] = {
+                                        'url': value.get('url', ''),
+                                        'description': value.get('description', ''),
+                                        'fields': value.get('fields', []) or []
+                                    }
+                                    # 如果是其他Excel文件的字段，需要保留
+                                    if filename not in current_excel_filenames:
+                                        keep_fields_from_excel_urls.update(url_dict[filename]['fields'])
+                                else:
+                                    url_dict[filename] = {
+                                        'url': value,
+                                        'description': '',
+                                        'fields': []
+                                    }
+                                    if filename not in current_excel_filenames:
+                                        keep_fields_from_excel_urls.update(url_dict[filename]['fields'])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                
+                # 更新或添加新的文件信息
+                if excel_files and isinstance(excel_files, list) and len(excel_files) > 0:
+                    for ef in excel_files:
+                        fn = ef.get('filename') or ef.get('name') or ef.get('file_name')
+                        if not fn:
+                            continue
+                        # 如果URL为空但excel_file_url有值，使用excel_file_url
+                        file_url = ef.get('url', '')
+                        if not file_url and excel_file_url:
+                            file_url = excel_file_url
+                            print(f"[save_group_scores] ✅ 使用excel_file_url填充excel_files中的URL: {fn} -> {file_url}")
+                            app_logger.info(f"[save_group_scores] ✅ 使用excel_file_url填充excel_files中的URL: {fn} -> {file_url}")
+                        url_dict[fn] = {
+                            'url': file_url,
+                            'description': ef.get('description', ''),
+                            'fields': ef.get('fields', []) or []
+                        }
+                elif excel_file_url:
+                    if excel_file_name:
+                        url_dict[excel_file_name] = {
+                            'url': excel_file_url,
+                            'description': excel_file_description if excel_file_description else '',
+                            'fields': []
+                        }
+                    else:
+                        timestamp = int(time.time())
+                        default_key = f"excel_file_{timestamp}"
+                        url_dict[default_key] = {
+                            'url': excel_file_url,
+                            'description': excel_file_description if excel_file_description else '',
+                            'fields': []
+                        }
+                
+                updated_excel_file_url = json.dumps(url_dict, ensure_ascii=False)
+                update_fields.append("excel_file_url = %s")
+                update_values.append(updated_excel_file_url)
+            
+            if update_fields:
+                update_values.append(score_header_id)
+                update_sql = f"UPDATE ta_group_score_header SET {', '.join(update_fields)}, updated_at = NOW() WHERE id = %s"
+                cursor.execute(update_sql, tuple(update_values))
+                print(f"[save_group_scores] ✅ UPDATE执行成功，影响行数: {cursor.rowcount}")
+                app_logger.info(f"[save_group_scores] ✅ UPDATE执行成功，影响行数: {cursor.rowcount}")
 
-        # 2. 批量插入评分明细
+        # 2. 处理字段定义（类似学生成绩接口，但小组成绩不需要字段定义表，直接使用scores_json）
+        print(f"[save_group_scores] ========== 收到scores数据 ==========")
+        print(f"[save_group_scores] scores数量: {len(scores)}")
+        app_logger.info(f"[save_group_scores] 收到scores数据: {json.dumps(scores, ensure_ascii=False, indent=2) if scores else '[]'}")
+        
+        # 3. 在替换模式下，删除不在新数据中的学生
+        deleted_student_count = 0
+        if operation_mode == 'replace':
+            new_student_keys = set()
+            for score_item in scores:
+                student_name = score_item.get('student_name', '').strip()
+                student_id = score_item.get('student_id')
+                if student_name:
+                    new_student_keys.add((student_name, student_id))
+            
+            cursor.execute(
+                "SELECT id, student_name, student_id FROM ta_group_score_detail WHERE score_header_id = %s",
+                (score_header_id,)
+            )
+            existing_students = cursor.fetchall()
+            
+            students_to_delete = []
+            for student in existing_students:
+                student_name = student.get('student_name', '').strip()
+                student_id = student.get('student_id')
+                student_key = (student_name, student_id)
+                if student_key not in new_student_keys:
+                    students_to_delete.append(student['id'])
+            
+            if students_to_delete:
+                delete_student_sql = "DELETE FROM ta_group_score_detail WHERE id = %s"
+                for student_id_to_delete in students_to_delete:
+                    cursor.execute(delete_student_sql, (student_id_to_delete,))
+                    deleted_student_count += 1
+                print(f"[save_group_scores] 替换模式下删除学生完成 - 删除{deleted_student_count}个学生")
+                app_logger.info(f"[save_group_scores] 替换模式下删除学生完成 - 删除{deleted_student_count}个学生")
+        
+        # 4. 计算小组总分（按小组分组计算）
+        group_totals = {}  # {group_name: total_score}
+        if scores:
+            for score_item in scores:
+                group_name = score_item.get('group_name', '').strip()
+                if not group_name:
+                    continue
+                
+                # 计算个人总分
+                total_score = score_item.get('总分') or score_item.get('total_score')
+                if total_score is None:
+                    # 自动计算总分（所有数字字段的和）
+                    total_score = 0.0
+                    for key, value in score_item.items():
+                        if key not in ['group_name', 'student_id', 'student_name', 'group_total_score', '总分', 'total_score']:
+                            if isinstance(value, (int, float)):
+                                total_score += float(value)
+                    if total_score == 0.0:
+                        total_score = None
+                
+                # 累加小组总分
+                if total_score is not None:
+                    if group_name not in group_totals:
+                        group_totals[group_name] = 0.0
+                    group_totals[group_name] += float(total_score)
+        
+        # 5. 批量插入或更新成绩明细
+        print(f"[save_group_scores] 开始插入/更新成绩明细 - score_header_id={score_header_id}, operation_mode={operation_mode}, 待处理数量={len(scores)}")
+        app_logger.info(f"[save_group_scores] 开始插入/更新成绩明细 - score_header_id={score_header_id}, operation_mode={operation_mode}, 待处理数量={len(scores)}")
+        
         insert_detail_sql = (
             "INSERT INTO ta_group_score_detail "
-            "(score_header_id, group_number, student_id, student_name, hygiene, participation, discipline, homework, recitation, total_score) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            "(score_header_id, group_name, student_id, student_name, scores_json, total_score, group_total_score) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)"
         )
         
         inserted_count = 0
-        for score_item in group_scores:
-            group_number = score_item.get('group_number')
+        updated_count = 0
+        skipped_count = 0
+        
+        # 当前上传中涉及的字段集合（用于替换模式时保留其他excel的字段）
+        upload_field_set = set()
+        for score_item in scores:
+            for key in score_item.keys():
+                if key not in ['group_name', 'student_id', 'student_name', 'group_total_score', '总分', 'total_score']:
+                    upload_field_set.add(key)
+        
+        for idx, score_item in enumerate(scores):
+            group_name = score_item.get('group_name', '').strip()
             student_id = score_item.get('student_id')
             student_name = score_item.get('student_name', '').strip()
+            if not student_name:
+                skipped_count += 1
+                print(f"[save_group_scores] 跳过第{idx+1}条记录：缺少学生姓名 - score_item={score_item}")
+                app_logger.warning(f"[save_group_scores] 跳过第{idx+1}条记录：缺少学生姓名 - score_item={score_item}")
+                continue
             
-            if not student_name or group_number is None:
-                continue  # 跳过没有姓名或小组编号的记录
+            # 检查该学生是否已有成绩记录
+            check_sql = (
+                "SELECT id, scores_json FROM ta_group_score_detail "
+                "WHERE score_header_id = %s AND student_name = %s "
+                "AND (%s IS NULL OR student_id = %s) "
+                "LIMIT 1"
+            )
+            cursor.execute(check_sql, (score_header_id, student_name, student_id, student_id))
+            existing_record = cursor.fetchone()
             
-            hygiene = score_item.get('hygiene')
-            participation = score_item.get('participation')
-            discipline = score_item.get('discipline')
-            homework = score_item.get('homework')
-            recitation = score_item.get('recitation')
+            # 构建JSON对象（包含除group_name、student_id、student_name、group_total_score外的所有字段）
+            scores_json = {}
+            total_score = None
+            for key, value in score_item.items():
+                if key not in ['group_name', 'student_id', 'student_name', 'group_total_score', '总分', 'total_score']:
+                    if value is not None:
+                        try:
+                            if isinstance(value, (int, float)):
+                                scores_json[key] = float(value)
+                            elif isinstance(value, str) and value.strip():
+                                scores_json[key] = float(value.strip())
+                            else:
+                                scores_json[key] = value
+                        except (ValueError, TypeError):
+                            scores_json[key] = value
+                
+                # 检查是否为总分字段
+                if (key == '总分' or key == 'total_score') and value is not None:
+                    try:
+                        total_score = float(value)
+                    except (ValueError, TypeError):
+                        pass
             
-            # 计算个人总分（如果未提供或需要重新计算）
-            total_score = score_item.get('total_score')
+            # 如果没有找到总分字段，自动计算总分
             if total_score is None:
-                # 自动计算总分（只计算提供的科目）
-                total_score = 0
-                if hygiene is not None:
-                    total_score += int(hygiene)
-                if participation is not None:
-                    total_score += int(participation)
-                if discipline is not None:
-                    total_score += int(discipline)
-                if homework is not None:
-                    total_score += int(homework)
-                if recitation is not None:
-                    total_score += int(recitation)
+                total_score = 0.0
+                for key, value in scores_json.items():
+                    if isinstance(value, (int, float)):
+                        total_score += float(value)
+                if total_score == 0.0:
+                    total_score = None
             
-            cursor.execute(insert_detail_sql, (
-                score_header_id,
-                int(group_number),
-                student_id,
-                student_name,
-                hygiene,
-                participation,
-                discipline,
-                homework,
-                recitation,
-                total_score
-            ))
-            inserted_count += 1
+            # 获取小组总分
+            group_total_score = group_totals.get(group_name)
+            
+            # 在追加模式下，如果记录已存在，合并JSON数据（保留旧字段，添加新字段）
+            # 在替换模式下，仅替换本次上传涉及的字段，保留其他excel的字段
+            if operation_mode == 'append' and existing_record and existing_record.get('scores_json'):
+                try:
+                    existing_json = json.loads(existing_record['scores_json']) if isinstance(existing_record['scores_json'], str) else existing_record['scores_json']
+                    merged_json = {**existing_json, **scores_json}
+                    scores_json = merged_json
+                    print(f"[save_group_scores] 合并已有成绩数据 - student_name={student_name}, 旧字段数={len(existing_json)}, 新字段数={len(scores_json)}")
+                    app_logger.info(f"[save_group_scores] 合并已有成绩数据 - student_name={student_name}")
+                except (json.JSONDecodeError, TypeError) as e:
+                    print(f"[save_group_scores] 解析已有JSON失败，使用新数据 - student_name={student_name}, error={e}")
+                    app_logger.warning(f"[save_group_scores] 解析已有JSON失败，使用新数据 - student_name={student_name}, error={e}")
+            elif operation_mode == 'replace' and existing_record and existing_record.get('scores_json'):
+                try:
+                    existing_json = json.loads(existing_record['scores_json']) if isinstance(existing_record['scores_json'], str) else existing_record['scores_json']
+                    # 保留非本次上传的字段（其他Excel的字段）
+                    preserved = {k: v for k, v in existing_json.items() if k not in upload_field_set and k in keep_fields_from_excel_urls}
+                    scores_json = {**preserved, **scores_json}
+                    print(f"[save_group_scores] 替换模式保留其他excel字段 - student_name={student_name}, 保留字段数={len(preserved)}, 新字段数={len(scores_json)}")
+                    app_logger.info(f"[save_group_scores] 替换模式保留其他excel字段 - student_name={student_name}")
+                except (json.JSONDecodeError, TypeError) as e:
+                    print(f"[save_group_scores] 解析已有JSON失败，使用新数据 - student_name={student_name}, error={e}")
+                    app_logger.warning(f"[save_group_scores] 解析已有JSON失败，使用新数据 - student_name={student_name}, error={e}")
+            
+            # 将scores_json转换为JSON字符串
+            scores_json_str = json.dumps(scores_json, ensure_ascii=False)
+            
+            is_update = existing_record is not None
+            action = "更新" if is_update else "插入"
+            print(f"[save_group_scores] {action}第{idx+1}条成绩 - student_name={student_name}, group_name={group_name}, scores_json={scores_json_str}, total_score={total_score}, group_total_score={group_total_score}")
+            app_logger.info(f"[save_group_scores] {action}第{idx+1}条成绩 - student_name={student_name}, group_name={group_name}, total_score={total_score}, group_total_score={group_total_score}")
+            
+            try:
+                if existing_record:
+                    update_detail_sql = (
+                        "UPDATE ta_group_score_detail "
+                        "SET group_name = %s, scores_json = %s, total_score = %s, group_total_score = %s, updated_at = NOW() "
+                        "WHERE id = %s"
+                    )
+                    cursor.execute(update_detail_sql, (
+                        group_name,
+                        scores_json_str,
+                        total_score,
+                        group_total_score,
+                        existing_record['id']
+                    ))
+                    updated_count += 1
+                else:
+                    cursor.execute(insert_detail_sql, (
+                        score_header_id,
+                        group_name,
+                        student_id,
+                        student_name,
+                        scores_json_str,
+                        total_score,
+                        group_total_score
+                    ))
+                    inserted_count += 1
+            except Exception as insert_error:
+                print(f"[save_group_scores] 第{idx+1}条成绩{action}失败 - student_name={student_name}, error={insert_error}")
+                app_logger.error(f"[save_group_scores] 第{idx+1}条成绩{action}失败 - student_name={student_name}, error={insert_error}", exc_info=True)
+                raise
 
+        print(f"[save_group_scores] 成绩明细处理完成 - 插入={inserted_count}, 更新={updated_count}, 跳过={skipped_count}, 总计={len(scores)}")
+        app_logger.info(f"[save_group_scores] 成绩明细处理完成 - 插入={inserted_count}, 更新={updated_count}, 跳过={skipped_count}, 总计={len(scores)}")
+        
+        print(f"[save_group_scores] 开始提交事务")
+        app_logger.info(f"[save_group_scores] 开始提交事务")
         connection.commit()
-        return { 'success': True, 'score_header_id': score_header_id, 'inserted_count': inserted_count, 'message': '保存成功' }
+        total_processed = inserted_count + updated_count
+        print(f"[save_group_scores] 事务提交成功 - score_header_id={score_header_id}, 插入={inserted_count}, 更新={updated_count}, 删除学生={deleted_student_count}, 总计={total_processed}")
+        app_logger.info(f"[save_group_scores] 事务提交成功 - score_header_id={score_header_id}, 插入={inserted_count}, 更新={updated_count}, 删除学生={deleted_student_count}, 总计={total_processed}")
+        return { 
+            'success': True, 
+            'score_header_id': score_header_id, 
+            'inserted_count': inserted_count, 
+            'updated_count': updated_count,
+            'deleted_student_count': deleted_student_count,
+            'message': '保存成功' 
+        }
     except mysql.connector.Error as e:
         if connection and connection.is_connected():
+            print(f"[save_group_scores] 数据库错误，回滚事务 - error={e}")
+            app_logger.error(f"[save_group_scores] 数据库错误，回滚事务 - error={e}")
             connection.rollback()
-        app_logger.error(f"Database error during save_group_scores: {e}")
+        else:
+            print(f"[save_group_scores] 数据库错误，连接已断开 - error={e}")
+            app_logger.error(f"[save_group_scores] 数据库错误，连接已断开 - error={e}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[save_group_scores] 错误堆栈:\n{traceback_str}")
+        app_logger.error(f"[save_group_scores] 错误堆栈:\n{traceback_str}")
         return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': f'数据库错误: {e}' }
     except Exception as e:
         if connection and connection.is_connected():
+            print(f"[save_group_scores] 未知错误，回滚事务 - error={e}")
+            app_logger.error(f"[save_group_scores] 未知错误，回滚事务 - error={e}")
             connection.rollback()
-        app_logger.error(f"Unexpected error during save_group_scores: {e}")
+        else:
+            print(f"[save_group_scores] 未知错误，连接已断开 - error={e}")
+            app_logger.error(f"[save_group_scores] 未知错误，连接已断开 - error={e}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[save_group_scores] 错误堆栈:\n{traceback_str}")
+        app_logger.error(f"[save_group_scores] 错误堆栈:\n{traceback_str}")
         return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': f'未知错误: {e}' }
     finally:
         if connection and connection.is_connected():
@@ -4553,75 +4905,487 @@ def save_group_scores(
 @app.post("/group-scores/save")
 async def api_save_group_scores(request: Request):
     """
-    保存小组管理表
+    保存小组成绩表（支持动态字段，使用JSON存储）
     请求体 JSON:
     {
       "class_id": "class_1001",
-      "term": "2025-2026-1",  // 可选
-      "remark": "备注信息",    // 可选
-      "group_scores": [
+      "exam_name": "期中考试",           // 考试名称（必需）
+      "term": "2025-2026-1",            // 可选
+      "remark": "备注信息",              // 可选
+      "operation_mode": "append",       // 可选，"append"（追加，默认）或 "replace"（替换）
+      "excel_file_url": "...",          // 可选，单个Excel文件URL（旧格式）
+      "excel_file_name": "...",          // 可选，Excel文件名
+      "excel_file_description": "...",  // 可选，Excel文件说明
+      "excel_files": [                  // 可选，多个Excel文件列表（新格式）
         {
-          "group_number": 1,              // 小组编号（必需）
-          "student_id": "2024001",        // 可选
-          "student_name": "张三",
-          "hygiene": 100,                 // 卫生评分（可选）
-          "participation": 89,            // 课堂发言评分（可选）
-          "discipline": 84,               // 纪律评分（可选）
-          "homework": 90,                 // 作业评分（可选）
-          "recitation": 85,               // 背诵评分（可选）
-          "total_score": 448              // 个人总分（可选，会自动计算）
+          "filename": "期中成绩单.xlsx",
+          "url": "https://...",
+          "description": "说明:该表为统计表。包含以下科目/属性: 语文、数学、英语",
+          "fields": ["语文", "数学", "英语", "总分"]
+        }
+      ],
+      "fields": [                       // 可选，字段定义列表
+        {
+          "field_name": "语文",
+          "field_type": "number",
+          "field_order": 1,
+          "is_total": 0
+        }
+      ],
+      "scores": [                       // 成绩明细列表
+        {
+          "group_name": "1组",          // 小组名称/编号（必需）
+          "student_id": "2024001",      // 可选
+          "student_name": "张三",       // 必需
+          "语文": 120,                  // 各科成绩（动态字段）
+          "数学": 90,
+          "英语": 149,
+          "总分": 359,                  // 个人总分（可选，可自动计算）
+          "group_total_score": 1000     // 小组总分（可选，会自动计算）
         },
         {
-          "group_number": 1,
+          "group_name": "1组",
           "student_name": "李四",
-          "hygiene": 90,
-          "participation": 78,
-          "discipline": 53
-          // total_score 会自动计算为 221
-        },
-        {
-          "group_number": 2,
-          "student_name": "王五",
-          "hygiene": 67,
-          "participation": 97,
-          "discipline": 23
+          "语文": 100,
+          "数学": 85,
+          "英语": 120
+          // total_score 和 group_total_score 会自动计算
         }
       ]
     }
+    
+    支持两种请求格式：
+    1. application/json: 直接发送JSON数据
+    2. multipart/form-data: 包含data字段（JSON字符串）和excel_file字段（Excel文件）
     """
+    print(f"[group-scores/save] ========== 收到保存请求 ==========")
+    app_logger.info(f"[group-scores/save] ========== 收到保存请求 ==========")
+    
+    data = None
+    excel_file = None
+    excel_file_name = None
+    excel_file_url = None
+    excel_files = None
+    
+    # 记录请求头信息
     try:
-        data = await request.json()
-    except Exception:
-        return safe_json_response({'message': '无效的 JSON 请求体', 'code': 400}, status_code=400)
-
-    class_id = data.get('class_id')
-    term = data.get('term')
-    remark = data.get('remark')
-    group_scores = data.get('group_scores', [])
-
-    if not class_id:
-        return safe_json_response({'message': '缺少必要参数 class_id', 'code': 400}, status_code=400)
-
-    result = save_group_scores(
-        class_id=class_id,
-        term=term,
-        remark=remark,
-        group_scores=group_scores
-    )
-
-    if result.get('success'):
-        return safe_json_response({'message': '保存成功', 'code': 200, 'data': result})
+        content_type = request.headers.get('content-type', '').lower()
+        content_length = request.headers.get('content-length', '')
+        print(f"[group-scores/save] 请求头 - Content-Type: {content_type}, Content-Length: {content_length}")
+        app_logger.info(f"[group-scores/save] 请求头 - Content-Type: {content_type}, Content-Length: {content_length}")
+    except Exception as e:
+        print(f"[group-scores/save] 读取请求头失败: {e}")
+        app_logger.warning(f"[group-scores/save] 读取请求头失败: {e}")
+        content_type = ""
+    
+    # 根据Content-Type处理不同的请求格式
+    if "multipart/form-data" in content_type:
+        # 处理multipart/form-data格式
+        print(f"[group-scores/save] ========== 处理 multipart/form-data 格式 ==========")
+        app_logger.info(f"[group-scores/save] ========== 处理 multipart/form-data 格式 ==========")
+        try:
+            form_data = await request.form()
+            print(f"[group-scores/save] ✅ 表单数据获取成功")
+            app_logger.info(f"[group-scores/save] ✅ 表单数据获取成功")
+            
+            # 获取JSON数据（从data字段）
+            data_str = form_data.get("data")
+            if not data_str:
+                error_msg = 'multipart请求中缺少data字段'
+                print(f"[group-scores/save] ❌ {error_msg}")
+                app_logger.error(f"[group-scores/save] ❌ {error_msg}")
+                return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
+            
+            print(f"[group-scores/save] data字段类型: {type(data_str).__name__}")
+            app_logger.info(f"[group-scores/save] data字段类型: {type(data_str).__name__}")
+            
+            # 解析JSON字符串（form_data.get返回的可能是字符串）
+            try:
+                if isinstance(data_str, str):
+                    data = json.loads(data_str)
+                else:
+                    # 如果不是字符串，尝试转换为字符串再解析
+                    data = json.loads(str(data_str))
+                print(f"[group-scores/save] ✅ JSON解析成功")
+                app_logger.info(f"[group-scores/save] ✅ JSON解析成功")
+            except json.JSONDecodeError as e:
+                error_msg = f'data字段中的JSON解析失败: {str(e)}'
+                print(f"[group-scores/save] ❌ {error_msg}")
+                app_logger.error(f"[group-scores/save] ❌ {error_msg}")
+                return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
+            
+            # 获取Excel文件（可选）
+            excel_file = form_data.get("excel_file")
+            print(f"[group-scores/save] excel_file是否存在: {excel_file is not None}")
+            app_logger.info(f"[group-scores/save] excel_file是否存在: {excel_file is not None}")
+            
+            if excel_file:
+                print(f"[group-scores/save] ========== 开始处理Excel文件 ==========")
+                app_logger.info(f"[group-scores/save] ========== 开始处理Excel文件 ==========")
+                print(f"[group-scores/save] excel_file类型: {type(excel_file)}")
+                print(f"[group-scores/save] excel_file类型名称: {type(excel_file).__name__}")
+                app_logger.info(f"[group-scores/save] excel_file类型: {type(excel_file)}, 类型名称: {type(excel_file).__name__}")
+                
+                # 检查是否是UploadFile类型
+                is_upload_file = isinstance(excel_file, UploadFile) or type(excel_file).__name__ == 'UploadFile'
+                print(f"[group-scores/save] is_upload_file: {is_upload_file}")
+                app_logger.info(f"[group-scores/save] is_upload_file: {is_upload_file}")
+                
+                if is_upload_file:
+                    filename_value = getattr(excel_file, 'filename', None)
+                    print(f"[group-scores/save] excel_file.filename值: {filename_value}")
+                    app_logger.info(f"[group-scores/save] excel_file.filename值: {filename_value}")
+                    
+                    # 优先使用客户端JSON中的excel_file_name字段
+                    excel_file_name = None
+                    if data:
+                        excel_file_name = data.get('excel_file_name')
+                        if excel_file_name:
+                            print(f"[group-scores/save] ✅ 从JSON数据中获取excel_file_name: {excel_file_name}")
+                            app_logger.info(f"[group-scores/save] ✅ 从JSON数据中获取excel_file_name: {excel_file_name}")
+                    
+                    # 如果JSON中没有，尝试使用excel_file.filename
+                    if not excel_file_name and filename_value:
+                        excel_file_name = filename_value
+                        print(f"[group-scores/save] ✅ 使用excel_file.filename: {excel_file_name}")
+                        app_logger.info(f"[group-scores/save] ✅ 使用excel_file.filename: {excel_file_name}")
+                    
+                    # 如果都没有，使用默认名称
+                    if not excel_file_name:
+                        timestamp = int(time.time())
+                        excel_file_name = f"excel_{timestamp}.xlsx"
+                        print(f"[group-scores/save] ⚠️ 使用默认文件名: {excel_file_name}")
+                        app_logger.warning(f"[group-scores/save] ⚠️ 使用默认文件名: {excel_file_name}")
+                    
+                    # 读取Excel文件内容并上传到OSS
+                    try:
+                        print(f"[group-scores/save] 📖 开始读取Excel文件内容...")
+                        app_logger.info(f"[group-scores/save] 📖 开始读取Excel文件内容...")
+                        excel_content = await excel_file.read()
+                        print(f"[group-scores/save] ✅ Excel文件读取成功，文件大小: {len(excel_content)} bytes")
+                        app_logger.info(f"[group-scores/save] ✅ Excel文件读取成功，文件大小: {len(excel_content)} bytes")
+                        
+                        # 生成OSS对象名称
+                        timestamp = int(time.time())
+                        file_ext = os.path.splitext(excel_file_name)[1] or '.xlsx'
+                        oss_object_name = f"excel/group-scores/{timestamp}_{excel_file_name}"
+                        print(f"[group-scores/save] 📝 生成OSS对象名称: {oss_object_name}")
+                        app_logger.info(f"[group-scores/save] 📝 生成OSS对象名称: {oss_object_name}")
+                        
+                        # 上传到阿里云OSS
+                        print(f"[group-scores/save] ☁️ 开始上传Excel文件到阿里云OSS...")
+                        app_logger.info(f"[group-scores/save] ☁️ 开始上传Excel文件到阿里云OSS: {oss_object_name}")
+                        excel_file_url = upload_excel_to_oss(excel_content, oss_object_name)
+                        
+                        if excel_file_url:
+                            print(f"[group-scores/save] ✅ Excel文件上传成功，OSS URL: {excel_file_url}")
+                            app_logger.info(f"[group-scores/save] ✅ Excel文件上传成功，OSS URL: {excel_file_url}")
+                        else:
+                            print(f"[group-scores/save] ❌ Excel文件上传失败，返回值为None或空")
+                            app_logger.warning(f"[group-scores/save] ❌ Excel文件上传失败，返回值为None或空")
+                    except Exception as e:
+                        error_msg = f'读取或上传Excel文件时出错: {str(e)}'
+                        print(f"[group-scores/save] ❌ 错误: {error_msg}")
+                        app_logger.error(f"[group-scores/save] ❌ {error_msg}", exc_info=True)
+                        import traceback
+                        traceback_str = traceback.format_exc()
+                        print(f"[group-scores/save] ❌ 错误堆栈:\n{traceback_str}")
+                        app_logger.error(f"[group-scores/save] ❌ 错误堆栈:\n{traceback_str}")
+                        # 继续处理，不阻止成绩数据保存
+        except Exception as e:
+            error_msg = f'处理multipart/form-data时出错: {str(e)}'
+            print(f"[group-scores/save] ❌ {error_msg}")
+            app_logger.error(f"[group-scores/save] ❌ {error_msg}", exc_info=True)
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"[group-scores/save] ❌ 错误堆栈:\n{traceback_str}")
+            app_logger.error(f"[group-scores/save] ❌ 错误堆栈:\n{traceback_str}")
+            return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
     else:
-        return safe_json_response({'message': result.get('message', '保存失败'), 'code': 500}, status_code=500)
+        # 处理application/json格式
+        print(f"[group-scores/save] ========== 处理 application/json 格式 ==========")
+        app_logger.info(f"[group-scores/save] ========== 处理 application/json 格式 ==========")
+        try:
+            data = await request.json()
+            print(f"[group-scores/save] ✅ JSON解析成功")
+            app_logger.info(f"[group-scores/save] ✅ JSON解析成功")
+        except json.JSONDecodeError as e:
+            error_msg = f'无效的 JSON 请求体: {str(e)}'
+            print(f"[group-scores/save] ❌ {error_msg}")
+            app_logger.error(f"[group-scores/save] ❌ {error_msg}")
+            return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
+        except Exception as e:
+            error_msg = f'解析请求体失败: {str(e)}'
+            print(f"[group-scores/save] ❌ {error_msg}")
+            app_logger.error(f"[group-scores/save] ❌ {error_msg}", exc_info=True)
+            return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
+    
+    # 记录完整请求体（截断过长的内容）
+    if data:
+        try:
+            request_body_str = json.dumps(data, ensure_ascii=False, indent=2)
+            if len(request_body_str) > 2000:
+                request_body_preview = request_body_str[:2000] + "... (已截断)"
+            else:
+                request_body_preview = request_body_str
+            print(f"[group-scores/save] 请求体内容:\n{request_body_preview}")
+            app_logger.info(f"[group-scores/save] 请求体内容:\n{request_body_preview}")
+        except Exception as e:
+            print(f"[group-scores/save] 序列化请求体失败: {e}")
+            app_logger.warning(f"[group-scores/save] 序列化请求体失败: {e}")
+
+    # 提取参数
+    class_id = data.get('class_id') if data else None
+    exam_name = data.get('exam_name') if data else None
+    term = data.get('term') if data else None
+    remark = data.get('remark') if data else None
+    
+    # 支持两种数据格式：scores（扁平）或 group_scores（嵌套）
+    scores = data.get('scores', []) if data else []
+    group_scores = data.get('group_scores', []) if data else []
+    
+    # 如果提供了 group_scores，转换为 scores 格式
+    if group_scores and isinstance(group_scores, list) and len(group_scores) > 0:
+        print(f"[group-scores/save] 检测到 group_scores 格式，开始转换...")
+        app_logger.info(f"[group-scores/save] 检测到 group_scores 格式，开始转换...")
+        converted_scores = []
+        for group_item in group_scores:
+            group_name = group_item.get('group_name', '').strip()
+            group_total_score = group_item.get('group_total_score')
+            students = group_item.get('students', [])
+            
+            for student in students:
+                student_name = student.get('student_name', '').strip()
+                if not student_name:
+                    continue
+                
+                # 构建扁平化的学生记录
+                student_record = {
+                    'group_name': group_name,
+                    'student_id': student.get('student_id'),
+                    'student_name': student_name,
+                    'group_total_score': group_total_score
+                }
+                
+                # 处理 scores 字段（可能是对象或字典）
+                student_scores = student.get('scores', {})
+                if isinstance(student_scores, dict):
+                    # 将 scores 对象中的字段平铺到顶层
+                    for key, value in student_scores.items():
+                        if key not in ['group_name', 'student_id', 'student_name', 'group_total_score']:
+                            student_record[key] = value
+                elif isinstance(student_scores, str):
+                    # 如果是字符串，尝试解析为JSON
+                    try:
+                        scores_dict = json.loads(student_scores)
+                        for key, value in scores_dict.items():
+                            if key not in ['group_name', 'student_id', 'student_name', 'group_total_score']:
+                                student_record[key] = value
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                
+                # 如果学生记录中有其他字段（不在scores中），也添加进去
+                for key, value in student.items():
+                    if key not in ['scores', 'group_name', 'student_id', 'student_name', 'group_total_score']:
+                        student_record[key] = value
+                
+                converted_scores.append(student_record)
+        
+        scores = converted_scores
+        print(f"[group-scores/save] ✅ 转换完成，共 {len(scores)} 条学生记录")
+        app_logger.info(f"[group-scores/save] ✅ 转换完成，共 {len(scores)} 条学生记录")
+        
+        # 显示转换后的前3条记录示例
+        if len(scores) > 0:
+            preview_count = min(3, len(scores))
+            print(f"[group-scores/save] 转换后的前{preview_count}条记录示例:")
+            app_logger.info(f"[group-scores/save] 转换后的前{preview_count}条记录示例:")
+            for i in range(preview_count):
+                try:
+                    record_str = json.dumps(scores[i], ensure_ascii=False, indent=2)
+                    print(f"[group-scores/save] 记录{i+1}:\n{record_str}")
+                    app_logger.info(f"[group-scores/save] 记录{i+1}:\n{record_str}")
+                except Exception as e:
+                    print(f"[group-scores/save] 序列化记录{i+1}失败: {e}")
+                    app_logger.warning(f"[group-scores/save] 序列化记录{i+1}失败: {e}")
+    
+    # 如果上传了文件，优先使用上传后的URL；否则使用data中的URL
+    if excel_file_url:
+        # 如果已经通过multipart上传了文件，使用上传后的URL
+        print(f"[group-scores/save] ✅ 使用上传后的Excel文件URL: {excel_file_url}")
+        app_logger.info(f"[group-scores/save] ✅ 使用上传后的Excel文件URL: {excel_file_url}")
+        
+        # 更新 excel_files 中的 URL（如果存在）
+        if excel_files and isinstance(excel_files, list) and len(excel_files) > 0:
+            updated_count = 0
+            for ef in excel_files:
+                fn = ef.get('filename') or ef.get('name') or ef.get('file_name')
+                # 如果文件名匹配，或者没有指定excel_file_name但excel_files中有文件，就更新URL
+                if (fn == excel_file_name) or (not excel_file_name and fn):
+                    old_url = ef.get('url', '')
+                    ef['url'] = excel_file_url
+                    updated_count += 1
+                    print(f"[group-scores/save] ✅ 更新 excel_files[{updated_count-1}] 中的 URL: {fn}")
+                    print(f"[group-scores/save]   旧URL: {old_url}")
+                    print(f"[group-scores/save]   新URL: {excel_file_url}")
+                    app_logger.info(f"[group-scores/save] ✅ 更新 excel_files[{updated_count-1}] 中的 URL: {fn}, 旧URL: {old_url}, 新URL: {excel_file_url}")
+            if updated_count == 0:
+                print(f"[group-scores/save] ⚠️ 未找到匹配的文件名来更新URL (excel_file_name={excel_file_name})")
+                app_logger.warning(f"[group-scores/save] ⚠️ 未找到匹配的文件名来更新URL (excel_file_name={excel_file_name})")
+                # 如果没找到匹配的，尝试更新第一个文件的URL
+                if len(excel_files) > 0:
+                    ef = excel_files[0]
+                    old_url = ef.get('url', '')
+                    ef['url'] = excel_file_url
+                    print(f"[group-scores/save] ✅ 更新 excel_files[0] 中的 URL (默认): {ef.get('filename', 'N/A')}")
+                    print(f"[group-scores/save]   旧URL: {old_url}")
+                    print(f"[group-scores/save]   新URL: {excel_file_url}")
+                    app_logger.info(f"[group-scores/save] ✅ 更新 excel_files[0] 中的 URL (默认): {ef.get('filename', 'N/A')}, 旧URL: {old_url}, 新URL: {excel_file_url}")
+    else:
+        # 否则从data中获取
+        excel_file_url = data.get('excel_file_url') if data else None
+    
+    excel_file_name = data.get('excel_file_name') if data else None
+    excel_file_description = data.get('excel_file_description') if data else None
+    operation_mode = data.get('operation_mode', 'append') if data else 'append'
+    fields = data.get('fields') if data else None
+    excel_files = data.get('excel_files') if data else None
+
+    print(f"[group-scores/save] ========== 参数提取 ==========")
+    print(f"[group-scores/save] class_id: {class_id} (type: {type(class_id).__name__})")
+    print(f"[group-scores/save] exam_name: {exam_name} (type: {type(exam_name).__name__})")
+    print(f"[group-scores/save] term: {term} (type: {type(term).__name__})")
+    print(f"[group-scores/save] remark: {remark} (type: {type(remark).__name__})")
+    print(f"[group-scores/save] operation_mode: {operation_mode} (type: {type(operation_mode).__name__})")
+    print(f"[group-scores/save] scores数量: {len(scores) if isinstance(scores, list) else 'N/A'} (type: {type(scores).__name__})")
+    print(f"[group-scores/save] excel_file_url: {excel_file_url} (type: {type(excel_file_url).__name__})")
+    print(f"[group-scores/save] excel_file_name: {excel_file_name} (type: {type(excel_file_name).__name__})")
+    print(f"[group-scores/save] excel_file_description: {excel_file_description} (type: {type(excel_file_description).__name__})")
+    print(f"[group-scores/save] fields数量: {len(fields) if isinstance(fields, list) else 'N/A'} (type: {type(fields).__name__})")
+    print(f"[group-scores/save] excel_files数量: {len(excel_files) if isinstance(excel_files, list) else 'N/A'} (type: {type(excel_files).__name__})")
+    
+    app_logger.info(f"[group-scores/save] 参数提取 - class_id={class_id}, exam_name={exam_name}, term={term}, operation_mode={operation_mode}, scores数量={len(scores) if isinstance(scores, list) else 0}")
+    
+    if excel_files:
+        try:
+            excel_files_str = json.dumps(excel_files, ensure_ascii=False, indent=2)
+            print(f"[group-scores/save] excel_files详情:\n{excel_files_str}")
+            app_logger.info(f"[group-scores/save] excel_files详情:\n{excel_files_str}")
+        except Exception as e:
+            print(f"[group-scores/save] 序列化excel_files失败: {e}")
+            app_logger.warning(f"[group-scores/save] 序列化excel_files失败: {e}")
+    
+    if scores and isinstance(scores, list) and len(scores) > 0:
+        try:
+            first_record_str = json.dumps(scores[0], ensure_ascii=False, indent=2)
+            print(f"[group-scores/save] scores第一条记录示例:\n{first_record_str}")
+            app_logger.info(f"[group-scores/save] scores第一条记录示例:\n{first_record_str}")
+        except Exception as e:
+            print(f"[group-scores/save] 序列化第一条记录失败: {e}")
+            app_logger.warning(f"[group-scores/save] 序列化第一条记录失败: {e}")
+    
+    if excel_files and isinstance(excel_files, list) and len(excel_files) > 0:
+        try:
+            excel_files_str = json.dumps(excel_files, ensure_ascii=False, indent=2)
+            print(f"[group-scores/save] excel_files更新后的内容:\n{excel_files_str}")
+            app_logger.info(f"[group-scores/save] excel_files更新后的内容:\n{excel_files_str}")
+        except Exception as e:
+            print(f"[group-scores/save] 序列化excel_files失败: {e}")
+            app_logger.warning(f"[group-scores/save] 序列化excel_files失败: {e}")
+
+    # 参数验证
+    print(f"[group-scores/save] ========== 参数验证 ==========")
+    app_logger.info(f"[group-scores/save] ========== 参数验证 ==========")
+    
+    if not data:
+        error_msg = '请求数据为空'
+        print(f"[group-scores/save] ❌ {error_msg}")
+        app_logger.error(f"[group-scores/save] ❌ {error_msg}")
+        return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
+    
+    if not class_id:
+        error_msg = '缺少必要参数 class_id'
+        print(f"[group-scores/save] ❌ {error_msg}")
+        app_logger.error(f"[group-scores/save] ❌ {error_msg}")
+        return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
+    
+    if not exam_name:
+        error_msg = '缺少必要参数 exam_name'
+        print(f"[group-scores/save] ❌ {error_msg}")
+        app_logger.error(f"[group-scores/save] ❌ {error_msg}")
+        return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
+    
+    if operation_mode not in ['append', 'replace']:
+        error_msg = f'无效的 operation_mode: {operation_mode}，必须是 "append" 或 "replace"'
+        print(f"[group-scores/save] ❌ {error_msg}")
+        app_logger.error(f"[group-scores/save] ❌ {error_msg}")
+        return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
+    
+    if not isinstance(scores, list):
+        error_msg = f'scores 必须是列表类型，当前类型: {type(scores).__name__}'
+        print(f"[group-scores/save] ❌ {error_msg}")
+        app_logger.error(f"[group-scores/save] ❌ {error_msg}")
+        return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
+    
+    if operation_mode == 'append' and len(scores) == 0:
+        error_msg = '追加模式下 scores 不能为空'
+        print(f"[group-scores/save] ❌ {error_msg}")
+        app_logger.error(f"[group-scores/save] ❌ {error_msg}")
+        return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
+    
+    print(f"[group-scores/save] ✅ 参数验证通过")
+    app_logger.info(f"[group-scores/save] ✅ 参数验证通过")
+
+    print(f"[group-scores/save] ========== 调用 save_group_scores 函数 ==========")
+    app_logger.info(f"[group-scores/save] ========== 调用 save_group_scores 函数 ==========")
+    
+    try:
+        result = save_group_scores(
+            class_id=class_id,
+            exam_name=exam_name,
+            term=term,
+            remark=remark,
+            scores=scores,
+            excel_file_url=excel_file_url,
+            excel_file_name=excel_file_name,
+            excel_file_description=excel_file_description,
+            operation_mode=operation_mode,
+            fields=fields,
+            excel_files=excel_files
+        )
+        
+        print(f"[group-scores/save] ========== save_group_scores 返回结果 ==========")
+        print(f"[group-scores/save] result: {json.dumps(result, ensure_ascii=False, indent=2, default=str)}")
+        app_logger.info(f"[group-scores/save] save_group_scores 返回结果: {json.dumps(result, ensure_ascii=False, indent=2, default=str)}")
+        
+        if result.get('success'):
+            print(f"[group-scores/save] ✅ 保存成功 - score_header_id={result.get('score_header_id')}, inserted={result.get('inserted_count')}, updated={result.get('updated_count')}, deleted={result.get('deleted_student_count')}")
+            app_logger.info(f"[group-scores/save] ✅ 保存成功 - score_header_id={result.get('score_header_id')}, inserted={result.get('inserted_count')}, updated={result.get('updated_count')}, deleted={result.get('deleted_student_count')}")
+            return safe_json_response({'message': '保存成功', 'code': 200, 'data': result})
+        else:
+            error_msg = result.get('message', '保存失败')
+            print(f"[group-scores/save] ❌ 保存失败: {error_msg}")
+            app_logger.error(f"[group-scores/save] ❌ 保存失败: {error_msg}")
+            return safe_json_response({'message': error_msg, 'code': 500}, status_code=500)
+    except Exception as e:
+        error_msg = f'调用 save_group_scores 时发生异常: {str(e)}'
+        print(f"[group-scores/save] ❌ {error_msg}")
+        app_logger.error(f"[group-scores/save] ❌ {error_msg}", exc_info=True)
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[group-scores/save] 异常堆栈:\n{traceback_str}")
+        app_logger.error(f"[group-scores/save] 异常堆栈:\n{traceback_str}")
+        return safe_json_response({'message': error_msg, 'code': 500}, status_code=500)
 
 @app.get("/group-scores")
 async def api_get_group_scores(
     request: Request,
     class_id: str = Query(..., description="班级ID"),
+    exam_name: Optional[str] = Query(None, description="考试名称，可选"),
     term: Optional[str] = Query(None, description="学期，可选")
 ):
     """
-    查询小组管理表
+    查询小组成绩表
     返回 JSON:
     {
       "message": "查询成功",
@@ -4630,33 +5394,39 @@ async def api_get_group_scores(
         "header": {
           "id": 1,
           "class_id": "class_1001",
+          "exam_name": "期中考试",
           "term": "2025-2026-1",
           "remark": "...",
+          "excel_file_url": {...},
           "created_at": "...",
           "updated_at": "..."
         },
         "group_scores": [
           {
-            "group_number": 1,
-            "group_total_score": 765,  // 小组总分（自动计算）
+            "group_name": "1组",
+            "group_total_score": 765.0,  // 小组总分
             "students": [
               {
                 "id": 1,
                 "student_id": "2024001",
                 "student_name": "张三",
-                "hygiene": 100,
-                "participation": 89,
-                "discipline": 84,
-                "homework": 90,
-                "recitation": 85,
-                "total_score": 448
+                "语文": 120,
+                "数学": 90,
+                "英语": 149,
+                "总分": 359,              // 个人总分
+                "group_total_score": 765.0,  // 小组总分（同组同值）
+                "scores": {               // 所有动态字段
+                  "语文": 120,
+                  "数学": 90,
+                  "英语": 149
+                }
               },
               ...
             ]
           },
           {
-            "group_number": 2,
-            "group_total_score": 544,
+            "group_name": "2组",
+            "group_total_score": 544.0,
             "students": [...]
           },
           ...
@@ -4671,58 +5441,86 @@ async def api_get_group_scores(
     try:
         cursor = connection.cursor(dictionary=True)
         
-        # 查询小组管理表头
-        cursor.execute(
-            "SELECT id, class_id, term, remark, created_at, updated_at "
-            "FROM ta_group_score_header "
-            "WHERE class_id = %s AND (%s IS NULL OR term = %s) "
-            "ORDER BY created_at DESC LIMIT 1",
-            (class_id, term, term)
-        )
+        # 查询小组成绩表头
+        if exam_name:
+            cursor.execute(
+                "SELECT id, class_id, exam_name, term, remark, excel_file_url, created_at, updated_at "
+                "FROM ta_group_score_header "
+                "WHERE class_id = %s AND exam_name = %s AND (%s IS NULL OR term = %s) "
+                "ORDER BY created_at DESC LIMIT 1",
+                (class_id, exam_name, term, term)
+            )
+        else:
+            cursor.execute(
+                "SELECT id, class_id, exam_name, term, remark, excel_file_url, created_at, updated_at "
+                "FROM ta_group_score_header "
+                "WHERE class_id = %s AND (%s IS NULL OR term = %s) "
+                "ORDER BY created_at DESC LIMIT 1",
+                (class_id, term, term)
+            )
         
         header = cursor.fetchone()
         if not header:
-            return safe_json_response({'message': '未找到小组管理表', 'code': 404}, status_code=404)
+            return safe_json_response({'message': '未找到小组成绩表', 'code': 404}, status_code=404)
 
         score_header_id = header['id']
         
-        # 查询所有评分明细，按小组编号和学生姓名排序
+        # 查询所有成绩明细，按小组名称和学生姓名排序
         cursor.execute(
-            "SELECT id, group_number, student_id, student_name, hygiene, participation, discipline, homework, recitation, total_score "
+            "SELECT id, group_name, student_id, student_name, scores_json, total_score, group_total_score "
             "FROM ta_group_score_detail "
             "WHERE score_header_id = %s "
-            "ORDER BY group_number ASC, student_name ASC",
+            "ORDER BY group_name ASC, student_name ASC",
             (score_header_id,)
         )
         all_scores = cursor.fetchall() or []
         
-        # 按小组分组，并计算每个小组的总分
+        # 解析excel_file_url
+        excel_file_url_parsed = None
+        if header.get('excel_file_url'):
+            try:
+                excel_file_url_parsed = json.loads(header['excel_file_url']) if isinstance(header['excel_file_url'], str) else header['excel_file_url']
+            except (json.JSONDecodeError, TypeError):
+                excel_file_url_parsed = header.get('excel_file_url')
+        
+        # 按小组分组
         group_dict = {}
         for score in all_scores:
-            group_num = score['group_number']
-            if group_num not in group_dict:
-                group_dict[group_num] = {
-                    'group_number': group_num,
-                    'group_total_score': 0,
+            group_name = score.get('group_name', '').strip() or '未分组'
+            
+            # 解析scores_json
+            scores_data = {}
+            if score.get('scores_json'):
+                try:
+                    scores_data = json.loads(score['scores_json']) if isinstance(score['scores_json'], str) else score['scores_json']
+                except (json.JSONDecodeError, TypeError):
+                    scores_data = {}
+            
+            if group_name not in group_dict:
+                group_dict[group_name] = {
+                    'group_name': group_name,
+                    'group_total_score': score.get('group_total_score'),
                     'students': []
                 }
-            group_dict[group_num]['students'].append({
+            
+            # 构建学生信息（包含所有动态字段）
+            student_info = {
                 'id': score['id'],
                 'student_id': score.get('student_id'),
-                'student_name': score['student_name'],
-                'hygiene': score.get('hygiene'),
-                'participation': score.get('participation'),
-                'discipline': score.get('discipline'),
-                'homework': score.get('homework'),
-                'recitation': score.get('recitation'),
-                'total_score': score.get('total_score')
-            })
-            # 累加小组总分
-            if score.get('total_score'):
-                group_dict[group_num]['group_total_score'] += int(score['total_score'])
+                'student_name': score.get('student_name', ''),
+                'total_score': float(score['total_score']) if score.get('total_score') is not None else None,
+                'group_total_score': float(score['group_total_score']) if score.get('group_total_score') is not None else None,
+                'scores': scores_data
+            }
+            
+            # 将动态字段也平铺到顶层（方便客户端使用）
+            for key, value in scores_data.items():
+                student_info[key] = value
+            
+            group_dict[group_name]['students'].append(student_info)
         
-        # 转换为列表，按小组编号排序
-        group_scores_list = sorted(group_dict.values(), key=lambda x: x['group_number'])
+        # 转换为列表，按小组名称排序
+        group_scores_list = sorted(group_dict.values(), key=lambda x: x['group_name'])
 
         return safe_json_response({
             'message': '查询成功',
@@ -4731,8 +5529,10 @@ async def api_get_group_scores(
                 'header': {
                     'id': header['id'],
                     'class_id': header['class_id'],
+                    'exam_name': header.get('exam_name'),
                     'term': header.get('term'),
                     'remark': header.get('remark'),
+                    'excel_file_url': excel_file_url_parsed,
                     'created_at': header.get('created_at'),
                     'updated_at': header.get('updated_at')
                 },
@@ -4744,7 +5544,10 @@ async def api_get_group_scores(
         return safe_json_response({'message': '数据库错误', 'code': 500}, status_code=500)
     except Exception as e:
         app_logger.error(f"Unexpected error during api_get_group_scores: {e}")
-        return safe_json_response({'message': '未知错误', 'code': 500}, status_code=500)
+        import traceback
+        traceback_str = traceback.format_exc()
+        app_logger.error(f"错误堆栈:\n{traceback_str}")
+        return safe_json_response({'message': f'未知错误: {str(e)}', 'code': 500}, status_code=500)
     finally:
         if connection and connection.is_connected():
             connection.close()
