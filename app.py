@@ -174,27 +174,55 @@ async def query_temp_rooms(request: Request):
         "code": 200
     }
     """
+    client_ip = request.client.host if request.client else "unknown"
+    print(f"[temp_rooms/query] ========== 收到查询请求 ==========")
+    print(f"[temp_rooms/query] 客户端IP: {client_ip}")
+    app_logger.info(f"[temp_rooms/query] 收到查询请求，客户端IP: {client_ip}")
+    
     try:
         body = await request.json()
-    except Exception:
+        print(f"[temp_rooms/query] 请求体内容: {json.dumps(body, ensure_ascii=False)}")
+        app_logger.info(f"[temp_rooms/query] 请求体内容: {json.dumps(body, ensure_ascii=False)}")
+    except Exception as e:
+        error_msg = f"请求体必须为 JSON，解析失败: {e}"
+        print(f"[temp_rooms/query] ❌ {error_msg}")
+        app_logger.error(f"[temp_rooms/query] ❌ {error_msg}")
         return JSONResponse({"data": {"message": "请求体必须为 JSON", "code": 400}}, status_code=400)
 
     group_ids = body.get("group_ids") or body.get("groupIds") or []
+    print(f"[temp_rooms/query] 原始 group_ids: {group_ids} (type: {type(group_ids).__name__})")
+    app_logger.info(f"[temp_rooms/query] 原始 group_ids: {group_ids}")
+    
     if not isinstance(group_ids, list) or not group_ids:
+        error_msg = f"group_ids 必须为非空数组，当前值: {group_ids} (type: {type(group_ids).__name__})"
+        print(f"[temp_rooms/query] ❌ {error_msg}")
+        app_logger.warning(f"[temp_rooms/query] ❌ {error_msg}")
         return JSONResponse({"data": {"message": "group_ids 必须为非空数组", "code": 400}}, status_code=400)
 
     # 去重、清理
     group_ids = list({str(gid).strip() for gid in group_ids if str(gid).strip()})
+    print(f"[temp_rooms/query] 清理后的 group_ids: {group_ids} (数量: {len(group_ids)})")
+    app_logger.info(f"[temp_rooms/query] 清理后的 group_ids: {group_ids} (数量: {len(group_ids)})")
+    
     if not group_ids:
+        error_msg = "group_ids 不能为空（清理后）"
+        print(f"[temp_rooms/query] ❌ {error_msg}")
+        app_logger.warning(f"[temp_rooms/query] ❌ {error_msg}")
         return JSONResponse({"data": {"message": "group_ids 不能为空", "code": 400}}, status_code=400)
 
     results = []
+    memory_results_count = 0
 
     # 先从内存 active_temp_rooms 读取
+    print(f"[temp_rooms/query] 开始从内存 active_temp_rooms 查询，当前内存中的房间数: {len(active_temp_rooms)}")
+    print(f"[temp_rooms/query] 内存中的房间 group_ids: {list(active_temp_rooms.keys())}")
+    app_logger.info(f"[temp_rooms/query] 开始从内存查询，内存房间数: {len(active_temp_rooms)}, 查询的 group_ids: {group_ids}")
+    
     for gid in group_ids:
         room = active_temp_rooms.get(gid)
         if room:
-            results.append({
+            memory_results_count += 1
+            room_data = {
                 "group_id": gid,
                 "room_id": room.get("room_id"),
                 "publish_url": room.get("publish_url"),
@@ -204,13 +232,26 @@ async def query_temp_rooms(request: Request):
                 "owner_name": room.get("owner_name"),
                 "owner_icon": room.get("owner_icon"),
                 "members": room.get("members", [])
-            })
+            }
+            results.append(room_data)
+            print(f"[temp_rooms/query] ✅ 从内存找到房间: group_id={gid}, room_id={room.get('room_id')}, members={len(room.get('members', []))}")
+            app_logger.info(f"[temp_rooms/query] ✅ 从内存找到房间: group_id={gid}, room_id={room.get('room_id')}, members={len(room.get('members', []))}")
+        else:
+            print(f"[temp_rooms/query] ⚠️ 内存中未找到房间: group_id={gid}")
+            app_logger.debug(f"[temp_rooms/query] ⚠️ 内存中未找到房间: group_id={gid}")
+
+    print(f"[temp_rooms/query] 内存查询完成，找到 {memory_results_count} 个房间")
 
     # 对于内存中不存在的，再查数据库（status=1）
     missing = [gid for gid in group_ids if gid not in active_temp_rooms]
+    print(f"[temp_rooms/query] 需要从数据库查询的 group_ids: {missing} (数量: {len(missing)})")
+    app_logger.info(f"[temp_rooms/query] 需要从数据库查询的 group_ids: {missing} (数量: {len(missing)})")
+    
     if missing:
         connection = get_db_connection()
         if connection and connection.is_connected():
+            print(f"[temp_rooms/query] ✅ 数据库连接成功，开始查询")
+            app_logger.info(f"[temp_rooms/query] ✅ 数据库连接成功，开始查询")
             try:
                 cursor = connection.cursor(dictionary=True)
                 query = """
@@ -219,11 +260,18 @@ async def query_temp_rooms(request: Request):
                     FROM temp_voice_rooms
                     WHERE status = 1 AND group_id IN ({})
                 """.format(", ".join(["%s"] * len(missing)))
+                print(f"[temp_rooms/query] 执行SQL查询: {query[:200]}... (参数: {missing})")
+                app_logger.info(f"[temp_rooms/query] 执行SQL查询，参数: {missing}")
                 cursor.execute(query, missing)
                 rows = cursor.fetchall() or []
+                print(f"[temp_rooms/query] 数据库查询结果: 找到 {len(rows)} 条记录")
+                app_logger.info(f"[temp_rooms/query] 数据库查询结果: 找到 {len(rows)} 条记录")
 
                 # 拉取成员
                 room_ids = [r.get("room_id") for r in rows if r.get("room_id")]
+                print(f"[temp_rooms/query] 需要查询成员的 room_ids: {room_ids} (数量: {len(room_ids)})")
+                app_logger.info(f"[temp_rooms/query] 需要查询成员的 room_ids: {room_ids} (数量: {len(room_ids)})")
+                
                 members_map: Dict[str, list] = {}
                 if room_ids:
                     member_query = """
@@ -231,21 +279,29 @@ async def query_temp_rooms(request: Request):
                         FROM temp_voice_room_members
                         WHERE status = 1 AND room_id IN ({})
                     """.format(", ".join(["%s"] * len(room_ids)))
+                    print(f"[temp_rooms/query] 执行成员查询SQL: {member_query[:200]}... (参数: {room_ids})")
+                    app_logger.info(f"[temp_rooms/query] 执行成员查询SQL，参数: {room_ids}")
                     cursor.execute(member_query, room_ids)
                     member_rows = cursor.fetchall() or []
+                    print(f"[temp_rooms/query] 成员查询结果: 找到 {len(member_rows)} 条成员记录")
+                    app_logger.info(f"[temp_rooms/query] 成员查询结果: 找到 {len(member_rows)} 条成员记录")
+                    
                     for m in member_rows:
                         rid = m.get("room_id")
                         uid = m.get("user_id")
                         if rid and uid:
                             members_map.setdefault(rid, []).append(uid)
+                    print(f"[temp_rooms/query] 成员映射结果: {json.dumps(members_map, ensure_ascii=False)}")
+                    app_logger.info(f"[temp_rooms/query] 成员映射结果: {json.dumps(members_map, ensure_ascii=False)}")
 
+                db_results_count = 0
                 for r in rows:
                     gid = r.get("group_id")
                     stream = r.get("stream_name")
                     publish_url = f"{SRS_WEBRTC_API_URL}/rtc/v1/publish/?app={SRS_APP}&stream={stream}"
                     play_url = f"{SRS_WEBRTC_API_URL}/rtc/v1/play/?app={SRS_APP}&stream={stream}"
                     rid = r.get("room_id")
-                    results.append({
+                    room_data = {
                         "group_id": gid,
                         "room_id": rid,
                         "publish_url": publish_url,
@@ -255,17 +311,42 @@ async def query_temp_rooms(request: Request):
                         "owner_name": r.get("owner_name"),
                         "owner_icon": r.get("owner_icon"),
                         "members": members_map.get(rid, [])
-                    })
+                    }
+                    results.append(room_data)
+                    db_results_count += 1
+                    print(f"[temp_rooms/query] ✅ 从数据库找到房间: group_id={gid}, room_id={rid}, members={len(members_map.get(rid, []))}")
+                    app_logger.info(f"[temp_rooms/query] ✅ 从数据库找到房间: group_id={gid}, room_id={rid}, members={len(members_map.get(rid, []))}")
+                
+                print(f"[temp_rooms/query] 数据库查询完成，找到 {db_results_count} 个房间")
+            except Exception as db_error:
+                error_msg = f"数据库查询失败: {db_error}"
+                print(f"[temp_rooms/query] ❌ {error_msg}")
+                app_logger.error(f"[temp_rooms/query] ❌ {error_msg}", exc_info=True)
             finally:
                 try:
                     if 'cursor' in locals() and cursor:
                         cursor.close()
+                        print(f"[temp_rooms/query] ✅ 数据库游标已关闭")
                     if connection and connection.is_connected():
                         connection.close()
-                except Exception:
-                    pass
+                        print(f"[temp_rooms/query] ✅ 数据库连接已关闭")
+                except Exception as close_error:
+                    print(f"[temp_rooms/query] ⚠️ 关闭数据库资源时出错: {close_error}")
+                    app_logger.warning(f"[temp_rooms/query] ⚠️ 关闭数据库资源时出错: {close_error}")
+        else:
+            error_msg = "数据库连接失败或未连接"
+            print(f"[temp_rooms/query] ❌ {error_msg}")
+            app_logger.error(f"[temp_rooms/query] ❌ {error_msg}")
 
-    return JSONResponse({"data": {"rooms": results, "count": len(results)}, "code": 200})
+    # 构建响应
+    response_data = {"data": {"rooms": results, "count": len(results)}, "code": 200}
+    print(f"[temp_rooms/query] ========== 查询完成 ==========")
+    print(f"[temp_rooms/query] 最终结果: 找到 {len(results)} 个房间")
+    print(f"[temp_rooms/query] 响应数据: {json.dumps(response_data, ensure_ascii=False, indent=2)}")
+    app_logger.info(f"[temp_rooms/query] 查询完成，找到 {len(results)} 个房间")
+    app_logger.debug(f"[temp_rooms/query] 响应数据: {json.dumps(response_data, ensure_ascii=False)}")
+    
+    return JSONResponse(response_data)
 
 
 
@@ -2315,10 +2396,6 @@ async def api_save_course_schedule(request: Request):
 
 # ===== 座位安排 API =====
 async def _handle_save_seat_arrangement_payload(data: Dict[str, Any]):
-    # 如果前面未获取到excel_files（如multipart场景），从data中提取
-    if excel_files is None:
-        excel_files = data.get('excel_files')
-
     class_id = data.get('class_id')
     seats = data.get('seats', [])
 
@@ -3848,7 +3925,14 @@ async def api_get_student_scores(
     """
     connection = get_db_connection()
     if connection is None:
-        return safe_json_response({'message': '数据库连接失败', 'code': 500}, status_code=500)
+        error_response = {'message': '数据库连接失败', 'code': 500}
+        try:
+            error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+            print(f"[student-scores] 返回的 JSON 结果（数据库连接失败）:\n{error_json}")
+            app_logger.error(f"[student-scores] 返回的 JSON 结果（数据库连接失败）: {json.dumps(error_response, ensure_ascii=False)}")
+        except Exception as json_error:
+            print(f"[student-scores] 打印 JSON 时出错: {json_error}")
+        return safe_json_response(error_response, status_code=500)
 
     try:
         cursor = connection.cursor(dictionary=True)
@@ -3951,6 +4035,14 @@ async def api_get_student_scores(
             excel_file_url_raw = header.get('excel_file_url')
             excel_file_urls = parse_excel_file_url(excel_file_url_raw)
             
+            # 转换 datetime 为字符串（用于 JSON 序列化）
+            created_at = header.get('created_at')
+            if created_at and isinstance(created_at, datetime.datetime):
+                created_at = created_at.strftime("%Y-%m-%d %H:%M:%S")
+            updated_at = header.get('updated_at')
+            if updated_at and isinstance(updated_at, datetime.datetime):
+                updated_at = updated_at.strftime("%Y-%m-%d %H:%M:%S")
+            
             header_dict = {
                 'id': header['id'],
                 'class_id': header['class_id'],
@@ -3959,24 +4051,66 @@ async def api_get_student_scores(
                 'remark': header.get('remark'),
                 'excel_file_url': excel_file_urls,  # 返回数组格式
                 'excel_file_url_raw': excel_file_url_raw,  # 保留原始值（可选，用于兼容）
-                'created_at': header.get('created_at'),
-                'updated_at': header.get('updated_at'),
+                'created_at': created_at,
+                'updated_at': updated_at,
                 'fields': fields,  # 字段定义列表
                 'scores': scores
             }
             result_headers.append(header_dict)
 
-        return safe_json_response({
+        # 转换 Decimal 类型为 float（用于 JSON 序列化）
+        from decimal import Decimal
+        def convert_for_json(obj):
+            """递归转换 Decimal 和 datetime 类型为 JSON 可序列化的类型"""
+            if isinstance(obj, Decimal):
+                return float(obj)
+            elif isinstance(obj, datetime.datetime):
+                return obj.strftime("%Y-%m-%d %H:%M:%S")
+            elif isinstance(obj, dict):
+                return {k: convert_for_json(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_for_json(item) for item in obj]
+            return obj
+        
+        # 转换所有数据以确保 JSON 序列化正常
+        result_headers = convert_for_json(result_headers)
+        
+        response_data = {
             'message': '查询成功',
             'code': 200,
             'data': {'headers': result_headers}
-        })
+        }
+        
+        # 打印返回的 JSON 结果
+        try:
+            response_json = json.dumps(response_data, ensure_ascii=False, indent=2)
+            print(f"[student-scores] 返回的 JSON 结果:\n{response_json}")
+            app_logger.info(f"[student-scores] 返回的 JSON 结果: {json.dumps(response_data, ensure_ascii=False)}")
+        except Exception as json_error:
+            print(f"[student-scores] 打印 JSON 时出错: {json_error}")
+            app_logger.warning(f"[student-scores] 打印 JSON 时出错: {json_error}")
+        
+        return safe_json_response(response_data)
     except mysql.connector.Error as e:
+        error_response = {'message': '数据库错误', 'code': 500}
         app_logger.error(f"Database error during api_get_student_scores: {e}")
-        return safe_json_response({'message': '数据库错误', 'code': 500}, status_code=500)
+        try:
+            error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+            print(f"[student-scores] 返回的 JSON 结果（数据库错误）:\n{error_json}")
+            app_logger.error(f"[student-scores] 返回的 JSON 结果（数据库错误）: {json.dumps(error_response, ensure_ascii=False)}")
+        except Exception as json_error:
+            print(f"[student-scores] 打印 JSON 时出错: {json_error}")
+        return safe_json_response(error_response, status_code=500)
     except Exception as e:
+        error_response = {'message': '未知错误', 'code': 500}
         app_logger.error(f"Unexpected error during api_get_student_scores: {e}")
-        return safe_json_response({'message': '未知错误', 'code': 500}, status_code=500)
+        try:
+            error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+            print(f"[student-scores] 返回的 JSON 结果（未知错误）:\n{error_json}")
+            app_logger.error(f"[student-scores] 返回的 JSON 结果（未知错误）: {json.dumps(error_response, ensure_ascii=False)}")
+        except Exception as json_error:
+            print(f"[student-scores] 打印 JSON 时出错: {json_error}")
+        return safe_json_response(error_response, status_code=500)
     finally:
         if connection and connection.is_connected():
             connection.close()
@@ -5436,7 +5570,14 @@ async def api_get_group_scores(
     """
     connection = get_db_connection()
     if connection is None:
-        return safe_json_response({'message': '数据库连接失败', 'code': 500}, status_code=500)
+        error_response = {'message': '数据库连接失败', 'code': 500}
+        try:
+            error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+            print(f"[group-scores] 返回的 JSON 结果（数据库连接失败）:\n{error_json}")
+            app_logger.error(f"[group-scores] 返回的 JSON 结果（数据库连接失败）: {json.dumps(error_response, ensure_ascii=False)}")
+        except Exception as json_error:
+            print(f"[group-scores] 打印 JSON 时出错: {json_error}")
+        return safe_json_response(error_response, status_code=500)
 
     try:
         cursor = connection.cursor(dictionary=True)
@@ -5461,7 +5602,14 @@ async def api_get_group_scores(
         
         header = cursor.fetchone()
         if not header:
-            return safe_json_response({'message': '未找到小组成绩表', 'code': 404}, status_code=404)
+            error_response = {'message': '未找到小组成绩表', 'code': 404}
+            try:
+                error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+                print(f"[group-scores] 返回的 JSON 结果（未找到数据）:\n{error_json}")
+                app_logger.info(f"[group-scores] 返回的 JSON 结果（未找到数据）: {json.dumps(error_response, ensure_ascii=False)}")
+            except Exception as json_error:
+                print(f"[group-scores] 打印 JSON 时出错: {json_error}")
+            return safe_json_response(error_response, status_code=404)
 
         score_header_id = header['id']
         
@@ -5521,8 +5669,33 @@ async def api_get_group_scores(
         
         # 转换为列表，按小组名称排序
         group_scores_list = sorted(group_dict.values(), key=lambda x: x['group_name'])
+        
+        # 转换 datetime 为字符串（用于 JSON 序列化）
+        created_at = header.get('created_at')
+        if created_at and isinstance(created_at, datetime.datetime):
+            created_at = created_at.strftime("%Y-%m-%d %H:%M:%S")
+        updated_at = header.get('updated_at')
+        if updated_at and isinstance(updated_at, datetime.datetime):
+            updated_at = updated_at.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # 转换 Decimal 类型为 float（用于 JSON 序列化）
+        from decimal import Decimal
+        def convert_for_json(obj):
+            """递归转换 Decimal 类型为 JSON 可序列化的类型"""
+            if isinstance(obj, Decimal):
+                return float(obj)
+            elif isinstance(obj, datetime.datetime):
+                return obj.strftime("%Y-%m-%d %H:%M:%S")
+            elif isinstance(obj, dict):
+                return {k: convert_for_json(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_for_json(item) for item in obj]
+            return obj
+        
+        # 转换 group_scores_list 以确保 JSON 序列化正常
+        group_scores_list = convert_for_json(group_scores_list)
 
-        return safe_json_response({
+        response_data = {
             'message': '查询成功',
             'code': 200,
             'data': {
@@ -5533,21 +5706,46 @@ async def api_get_group_scores(
                     'term': header.get('term'),
                     'remark': header.get('remark'),
                     'excel_file_url': excel_file_url_parsed,
-                    'created_at': header.get('created_at'),
-                    'updated_at': header.get('updated_at')
+                    'created_at': created_at,
+                    'updated_at': updated_at
                 },
                 'group_scores': group_scores_list
             }
-        })
+        }
+        
+        # 打印返回的 JSON 结果
+        try:
+            response_json = json.dumps(response_data, ensure_ascii=False, indent=2)
+            print(f"[group-scores] 返回的 JSON 结果:\n{response_json}")
+            app_logger.info(f"[group-scores] 返回的 JSON 结果: {json.dumps(response_data, ensure_ascii=False)}")
+        except Exception as json_error:
+            print(f"[group-scores] 打印 JSON 时出错: {json_error}")
+            app_logger.warning(f"[group-scores] 打印 JSON 时出错: {json_error}")
+        
+        return safe_json_response(response_data)
     except mysql.connector.Error as e:
+        error_response = {'message': '数据库错误', 'code': 500}
         app_logger.error(f"Database error during api_get_group_scores: {e}")
-        return safe_json_response({'message': '数据库错误', 'code': 500}, status_code=500)
+        try:
+            error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+            print(f"[group-scores] 返回的 JSON 结果（数据库错误）:\n{error_json}")
+            app_logger.error(f"[group-scores] 返回的 JSON 结果（数据库错误）: {json.dumps(error_response, ensure_ascii=False)}")
+        except Exception as json_error:
+            print(f"[group-scores] 打印 JSON 时出错: {json_error}")
+        return safe_json_response(error_response, status_code=500)
     except Exception as e:
+        error_response = {'message': f'未知错误: {str(e)}', 'code': 500}
         app_logger.error(f"Unexpected error during api_get_group_scores: {e}")
         import traceback
         traceback_str = traceback.format_exc()
         app_logger.error(f"错误堆栈:\n{traceback_str}")
-        return safe_json_response({'message': f'未知错误: {str(e)}', 'code': 500}, status_code=500)
+        try:
+            error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+            print(f"[group-scores] 返回的 JSON 结果（未知错误）:\n{error_json}")
+            app_logger.error(f"[group-scores] 返回的 JSON 结果（未知错误）: {json.dumps(error_response, ensure_ascii=False)}")
+        except Exception as json_error:
+            print(f"[group-scores] 打印 JSON 时出错: {json_error}")
+        return safe_json_response(error_response, status_code=500)
     finally:
         if connection and connection.is_connected():
             connection.close()
@@ -12930,7 +13128,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
                 # 生成唯一的房间ID和流名称
                 # 客户端使用传统 SRS WebRTC API（/rtc/v1/publish/ 和 /rtc/v1/play/）
-                room_id = str(uuid.uuid4())
+                # 使用纯数字生成房间ID（时间戳毫秒 + 4位随机数）
+                room_id = str(int(time.time() * 1000)) + str(random.randint(1000, 9999))
                 stream_name = f"room_{group_id}_{int(time.time())}"
                 
                 # 生成传统 WebRTC API 地址（推流和拉流）
@@ -13534,15 +13733,36 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             except WebSocketDisconnect as exc:
                 # 正常断开
                 print(f"用户 {user_id} 断开（WebSocketDisconnect），详情: {exc}")
+                # 清理用户从所有临时房间的成员列表中移除
+                for group_id, room_info in list(active_temp_rooms.items()):
+                    members = room_info.get("members", [])
+                    if user_id in members:
+                        members.remove(user_id)
+                        app_logger.info(f"[webrtc] 用户 {user_id} 离开房间 {group_id}（WebSocketDisconnect），当前成员数={len(members)}")
+                        print(f"[webrtc] 用户 {user_id} 离开房间 {group_id}（WebSocketDisconnect），当前成员数={len(members)}")
                 break
             except RuntimeError as e:
                 # 已收到 disconnect 后再次 receive 会到这里
                 print(f"用户 {user_id} receive RuntimeError: {e}")
+                # 清理用户从所有临时房间的成员列表中移除
+                for group_id, room_info in list(active_temp_rooms.items()):
+                    members = room_info.get("members", [])
+                    if user_id in members:
+                        members.remove(user_id)
+                        app_logger.info(f"[webrtc] 用户 {user_id} 离开房间 {group_id}（RuntimeError），当前成员数={len(members)}")
+                        print(f"[webrtc] 用户 {user_id} 离开房间 {group_id}（RuntimeError），当前成员数={len(members)}")
                 break
 
             # starlette 会在断开时 raise WebSocketDisconnect，保险起见也判断 type
             if message.get("type") == "websocket.disconnect":
                 print(f"用户 {user_id} 断开（disconnect event）")
+                # 清理用户从所有临时房间的成员列表中移除
+                for group_id, room_info in list(active_temp_rooms.items()):
+                    members = room_info.get("members", [])
+                    if user_id in members:
+                        members.remove(user_id)
+                        app_logger.info(f"[webrtc] 用户 {user_id} 离开房间 {group_id}（disconnect event），当前成员数={len(members)}")
+                        print(f"[webrtc] 用户 {user_id} 离开房间 {group_id}（disconnect event），当前成员数={len(members)}")
                 break
             
             if "text" in message:
@@ -14067,7 +14287,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                                     app_logger.error(f"[创建班级群] 查询创建者信息失败 - user_id={user_id}, error={db_error}")
                                             
                                             # 生成唯一的房间ID和流名称
-                                            room_id = str(uuid.uuid4())
+                                            # 使用纯数字生成房间ID（时间戳毫秒 + 4位随机数）
+                                            room_id = str(int(time.time() * 1000)) + str(random.randint(1000, 9999))
                                             stream_name = f"room_{unique_group_id}_{int(time.time())}"
                                             
                                             # 生成传统 WebRTC API 地址（推流和拉流）
@@ -14732,12 +14953,36 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             members = room_info.get("members", [])
             if user_id in members:
                 members.remove(user_id)
-                app_logger.info(f"[webrtc] 用户 {user_id} 离开房间 {group_id}，当前成员数={len(members)}")
-                print(f"[webrtc] 用户 {user_id} 离开房间 {group_id}，当前成员数={len(members)}")
+                app_logger.info(f"[webrtc] 用户 {user_id} 离开房间 {group_id}（外层捕获），当前成员数={len(members)}")
+                print(f"[webrtc] 用户 {user_id} 离开房间 {group_id}（外层捕获），当前成员数={len(members)}")
         
         if connection:
             connection.rollback()
+    except Exception as e:
+        # 捕获其他未预期的异常
+        app_logger.error(f"[websocket][{user_id}] 未预期的异常: {e}", exc_info=True)
+        print(f"[websocket][{user_id}] 未预期的异常: {e}")
+        # 确保清理用户从临时房间中移除
+        for group_id, room_info in list(active_temp_rooms.items()):
+            members = room_info.get("members", [])
+            if user_id in members:
+                members.remove(user_id)
+                app_logger.info(f"[webrtc] 用户 {user_id} 离开房间 {group_id}（异常清理），当前成员数={len(members)}")
+                print(f"[webrtc] 用户 {user_id} 离开房间 {group_id}（异常清理），当前成员数={len(members)}")
     finally:
+        # 最终清理：确保用户从连接列表和临时房间中移除
+        if user_id in connections:
+            connections.pop(user_id, None)
+            print(f"[websocket][{user_id}] 从连接列表中移除（finally块）")
+        
+        # 再次检查并清理临时房间成员（防止遗漏）
+        for group_id, room_info in list(active_temp_rooms.items()):
+            members = room_info.get("members", [])
+            if user_id in members:
+                members.remove(user_id)
+                app_logger.info(f"[webrtc] 用户 {user_id} 离开房间 {group_id}（finally清理），当前成员数={len(members)}")
+                print(f"[webrtc] 用户 {user_id} 离开房间 {group_id}（finally清理），当前成员数={len(members)}")
+        
         if cursor:
             cursor.close()
         if connection and connection.is_connected():
