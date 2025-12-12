@@ -3182,35 +3182,49 @@ def save_student_scores(
         if not upload_field_set and fields:
             upload_field_set = {f.get('field_name') for f in fields if f.get('field_name')}
         
-        # 4. 在替换模式下，删除不在新数据中的字段
+        # 确定当前上传的Excel文件名（用于字段定义和成绩保存）
+        current_excel_filename = None
+        if excel_files and isinstance(excel_files, list) and len(excel_files) > 0:
+            # 如果有多个文件，使用第一个文件的文件名
+            current_excel_filename = excel_files[0].get('filename') or excel_files[0].get('name') or excel_files[0].get('file_name')
+        elif excel_file_name:
+            current_excel_filename = excel_file_name
+        
+        # 如果无法确定文件名，使用默认值（避免 NOT NULL 约束错误）
+        if not current_excel_filename:
+            current_excel_filename = f"excel_file_{int(time.time())}"
+            print(f"[save_student_scores] ⚠️ 无法确定Excel文件名，使用默认值: {current_excel_filename}")
+            app_logger.warning(f"[save_student_scores] ⚠️ 无法确定Excel文件名，使用默认值: {current_excel_filename}")
+        
+        # 4. 在替换模式下，删除不在新数据中的字段（需要按 excel_filename 和 field_name 组合删除）
         deleted_field_count = 0
-        if operation_mode == 'replace' and field_name_set:
-            # 查询所有现有字段
+        if operation_mode == 'replace' and field_name_set and current_excel_filename:
+            # 查询当前Excel文件的所有现有字段
             cursor.execute(
-                "SELECT field_name FROM ta_student_score_field WHERE score_header_id = %s",
-                (score_header_id,)
+                "SELECT field_name FROM ta_student_score_field WHERE score_header_id = %s AND excel_filename = %s",
+                (score_header_id, current_excel_filename)
             )
             existing_fields = cursor.fetchall()
             existing_field_names = {f['field_name'] for f in existing_fields}
             
-            # 找出需要删除的字段（存在于数据库但不在新数据中 + 不在“其他excel字段”保留集中）
-            fields_to_delete = existing_field_names - field_name_set - other_excels_fields
+            # 找出需要删除的字段（存在于当前Excel但不在新数据中）
+            fields_to_delete = existing_field_names - field_name_set
             if fields_to_delete:
-                delete_field_sql = "DELETE FROM ta_student_score_field WHERE score_header_id = %s AND field_name = %s"
+                delete_field_sql = "DELETE FROM ta_student_score_field WHERE score_header_id = %s AND field_name = %s AND excel_filename = %s"
                 for field_name in fields_to_delete:
-                    cursor.execute(delete_field_sql, (score_header_id, field_name))
+                    cursor.execute(delete_field_sql, (score_header_id, field_name, current_excel_filename))
                     deleted_field_count += 1
-                    print(f"[save_student_scores] 删除字段: {field_name}")
-                    app_logger.info(f"[save_student_scores] 删除字段: {field_name}")
+                    print(f"[save_student_scores] 删除字段: {field_name} (来自 {current_excel_filename})")
+                    app_logger.info(f"[save_student_scores] 删除字段: {field_name} (来自 {current_excel_filename})")
                 print(f"[save_student_scores] 替换模式下删除字段完成 - 删除{deleted_field_count}个字段")
                 app_logger.info(f"[save_student_scores] 替换模式下删除字段完成 - 删除{deleted_field_count}个字段")
         
-        # 5. 保存或更新字段定义
+        # 5. 保存或更新字段定义（添加 excel_filename 字段支持）
         if field_definitions:
             insert_field_sql = (
                 "INSERT INTO ta_student_score_field "
-                "(score_header_id, field_name, field_type, field_order, is_total) "
-                "VALUES (%s, %s, %s, %s, %s) "
+                "(score_header_id, field_name, excel_filename, field_type, field_order, is_total) "
+                "VALUES (%s, %s, %s, %s, %s, %s) "
                 "ON DUPLICATE KEY UPDATE "
                 "field_type = VALUES(field_type), "
                 "field_order = VALUES(field_order), "
@@ -3223,10 +3237,10 @@ def save_student_scores(
                 if not field_name:
                     continue
                 
-                # 检查字段是否已存在
+                # 检查字段是否已存在（需要同时匹配 field_name 和 excel_filename）
                 cursor.execute(
-                    "SELECT id FROM ta_student_score_field WHERE score_header_id = %s AND field_name = %s",
-                    (score_header_id, field_name)
+                    "SELECT id FROM ta_student_score_field WHERE score_header_id = %s AND field_name = %s AND excel_filename = %s",
+                    (score_header_id, field_name, current_excel_filename)
                 )
                 existing_field = cursor.fetchone()
                 
@@ -3239,16 +3253,16 @@ def save_student_scores(
                     if existing_field:
                         # 保持原有顺序
                         cursor.execute(
-                            "SELECT field_order FROM ta_student_score_field WHERE score_header_id = %s AND field_name = %s",
-                            (score_header_id, field_name)
+                            "SELECT field_order FROM ta_student_score_field WHERE score_header_id = %s AND field_name = %s AND excel_filename = %s",
+                            (score_header_id, field_name, current_excel_filename)
                         )
                         order_result = cursor.fetchone()
                         field_order = order_result['field_order'] if order_result else 1
                     else:
-                        # 新字段，追加到最后
+                        # 新字段，追加到最后（按当前Excel文件的字段顺序）
                         cursor.execute(
-                            "SELECT MAX(field_order) as max_order FROM ta_student_score_field WHERE score_header_id = %s",
-                            (score_header_id,)
+                            "SELECT MAX(field_order) as max_order FROM ta_student_score_field WHERE score_header_id = %s AND excel_filename = %s",
+                            (score_header_id, current_excel_filename)
                         )
                         max_order_result = cursor.fetchone()
                         max_order = max_order_result['max_order'] if max_order_result and max_order_result['max_order'] is not None else 0
@@ -3257,6 +3271,7 @@ def save_student_scores(
                 cursor.execute(insert_field_sql, (
                     score_header_id,
                     field_name,
+                    current_excel_filename,
                     field_type,
                     field_order,
                     is_total
@@ -3318,10 +3333,12 @@ def save_student_scores(
         # 注意：需要根据student_id和student_name来判断是否已存在
         insert_detail_sql = (
             "INSERT INTO ta_student_score_detail "
-            "(score_header_id, student_id, student_name, scores_json, total_score) "
-            "VALUES (%s, %s, %s, %s, %s) "
+            "(score_header_id, student_id, student_name, scores_json, comments_json, field_source_json, total_score) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) "
             "ON DUPLICATE KEY UPDATE "
             "scores_json = VALUES(scores_json), "
+            "comments_json = VALUES(comments_json), "
+            "field_source_json = VALUES(field_source_json), "
             "total_score = VALUES(total_score), "
             "updated_at = NOW()"
         )
@@ -3341,7 +3358,7 @@ def save_student_scores(
             
             # 检查该学生是否已有成绩记录
             check_sql = (
-                "SELECT id, scores_json FROM ta_student_score_detail "
+                "SELECT id, scores_json, field_source_json, comments_json FROM ta_student_score_detail "
                 "WHERE score_header_id = %s AND student_name = %s "
                 "AND (%s IS NULL OR student_id = %s) "
                 "LIMIT 1"
@@ -3349,38 +3366,91 @@ def save_student_scores(
             cursor.execute(check_sql, (score_header_id, student_name, student_id, student_id))
             existing_record = cursor.fetchone()
             
-            # 构建JSON对象（包含除student_id和student_name外的所有字段）
+            # 构建JSON对象（使用复合键名：字段名_Excel文件名）
+            # 这样可以支持同一字段名来自不同Excel文件的情况
             scores_json = {}
+            comments_json = {}  # 保存注释（支持复合键名）
+            field_source_json = {}  # 记录字段名到Excel文件名的映射
             total_score = None
             for key, value in score_item.items():
                 if key not in ['student_id', 'student_name']:
                     if value is not None:
-                        # 尝试转换为数字
-                        try:
-                            if isinstance(value, (int, float)):
-                                scores_json[key] = float(value)
-                            elif isinstance(value, str) and value.strip():
-                                # 尝试解析为数字
-                                scores_json[key] = float(value.strip())
+                        # 检查是否为注释字段（以 _comment 结尾）
+                        if key.endswith('_comment'):
+                            # 这是注释字段，提取字段名并保存到 comments_json
+                            field_name = key[:-8]  # 去掉 '_comment' 后缀
+                            comment_value = str(value).strip() if value else ''
+                            if comment_value:
+                                # 使用复合键名保存注释（字段名_Excel文件名）
+                                comment_key = f"{field_name}_{current_excel_filename}" if current_excel_filename else field_name
+                                comments_json[comment_key] = comment_value
+                                # 同时为了兼容性，也保存简单字段名（如果还没有的话）
+                                if field_name not in comments_json:
+                                    comments_json[field_name] = comment_value
+                        else:
+                            # 这是成绩字段，保存到 scores_json
+                            # 使用复合键名（字段名_Excel文件名）来保存，避免同名字段覆盖
+                            composite_key = f"{key}_{current_excel_filename}" if current_excel_filename else key
+                            
+                            # 尝试转换为数字
+                            try:
+                                if isinstance(value, (int, float)):
+                                    scores_json[composite_key] = float(value)
+                                elif isinstance(value, str) and value.strip():
+                                    # 尝试解析为数字
+                                    scores_json[composite_key] = float(value.strip())
+                                else:
+                                    scores_json[composite_key] = value
+                            except (ValueError, TypeError):
+                                scores_json[composite_key] = value
+                            
+                            # 记录字段来源映射（如果同一字段名来自多个Excel，使用数组）
+                            if key in field_source_json:
+                                # 如果已有记录，转换为数组
+                                existing_source = field_source_json[key]
+                                if isinstance(existing_source, str):
+                                    field_source_json[key] = [existing_source, current_excel_filename] if current_excel_filename else existing_source
+                                elif isinstance(existing_source, list):
+                                    if current_excel_filename and current_excel_filename not in existing_source:
+                                        existing_source.append(current_excel_filename)
                             else:
-                                scores_json[key] = value
-                        except (ValueError, TypeError):
-                            scores_json[key] = value
-                    
-                    # 检查是否为总分字段
-                    if ('总分' in key or 'total' in key.lower()) and value is not None:
-                        try:
-                            total_score = float(value)
-                        except (ValueError, TypeError):
-                            pass
+                                # 首次记录
+                                field_source_json[key] = current_excel_filename if current_excel_filename else key
+                        
+                        # 检查是否为总分字段
+                        if ('总分' in key or 'total' in key.lower()) and value is not None:
+                            try:
+                                # 如果有多个"总分"字段，取最后一个（或者可以根据业务需求调整）
+                                total_score = float(value)
+                            except (ValueError, TypeError):
+                                pass
             
             # 在追加模式下，如果记录已存在，合并JSON数据（保留旧字段，添加新字段）
             # 在替换模式下，仅替换本次上传涉及的字段，保留其他excel的字段
+            existing_field_source_json = {}
+            existing_comments_json = {}
+            if existing_record and existing_record.get('field_source_json'):
+                try:
+                    existing_field_source_json = json.loads(existing_record['field_source_json']) if isinstance(existing_record['field_source_json'], str) else existing_record['field_source_json']
+                except (json.JSONDecodeError, TypeError):
+                    existing_field_source_json = {}
+            
+            if existing_record and existing_record.get('comments_json'):
+                try:
+                    existing_comments_json = json.loads(existing_record['comments_json']) if isinstance(existing_record['comments_json'], str) else existing_record['comments_json']
+                except (json.JSONDecodeError, TypeError):
+                    existing_comments_json = {}
+            
             if operation_mode == 'append' and existing_record and existing_record.get('scores_json'):
                 try:
                     existing_json = json.loads(existing_record['scores_json']) if isinstance(existing_record['scores_json'], str) else existing_record['scores_json']
+                    # 合并时，复合键名不会冲突（因为包含Excel文件名）
                     merged_json = {**existing_json, **scores_json}
                     scores_json = merged_json
+                    # 合并字段来源映射
+                    field_source_json = {**existing_field_source_json, **field_source_json}
+                    # 合并注释（复合键名不会冲突）
+                    comments_json = {**existing_comments_json, **comments_json}
                     print(f"[save_student_scores] 合并已有成绩数据 - student_name={student_name}, 旧字段数={len(existing_json)}, 新字段数={len(scores_json)}")
                     app_logger.info(f"[save_student_scores] 合并已有成绩数据 - student_name={student_name}")
                 except (json.JSONDecodeError, TypeError) as e:
@@ -3389,9 +3459,19 @@ def save_student_scores(
             elif operation_mode == 'replace' and existing_record and existing_record.get('scores_json'):
                 try:
                     existing_json = json.loads(existing_record['scores_json']) if isinstance(existing_record['scores_json'], str) else existing_record['scores_json']
-                    # 保留“其他excel”的字段，仅用本次上传字段覆盖
-                    preserved = {k: v for k, v in existing_json.items() if k in other_excels_fields}
+                    # 替换模式下，仅删除当前Excel文件的字段，保留其他Excel的字段
+                    # 保留不以当前Excel文件名结尾的字段（即其他Excel的字段）
+                    preserved = {k: v for k, v in existing_json.items() if not k.endswith(f"_{current_excel_filename}")}
                     scores_json = {**preserved, **scores_json}
+                    # 同样处理字段来源映射：删除当前Excel的字段映射，保留其他的
+                    preserved_sources = {k: v for k, v in existing_field_source_json.items() 
+                                        if (isinstance(v, str) and v != current_excel_filename) or
+                                           (isinstance(v, list) and current_excel_filename not in v)}
+                    field_source_json = {**preserved_sources, **field_source_json}
+                    # 同样处理注释：删除当前Excel的注释，保留其他的
+                    preserved_comments = {k: v for k, v in existing_comments_json.items() 
+                                         if not k.endswith(f"_{current_excel_filename}")}
+                    comments_json = {**preserved_comments, **comments_json}
                     print(f"[save_student_scores] 替换模式保留其他excel字段 - student_name={student_name}, 保留字段数={len(preserved)}, 新字段数={len(scores_json)}")
                     app_logger.info(f"[save_student_scores] 替换模式保留其他excel字段 - student_name={student_name}")
                 except (json.JSONDecodeError, TypeError) as e:
@@ -3407,24 +3487,28 @@ def save_student_scores(
                 if total_score == 0.0:
                     total_score = None  # 如果所有值都是0或没有值，设为None
             
-            # 将scores_json转换为JSON字符串
+            # 将scores_json、comments_json和field_source_json转换为JSON字符串
             scores_json_str = json.dumps(scores_json, ensure_ascii=False)
+            comments_json_str = json.dumps(comments_json, ensure_ascii=False) if comments_json else None
+            field_source_json_str = json.dumps(field_source_json, ensure_ascii=False) if field_source_json else None
             
             is_update = existing_record is not None
             action = "更新" if is_update else "插入"
-            print(f"[save_student_scores] {action}第{idx+1}条成绩 - student_name={student_name}, student_id={student_id}, scores_json={scores_json_str}, total_score={total_score}")
-            app_logger.info(f"[save_student_scores] {action}第{idx+1}条成绩 - student_name={student_name}, student_id={student_id}, scores_json={scores_json_str}, total_score={total_score}")
+            print(f"[save_student_scores] {action}第{idx+1}条成绩 - student_name={student_name}, student_id={student_id}, scores_json={scores_json_str}, comments_json={comments_json_str}, field_source_json={field_source_json_str}, total_score={total_score}")
+            app_logger.info(f"[save_student_scores] {action}第{idx+1}条成绩 - student_name={student_name}, student_id={student_id}, total_score={total_score}")
             
             try:
                 # 如果记录已存在，使用UPDATE语句
                 if existing_record:
                     update_detail_sql = (
                         "UPDATE ta_student_score_detail "
-                        "SET scores_json = %s, total_score = %s, updated_at = NOW() "
+                        "SET scores_json = %s, comments_json = %s, field_source_json = %s, total_score = %s, updated_at = NOW() "
                         "WHERE id = %s"
                     )
                     cursor.execute(update_detail_sql, (
                         scores_json_str,
+                        comments_json_str,
+                        field_source_json_str,
                         total_score,
                         existing_record['id']
                     ))
@@ -3437,6 +3521,8 @@ def save_student_scores(
                         student_id,
                         student_name,
                         scores_json_str,
+                        comments_json_str,
+                        field_source_json_str,
                         total_score
                     ))
                     inserted_count += 1
@@ -3961,20 +4047,31 @@ async def api_get_student_scores(
         for header in headers:
             score_header_id = header['id']
             
-            # 查询字段定义
+            # 查询字段定义（包含 excel_filename）
             cursor.execute(
-                "SELECT field_name, field_type, field_order, is_total "
+                "SELECT field_name, excel_filename, field_type, field_order, is_total "
                 "FROM ta_student_score_field "
                 "WHERE score_header_id = %s "
-                "ORDER BY field_order ASC",
+                "ORDER BY excel_filename ASC, field_order ASC",
                 (score_header_id,)
             )
             fields = cursor.fetchall() or []
-            field_names = [f['field_name'] for f in fields]
+            # 收集所有字段名（可能有重复，来自不同Excel）
+            field_names = list({f['field_name'] for f in fields})  # 去重
             
-            # 查询成绩明细
+            # 构建字段名到Excel文件名的映射（用于解析复合键名）
+            field_excel_map = {}
+            for f in fields:
+                field_name = f['field_name']
+                excel_filename = f.get('excel_filename', '')
+                if field_name not in field_excel_map:
+                    field_excel_map[field_name] = []
+                if excel_filename and excel_filename not in field_excel_map[field_name]:
+                    field_excel_map[field_name].append(excel_filename)
+            
+            # 查询成绩明细（包含 field_source_json）
             cursor.execute(
-                "SELECT id, student_id, student_name, scores_json, comments_json, total_score "
+                "SELECT id, student_id, student_name, scores_json, field_source_json, comments_json, total_score "
                 "FROM ta_student_score_detail "
                 "WHERE score_header_id = %s "
                 "ORDER BY total_score DESC, student_name ASC",
@@ -3992,7 +4089,7 @@ async def api_get_student_scores(
                     'total_score': float(row['total_score']) if row['total_score'] is not None else None
                 }
                 
-                # 解析成绩JSON字段
+                # 解析成绩JSON字段（处理复合键名：字段名_Excel文件名）
                 if row.get('scores_json'):
                     try:
                         if isinstance(row['scores_json'], str):
@@ -4000,15 +4097,62 @@ async def api_get_student_scores(
                         else:
                             scores_data = row['scores_json']
                         
+                        # 解析 field_source_json（字段名到Excel文件名的映射）
+                        field_source_data = {}
+                        if row.get('field_source_json'):
+                            try:
+                                if isinstance(row['field_source_json'], str):
+                                    field_source_data = json.loads(row['field_source_json'])
+                                else:
+                                    field_source_data = row['field_source_json']
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                        
                         # 将JSON中的字段添加到score_dict中
+                        # 支持两种方式：1. 使用复合键名查找 2. 使用简单字段名（如果有映射）
+                        # 同时收集所有来源的值（用于返回详细信息）
+                        field_sources_detail = {}  # 记录每个字段的所有来源值
                         for field_name in field_names:
+                            # 优先使用简单字段名（兼容旧数据）
                             if field_name in scores_data:
                                 score_dict[field_name] = scores_data[field_name]
+                                # 记录来源信息
+                                field_sources_detail[field_name] = {
+                                    'value': scores_data[field_name],
+                                    'sources': [field_source_data.get(field_name, 'unknown')] if field_source_data else ['unknown']
+                                }
+                            else:
+                                # 尝试使用复合键名查找
+                                excel_filenames = field_excel_map.get(field_name, [])
+                                found_value = None
+                                found_sources = []
+                                # 收集所有来源的值
+                                for excel_filename in excel_filenames:
+                                    composite_key = f"{field_name}_{excel_filename}"
+                                    if composite_key in scores_data:
+                                        if found_value is None:
+                                            found_value = scores_data[composite_key]  # 第一个作为默认值
+                                        found_sources.append({
+                                            'excel_filename': excel_filename,
+                                            'value': scores_data[composite_key]
+                                        })
+                                if found_value is not None:
+                                    score_dict[field_name] = found_value
+                                    # 记录所有来源信息
+                                    field_sources_detail[field_name] = {
+                                        'value': found_value,
+                                        'sources': found_sources if found_sources else [field_source_data.get(field_name, 'unknown')] if field_source_data else ['unknown']
+                                    }
+                        
+                        # 添加字段来源详细信息（供客户端区分不同Excel文件的相同字段）
+                        score_dict['field_sources'] = field_sources_detail
+                        # 同时返回完整的scores_json（包含所有复合键名），方便客户端直接访问
+                        score_dict['scores_json_full'] = scores_data
                     except (json.JSONDecodeError, TypeError) as e:
                         print(f"[api_get_student_scores] 解析JSON失败: {e}, scores_json={row.get('scores_json')}")
                         app_logger.warning(f"[api_get_student_scores] 解析JSON失败: {e}")
                 
-                # 解析注释JSON字段
+                # 解析注释JSON字段（支持复合键名：字段名_Excel文件名）
                 comments_dict = {}
                 if row.get('comments_json'):
                     try:
@@ -4021,10 +4165,24 @@ async def api_get_student_scores(
                         app_logger.warning(f"[api_get_student_scores] 解析注释JSON失败: {e}")
                 
                 # 为每个字段添加注释（如果存在）
+                # 支持简单字段名（兼容旧数据）和复合键名
                 for field_name in field_names:
                     comment_key = f"{field_name}_comment"
+                    # 优先使用简单字段名（兼容旧数据）
                     if field_name in comments_dict:
                         score_dict[comment_key] = comments_dict[field_name]
+                    else:
+                        # 尝试使用复合键名查找
+                        excel_filenames = field_excel_map.get(field_name, [])
+                        found_comment = None
+                        # 如果字段有多个来源，优先使用第一个
+                        for excel_filename in excel_filenames:
+                            composite_comment_key = f"{field_name}_{excel_filename}"
+                            if composite_comment_key in comments_dict:
+                                found_comment = comments_dict[composite_comment_key]
+                                break  # 找到第一个就退出
+                        if found_comment is not None:
+                            score_dict[comment_key] = found_comment
                 
                 # 同时返回完整的注释对象（可选，方便前端使用）
                 score_dict['comments'] = comments_dict
@@ -4206,25 +4364,36 @@ async def api_get_student_score(
         print(f"[student-scores/get] 找到成绩表头 - id: {header['id']}, created_at: {header.get('created_at')}")
         app_logger.info(f"[student-scores/get] 找到成绩表头 - id: {header['id']}, class_id: {class_id}, exam_name: {exam_name}, term: {term}, created_at: {header.get('created_at')}")
         
-        # 查询字段定义
+        # 查询字段定义（包含 excel_filename）
         score_header_id = header['id']
         print(f"[student-scores/get] 查询字段定义 - score_header_id: {score_header_id}")
         app_logger.info(f"[student-scores/get] 开始查询字段定义 - score_header_id: {score_header_id}")
         cursor.execute(
-            "SELECT field_name, field_type, field_order, is_total "
+            "SELECT field_name, excel_filename, field_type, field_order, is_total "
             "FROM ta_student_score_field "
             "WHERE score_header_id = %s "
-            "ORDER BY field_order ASC",
+            "ORDER BY excel_filename ASC, field_order ASC",
             (score_header_id,)
         )
         fields = cursor.fetchall() or []
-        field_names = [f['field_name'] for f in fields]
+        # 收集所有字段名（可能有重复，来自不同Excel）
+        field_names = list({f['field_name'] for f in fields})  # 去重
         
-        # 查询成绩明细
+        # 构建字段名到Excel文件名的映射（用于解析复合键名）
+        field_excel_map = {}
+        for f in fields:
+            field_name = f['field_name']
+            excel_filename = f.get('excel_filename', '')
+            if field_name not in field_excel_map:
+                field_excel_map[field_name] = []
+            if excel_filename and excel_filename not in field_excel_map[field_name]:
+                field_excel_map[field_name].append(excel_filename)
+        
+        # 查询成绩明细（包含 field_source_json）
         print(f"[student-scores/get] 查询成绩明细 - score_header_id: {score_header_id}")
         app_logger.info(f"[student-scores/get] 开始查询成绩明细 - score_header_id: {score_header_id}")
         cursor.execute(
-            "SELECT id, student_id, student_name, scores_json, comments_json, total_score "
+            "SELECT id, student_id, student_name, scores_json, field_source_json, comments_json, total_score "
             "FROM ta_student_score_detail "
             "WHERE score_header_id = %s "
             "ORDER BY total_score DESC, student_name ASC",
@@ -4245,7 +4414,7 @@ async def api_get_student_score(
                 'total_score': float(row['total_score']) if row['total_score'] is not None else None
             }
             
-            # 解析成绩JSON字段
+            # 解析成绩JSON字段（处理复合键名：字段名_Excel文件名）
             if row.get('scores_json'):
                 try:
                     if isinstance(row['scores_json'], str):
@@ -4253,15 +4422,62 @@ async def api_get_student_score(
                     else:
                         scores_data = row['scores_json']
                     
+                    # 解析 field_source_json（字段名到Excel文件名的映射）
+                    field_source_data = {}
+                    if row.get('field_source_json'):
+                        try:
+                            if isinstance(row['field_source_json'], str):
+                                field_source_data = json.loads(row['field_source_json'])
+                            else:
+                                field_source_data = row['field_source_json']
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    
                     # 将JSON中的字段添加到score_dict中
+                    # 支持两种方式：1. 使用复合键名查找 2. 使用简单字段名（如果有映射）
+                    # 同时收集所有来源的值（用于返回详细信息）
+                    field_sources_detail = {}  # 记录每个字段的所有来源值
                     for field_name in field_names:
+                        # 优先使用简单字段名（兼容旧数据）
                         if field_name in scores_data:
                             score_dict[field_name] = scores_data[field_name]
+                            # 记录来源信息
+                            field_sources_detail[field_name] = {
+                                'value': scores_data[field_name],
+                                'sources': [field_source_data.get(field_name, 'unknown')] if field_source_data else ['unknown']
+                            }
+                        else:
+                            # 尝试使用复合键名查找
+                            excel_filenames = field_excel_map.get(field_name, [])
+                            found_value = None
+                            found_sources = []
+                            # 收集所有来源的值
+                            for excel_filename in excel_filenames:
+                                composite_key = f"{field_name}_{excel_filename}"
+                                if composite_key in scores_data:
+                                    if found_value is None:
+                                        found_value = scores_data[composite_key]  # 第一个作为默认值
+                                    found_sources.append({
+                                        'excel_filename': excel_filename,
+                                        'value': scores_data[composite_key]
+                                    })
+                            if found_value is not None:
+                                score_dict[field_name] = found_value
+                                # 记录所有来源信息
+                                field_sources_detail[field_name] = {
+                                    'value': found_value,
+                                    'sources': found_sources if found_sources else [field_source_data.get(field_name, 'unknown')] if field_source_data else ['unknown']
+                                }
+                    
+                    # 添加字段来源详细信息（供客户端区分不同Excel文件的相同字段）
+                    score_dict['field_sources'] = field_sources_detail
+                    # 同时返回完整的scores_json（包含所有复合键名），方便客户端直接访问
+                    score_dict['scores_json_full'] = scores_data
                 except (json.JSONDecodeError, TypeError) as e:
                     print(f"[api_get_student_score] 解析JSON失败: {e}, scores_json={row.get('scores_json')}")
                     app_logger.warning(f"[api_get_student_score] 解析JSON失败: {e}")
             
-            # 解析注释JSON字段
+            # 解析注释JSON字段（支持复合键名：字段名_Excel文件名）
             comments_dict = {}
             if row.get('comments_json'):
                 try:
@@ -4274,10 +4490,24 @@ async def api_get_student_score(
                     app_logger.warning(f"[api_get_student_score] 解析注释JSON失败: {e}")
             
             # 为每个字段添加注释（如果存在）
+            # 支持简单字段名（兼容旧数据）和复合键名
             for field_name in field_names:
                 comment_key = f"{field_name}_comment"
+                # 优先使用简单字段名（兼容旧数据）
                 if field_name in comments_dict:
                     score_dict[comment_key] = comments_dict[field_name]
+                else:
+                    # 尝试使用复合键名查找
+                    excel_filenames = field_excel_map.get(field_name, [])
+                    found_comment = None
+                    # 如果字段有多个来源，优先使用第一个
+                    for excel_filename in excel_filenames:
+                        composite_comment_key = f"{field_name}_{excel_filename}"
+                        if composite_comment_key in comments_dict:
+                            found_comment = comments_dict[composite_comment_key]
+                            break  # 找到第一个就退出
+                    if found_comment is not None:
+                        score_dict[comment_key] = found_comment
             
             # 同时返回完整的注释对象（可选，方便前端使用）
             score_dict['comments'] = comments_dict
@@ -4380,8 +4610,11 @@ async def api_set_student_score_comment(request: Request):
       "student_name": "张子晨",           // 学生姓名（必需）
       "student_id": "2024001",           // 学号（可选，如果提供会更精确匹配）
       "field_name": "数学",               // 字段名称（必需，如：数学、早读、语文等）
+      "excel_filename": "期中成绩单.xlsx", // Excel文件名（可选，如果提供则使用复合键名保存）
       "comment": "需要加强练习"           // 注释内容（必需，如果要删除注释可以传空字符串）
     }
+    注意：如果提供了 excel_filename，将使用复合键名（field_name_excel_filename）保存注释，
+         这样可以支持不同Excel文件中相同字段名的注释不互相覆盖
     """
     print("=" * 80)
     print("[student-scores/set-comment] ========== 收到设置注释请求 ==========")
@@ -4392,6 +4625,7 @@ async def api_set_student_score_comment(request: Request):
         student_name = body.get('student_name')
         student_id = body.get('student_id')  # 可选
         field_name = body.get('field_name')
+        excel_filename = body.get('excel_filename')  # 可选，如果提供则使用复合键名
         comment = body.get('comment')
         
         # 参数验证
@@ -4419,8 +4653,8 @@ async def api_set_student_score_comment(request: Request):
                 'code': 400
             }, status_code=400)
         
-        print(f"[student-scores/set-comment] 参数 - score_header_id: {score_header_id}, student_name: {student_name}, student_id: {student_id}, field_name: {field_name}, comment: {comment}")
-        app_logger.info(f"[student-scores/set-comment] 收到设置注释请求 - score_header_id: {score_header_id}, student_name: {student_name}, student_id: {student_id}, field_name: {field_name}")
+        print(f"[student-scores/set-comment] 参数 - score_header_id: {score_header_id}, student_name: {student_name}, student_id: {student_id}, field_name: {field_name}, excel_filename: {excel_filename}, comment: {comment}")
+        app_logger.info(f"[student-scores/set-comment] 收到设置注释请求 - score_header_id: {score_header_id}, student_name: {student_name}, student_id: {student_id}, field_name: {field_name}, excel_filename: {excel_filename}")
         
         connection = get_db_connection()
         if connection is None:
@@ -4430,6 +4664,22 @@ async def api_set_student_score_comment(request: Request):
             }, status_code=500)
         
         cursor = connection.cursor(dictionary=True)
+        
+        # 如果没有提供 excel_filename，尝试从字段定义中查找
+        if not excel_filename:
+            cursor.execute(
+                "SELECT excel_filename FROM ta_student_score_field "
+                "WHERE score_header_id = %s AND field_name = %s "
+                "LIMIT 1",
+                (score_header_id, field_name)
+            )
+            field_result = cursor.fetchone()
+            if field_result and field_result.get('excel_filename'):
+                excel_filename = field_result['excel_filename']
+                print(f"[student-scores/set-comment] 从字段定义中获取 excel_filename: {excel_filename}")
+        
+        # 确定使用的键名（如果提供了 excel_filename，使用复合键名）
+        comment_key = f"{field_name}_{excel_filename}" if excel_filename else field_name
         
         # 查询学生成绩记录
         if student_id:
@@ -4470,11 +4720,22 @@ async def api_set_student_score_comment(request: Request):
         else:
             comments_dict = {}
         
-        # 更新或添加注释
+        # 更新或添加注释（使用复合键名，如果提供了 excel_filename）
         if comment.strip():  # 如果注释不为空，则设置
-            comments_dict[field_name] = comment
+            comments_dict[comment_key] = comment
+            # 同时为了兼容性，也保留简单字段名（如果只有一个来源）
+            # 如果已经有多个来源的注释，则不覆盖简单字段名
+            if not excel_filename or field_name not in comments_dict:
+                comments_dict[field_name] = comment
         else:  # 如果注释为空字符串，则删除该字段的注释
-            comments_dict.pop(field_name, None)
+            comments_dict.pop(comment_key, None)
+            # 如果删除了复合键名的注释，也删除简单字段名的注释（如果存在且只有一个来源）
+            if excel_filename and field_name in comments_dict:
+                # 检查是否还有其他复合键名的注释
+                has_other_comments = any(k.startswith(f"{field_name}_") and k != comment_key 
+                                       for k in comments_dict.keys())
+                if not has_other_comments:
+                    comments_dict.pop(field_name, None)
         
         # 将更新后的字典转换为JSON字符串
         comments_json_str = json.dumps(comments_dict, ensure_ascii=False)
@@ -4855,8 +5116,8 @@ def save_group_scores(
         
         insert_detail_sql = (
             "INSERT INTO ta_group_score_detail "
-            "(score_header_id, group_name, student_id, student_name, scores_json, total_score, group_total_score) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            "(score_header_id, group_name, student_id, student_name, scores_json, field_source_json, total_score, group_total_score) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
         )
         
         inserted_count = 0
@@ -4867,8 +5128,15 @@ def save_group_scores(
         upload_field_set = set()
         for score_item in scores:
             for key in score_item.keys():
-                if key not in ['group_name', 'student_id', 'student_name', 'group_total_score', '总分', 'total_score']:
+                if key not in ['group_name', 'student_id', 'student_name', 'group_total_score', '总分', 'total_score', 'total']:
                     upload_field_set.add(key)
+        
+        # 确定当前Excel文件名（如果有多个，使用第一个）
+        current_excel_filename = None
+        if current_excel_filenames:
+            current_excel_filename = list(current_excel_filenames)[0]  # 使用第一个文件名
+        elif excel_file_name:
+            current_excel_filename = excel_file_name
         
         for idx, score_item in enumerate(scores):
             group_name = score_item.get('group_name', '').strip()
@@ -4882,7 +5150,7 @@ def save_group_scores(
             
             # 检查该学生是否已有成绩记录
             check_sql = (
-                "SELECT id, scores_json FROM ta_group_score_detail "
+                "SELECT id, scores_json, field_source_json FROM ta_group_score_detail "
                 "WHERE score_header_id = %s AND student_name = %s "
                 "AND (%s IS NULL OR student_id = %s) "
                 "LIMIT 1"
@@ -4890,21 +5158,37 @@ def save_group_scores(
             cursor.execute(check_sql, (score_header_id, student_name, student_id, student_id))
             existing_record = cursor.fetchone()
             
-            # 构建JSON对象（包含除group_name、student_id、student_name、group_total_score外的所有字段）
+            # 构建JSON对象（使用复合键名：字段名_Excel文件名）
+            # 这样可以支持同一字段名来自不同Excel文件的情况
             scores_json = {}
+            field_source_json = {}  # 记录字段名到Excel文件名的映射（可选）
             total_score = None
             for key, value in score_item.items():
-                if key not in ['group_name', 'student_id', 'student_name', 'group_total_score', '总分', 'total_score']:
+                if key not in ['group_name', 'student_id', 'student_name', 'group_total_score', '总分', 'total_score', 'total']:
                     if value is not None:
+                        # 使用复合键名（字段名_Excel文件名）来保存，避免同名字段覆盖
+                        composite_key = f"{key}_{current_excel_filename}" if current_excel_filename else key
+                        
                         try:
                             if isinstance(value, (int, float)):
-                                scores_json[key] = float(value)
+                                scores_json[composite_key] = float(value)
                             elif isinstance(value, str) and value.strip():
-                                scores_json[key] = float(value.strip())
+                                scores_json[composite_key] = float(value.strip())
                             else:
-                                scores_json[key] = value
+                                scores_json[composite_key] = value
                         except (ValueError, TypeError):
-                            scores_json[key] = value
+                            scores_json[composite_key] = value
+                        
+                        # 记录字段来源映射（如果同一字段名来自多个Excel，使用数组）
+                        if key in field_source_json:
+                            existing_source = field_source_json[key]
+                            if isinstance(existing_source, str):
+                                field_source_json[key] = [existing_source, current_excel_filename] if current_excel_filename else existing_source
+                            elif isinstance(existing_source, list):
+                                if current_excel_filename and current_excel_filename not in existing_source:
+                                    existing_source.append(current_excel_filename)
+                        else:
+                            field_source_json[key] = current_excel_filename if current_excel_filename else key
                 
                 # 检查是否为总分字段
                 if (key == '总分' or key == 'total_score') and value is not None:
@@ -4930,6 +5214,7 @@ def save_group_scores(
             if operation_mode == 'append' and existing_record and existing_record.get('scores_json'):
                 try:
                     existing_json = json.loads(existing_record['scores_json']) if isinstance(existing_record['scores_json'], str) else existing_record['scores_json']
+                    # 合并时，复合键名不会冲突（因为包含Excel文件名）
                     merged_json = {**existing_json, **scores_json}
                     scores_json = merged_json
                     print(f"[save_group_scores] 合并已有成绩数据 - student_name={student_name}, 旧字段数={len(existing_json)}, 新字段数={len(scores_json)}")
@@ -4940,8 +5225,13 @@ def save_group_scores(
             elif operation_mode == 'replace' and existing_record and existing_record.get('scores_json'):
                 try:
                     existing_json = json.loads(existing_record['scores_json']) if isinstance(existing_record['scores_json'], str) else existing_record['scores_json']
-                    # 保留非本次上传的字段（其他Excel的字段）
-                    preserved = {k: v for k, v in existing_json.items() if k not in upload_field_set and k in keep_fields_from_excel_urls}
+                    # 替换模式下，仅删除当前Excel文件的字段，保留其他Excel的字段
+                    # 保留不以当前Excel文件名结尾的字段（即其他Excel的字段）
+                    if current_excel_filename:
+                        preserved = {k: v for k, v in existing_json.items() if not k.endswith(f"_{current_excel_filename}")}
+                    else:
+                        # 如果没有Excel文件名，保留不在本次上传字段集中的字段
+                        preserved = {k: v for k, v in existing_json.items() if k not in upload_field_set}
                     scores_json = {**preserved, **scores_json}
                     print(f"[save_group_scores] 替换模式保留其他excel字段 - student_name={student_name}, 保留字段数={len(preserved)}, 新字段数={len(scores_json)}")
                     app_logger.info(f"[save_group_scores] 替换模式保留其他excel字段 - student_name={student_name}")
@@ -4949,24 +5239,44 @@ def save_group_scores(
                     print(f"[save_group_scores] 解析已有JSON失败，使用新数据 - student_name={student_name}, error={e}")
                     app_logger.warning(f"[save_group_scores] 解析已有JSON失败，使用新数据 - student_name={student_name}, error={e}")
             
-            # 将scores_json转换为JSON字符串
+            # 在追加模式下，合并字段来源映射
+            existing_field_source_json = {}
+            if existing_record and existing_record.get('field_source_json'):
+                try:
+                    existing_field_source_json = json.loads(existing_record['field_source_json']) if isinstance(existing_record['field_source_json'], str) else existing_record['field_source_json']
+                except (json.JSONDecodeError, TypeError):
+                    existing_field_source_json = {}
+            
+            if operation_mode == 'append' and existing_record:
+                # 合并字段来源映射
+                field_source_json = {**existing_field_source_json, **field_source_json}
+            elif operation_mode == 'replace' and existing_record:
+                # 替换模式下，删除当前Excel的字段映射，保留其他的
+                preserved_sources = {k: v for k, v in existing_field_source_json.items() 
+                                    if (isinstance(v, str) and v != current_excel_filename) or
+                                       (isinstance(v, list) and current_excel_filename not in v)}
+                field_source_json = {**preserved_sources, **field_source_json}
+            
+            # 将scores_json和field_source_json转换为JSON字符串
             scores_json_str = json.dumps(scores_json, ensure_ascii=False)
+            field_source_json_str = json.dumps(field_source_json, ensure_ascii=False) if field_source_json else None
             
             is_update = existing_record is not None
             action = "更新" if is_update else "插入"
-            print(f"[save_group_scores] {action}第{idx+1}条成绩 - student_name={student_name}, group_name={group_name}, scores_json={scores_json_str}, total_score={total_score}, group_total_score={group_total_score}")
+            print(f"[save_group_scores] {action}第{idx+1}条成绩 - student_name={student_name}, group_name={group_name}, scores_json={scores_json_str}, field_source_json={field_source_json_str}, total_score={total_score}, group_total_score={group_total_score}")
             app_logger.info(f"[save_group_scores] {action}第{idx+1}条成绩 - student_name={student_name}, group_name={group_name}, total_score={total_score}, group_total_score={group_total_score}")
             
             try:
                 if existing_record:
                     update_detail_sql = (
                         "UPDATE ta_group_score_detail "
-                        "SET group_name = %s, scores_json = %s, total_score = %s, group_total_score = %s, updated_at = NOW() "
+                        "SET group_name = %s, scores_json = %s, field_source_json = %s, total_score = %s, group_total_score = %s, updated_at = NOW() "
                         "WHERE id = %s"
                     )
                     cursor.execute(update_detail_sql, (
                         group_name,
                         scores_json_str,
+                        field_source_json_str,
                         total_score,
                         group_total_score,
                         existing_record['id']
@@ -4979,6 +5289,7 @@ def save_group_scores(
                         student_id,
                         student_name,
                         scores_json_str,
+                        field_source_json_str,
                         total_score,
                         group_total_score
                     ))
@@ -5625,24 +5936,88 @@ async def api_get_group_scores(
         
         # 解析excel_file_url
         excel_file_url_parsed = None
+        excel_filenames = []  # 收集所有Excel文件名
         if header.get('excel_file_url'):
             try:
                 excel_file_url_parsed = json.loads(header['excel_file_url']) if isinstance(header['excel_file_url'], str) else header['excel_file_url']
+                # 提取Excel文件名列表
+                if isinstance(excel_file_url_parsed, dict):
+                    excel_filenames = list(excel_file_url_parsed.keys())
             except (json.JSONDecodeError, TypeError):
                 excel_file_url_parsed = header.get('excel_file_url')
+        
+        # 收集所有字段名（从scores_json中推断，支持复合键名）
+        # 先从第一条记录中收集所有字段名，用于解析
+        all_field_names = set()
+        if all_scores:
+            for score in all_scores:
+                if score.get('scores_json'):
+                    try:
+                        scores_data = json.loads(score['scores_json']) if isinstance(score['scores_json'], str) else score['scores_json']
+                        for key in scores_data.keys():
+                            # 如果是复合键名（包含下划线和Excel文件名），提取字段名
+                            if '_' in key:
+                                for excel_filename in excel_filenames:
+                                    if key.endswith(f"_{excel_filename}"):
+                                        field_name = key[:-len(f"_{excel_filename}")]
+                                        all_field_names.add(field_name)
+                                        break
+                                else:
+                                    # 如果没匹配到，可能是其他格式的复合键，使用原键名
+                                    all_field_names.add(key)
+                            else:
+                                # 简单字段名
+                                all_field_names.add(key)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
         
         # 按小组分组
         group_dict = {}
         for score in all_scores:
             group_name = score.get('group_name', '').strip() or '未分组'
             
-            # 解析scores_json
+            # 解析scores_json（支持复合键名）
             scores_data = {}
+            scores_data_full = {}  # 完整的scores_json（包含所有复合键名）
+            field_sources_detail = {}  # 字段来源详细信息
             if score.get('scores_json'):
                 try:
-                    scores_data = json.loads(score['scores_json']) if isinstance(score['scores_json'], str) else score['scores_json']
+                    scores_data_raw = json.loads(score['scores_json']) if isinstance(score['scores_json'], str) else score['scores_json']
+                    scores_data_full = scores_data_raw
+                    # 解析复合键名，转换为简单字段名
+                    # 优先使用简单字段名（兼容旧数据），如果没有则使用复合键名
+                    for field_name in all_field_names:
+                        found_sources = []
+                        # 优先使用简单字段名
+                        if field_name in scores_data_raw:
+                            scores_data[field_name] = scores_data_raw[field_name]
+                            found_sources.append({
+                                'excel_filename': None,  # 旧数据或单一来源
+                                'value': scores_data_raw[field_name]
+                            })
+                        else:
+                            # 尝试使用复合键名查找
+                            for excel_filename in excel_filenames:
+                                composite_key = f"{field_name}_{excel_filename}"
+                                if composite_key in scores_data_raw:
+                                    if field_name not in scores_data:
+                                        scores_data[field_name] = scores_data_raw[composite_key]  # 第一个作为默认值
+                                    found_sources.append({
+                                        'excel_filename': excel_filename,
+                                        'value': scores_data_raw[composite_key]
+                                    })
+                        
+                        # 记录字段来源信息
+                        if found_sources:
+                            field_sources_detail[field_name] = {
+                                'value': found_sources[0]['value'],  # 第一个作为默认值
+                                'sources': found_sources
+                            }
+                    # 同时保留原始的scores_json（包含复合键名），方便调试
+                    # scores_data 中现在包含解析后的简单字段名
                 except (json.JSONDecodeError, TypeError):
                     scores_data = {}
+                    scores_data_full = {}
             
             if group_name not in group_dict:
                 group_dict[group_name] = {
@@ -5658,7 +6033,9 @@ async def api_get_group_scores(
                 'student_name': score.get('student_name', ''),
                 'total_score': float(score['total_score']) if score.get('total_score') is not None else None,
                 'group_total_score': float(score['group_total_score']) if score.get('group_total_score') is not None else None,
-                'scores': scores_data
+                'scores': scores_data,  # 解析后的简单字段名（向后兼容）
+                'scores_json_full': scores_data_full,  # 完整的scores_json（包含所有复合键名）
+                'field_sources': field_sources_detail  # 字段来源详细信息
             }
             
             # 将动态字段也平铺到顶层（方便客户端使用）
