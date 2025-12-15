@@ -2795,7 +2795,7 @@ def parse_excel_file_url(excel_file_url):
 
 def save_student_scores(
     class_id: str,
-    exam_name: str,
+    exam_name: Optional[str],
     term: Optional[str] = None,
     remark: Optional[str] = None,
     scores: List[Dict] = None,
@@ -2837,8 +2837,14 @@ def save_student_scores(
     返回：
     - { success, score_header_id, inserted_count, updated_count, deleted_count, message }
     """
-    if not class_id or not exam_name:
-        return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '缺少必要参数 class_id 或 exam_name' }
+    if not class_id:
+        return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '缺少必要参数 class_id' }
+
+    # 兼容：exam_name 不再作为定位条件，但表结构 NOT NULL，仍需写入一个展示用字符串
+    provided_exam_name = exam_name
+    exam_name = (provided_exam_name or '').strip()
+    if not exam_name:
+        exam_name = '成绩'
     
     # 验证operation_mode
     if operation_mode not in ['append', 'replace']:
@@ -2875,8 +2881,8 @@ def save_student_scores(
 
         # 1. 插入或获取成绩表头
         # 约定：class_id + term 能定位一张成绩表；exam_name 仅作为展示字段保留，不作为定位条件
-        print(f"[save_student_scores] 查询成绩表头 - class_id={class_id}, term={term}（忽略exam_name={exam_name}）")
-        app_logger.info(f"[save_student_scores] 查询成绩表头 - class_id={class_id}, term={term}（忽略exam_name={exam_name}）")
+        print(f"[save_student_scores] 查询成绩表头 - class_id={class_id}, term={term}（忽略exam_name={provided_exam_name}）")
+        app_logger.info(f"[save_student_scores] 查询成绩表头 - class_id={class_id}, term={term}（忽略exam_name={provided_exam_name}）")
         if term is None:
             cursor.execute(
                 "SELECT id, excel_file_url "
@@ -2985,6 +2991,14 @@ def save_student_scores(
             # 更新表头信息（若存在）
             update_fields = []
             update_values = []
+            # exam_name 仅用于展示：如果客户端传了新值，则更新
+            if provided_exam_name is not None:
+                normalized_exam_name = str(provided_exam_name).strip()
+                if normalized_exam_name:
+                    update_fields.append("exam_name = %s")
+                    update_values.append(normalized_exam_name)
+                    print(f"[save_student_scores] 📝 将更新exam_name字段: {normalized_exam_name}")
+                    app_logger.info(f"[save_student_scores] 📝 将更新exam_name字段: {normalized_exam_name}")
             if remark is not None:
                 update_fields.append("remark = %s")
                 update_values.append(remark)
@@ -3607,7 +3621,7 @@ async def api_save_student_scores(request: Request):
     请求体 JSON (或multipart中的data字段):
     {
       "class_id": "class_1001",
-      "exam_name": "期中考试",
+      "exam_name": "期中考试",  // 可选（仅用于展示，不再作为定位条件；不传则使用默认值“成绩”）
       "term": "2025-2026-1",  // 可选
       "remark": "备注信息",    // 可选
       "excel_file_name": "成绩表.xlsx",  // 可选，Excel文件名
@@ -3921,8 +3935,8 @@ async def api_save_student_scores(request: Request):
     print(f"[student-scores/save] scores数量: {len(scores) if scores else 0}")
     app_logger.info(f"[student-scores/save] 解析后的参数: class_id={class_id}, exam_name={exam_name}, term={term}, operation_mode={operation_mode}, excel_file_name={excel_file_name}, excel_file_url={excel_file_url}, excel_file_description={excel_file_description}, excel_files数量={len(excel_files) if excel_files else 0}, fields数量={len(fields) if fields else 0}, scores数量={len(scores) if scores else 0}")
 
-    if not class_id or not exam_name:
-        error_msg = '缺少必要参数 class_id 或 exam_name'
+    if not class_id:
+        error_msg = '缺少必要参数 class_id'
         print(f"[student-scores/save] 错误: {error_msg}")
         app_logger.warning(f"[student-scores/save] {error_msg}")
         return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
