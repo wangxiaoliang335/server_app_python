@@ -4121,18 +4121,22 @@ async def api_get_student_scores(
                     if isinstance(comments_dict, dict) and comments_dict:
                         all_excel_filenames = {fn for fns in field_excel_map.values() for fn in fns if fn}
                         has_composite = False
+
                         if all_excel_filenames:
                             for k in comments_dict.keys():
                                 if any(k.endswith(f"_{fn}") for fn in all_excel_filenames):
                                     has_composite = True
                                     break
-                    else:
+                        else:
                             has_composite = any('_' in k for k in comments_dict.keys())
 
                         if has_composite:
                             if all_excel_filenames:
-                                filtered_comments = {k: v for k, v in comments_dict.items()
-                                                     if any(k.endswith(f"_{fn}") for fn in all_excel_filenames)}
+                                filtered_comments = {
+                                    k: v
+                                    for k, v in comments_dict.items()
+                                    if any(k.endswith(f"_{fn}") for fn in all_excel_filenames)
+                                }
                             else:
                                 filtered_comments = {k: v for k, v in comments_dict.items() if '_' in k}
                 except Exception:
@@ -4396,18 +4400,22 @@ async def api_get_student_score(
                 if isinstance(comments_dict, dict) and comments_dict:
                     all_excel_filenames = {fn for fns in field_excel_map.values() for fn in fns if fn}
                     has_composite = False
+
                     if all_excel_filenames:
                         for k in comments_dict.keys():
                             if any(k.endswith(f"_{fn}") for fn in all_excel_filenames):
                                 has_composite = True
                                 break
-                else:
+                    else:
                         has_composite = any('_' in k for k in comments_dict.keys())
 
                     if has_composite:
                         if all_excel_filenames:
-                            filtered_comments = {k: v for k, v in comments_dict.items()
-                                                 if any(k.endswith(f"_{fn}") for fn in all_excel_filenames)}
+                            filtered_comments = {
+                                k: v
+                                for k, v in comments_dict.items()
+                                if any(k.endswith(f"_{fn}") for fn in all_excel_filenames)
+                            }
                         else:
                             filtered_comments = {k: v for k, v in comments_dict.items() if '_' in k}
             except Exception:
