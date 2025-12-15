@@ -4055,6 +4055,10 @@ async def api_get_student_scores(
                 (score_header_id,)
             )
             fields = cursor.fetchall() or []
+            # 补充 score_header_id，便于前端直接使用
+            for f in fields:
+                if isinstance(f, dict) and 'score_header_id' not in f:
+                    f['score_header_id'] = score_header_id
             # 收集所有字段名（可能有重复，来自不同Excel）
             field_names = list({f['field_name'] for f in fields})  # 去重
             
@@ -4333,6 +4337,10 @@ async def api_get_student_score(
             (score_header_id,)
         )
         fields = cursor.fetchall() or []
+        # 补充 score_header_id，便于前端直接使用
+        for f in fields:
+            if isinstance(f, dict) and 'score_header_id' not in f:
+                f['score_header_id'] = score_header_id
         # 收集所有字段名（可能有重复，来自不同Excel）
         field_names = list({f['field_name'] for f in fields})  # 去重
         
