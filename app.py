@@ -4763,6 +4763,234 @@ async def api_set_student_score_comment(request: Request):
         print("[student-scores/set-comment] ========== 设置注释请求处理完成 ==========")
         print("=" * 80)
 
+
+@app.post("/student-scores/set-score")
+async def api_set_student_score_value(request: Request):
+    """
+    设置/更新特定学生特定字段的分数（更新 ta_student_score_detail.scores_json）
+
+    请求体 JSON:
+    {
+      "score_header_id": 1,               // 成绩表头ID（必需）
+      "student_name": "张三",              // 学生姓名（必需）
+      "student_id": "2024001",            // 学号（可选，如果提供会更精确匹配）
+      "field_name": "数学",                // 字段名称（必需）
+      "excel_filename": "期中成绩单.xlsx",  // Excel文件名（可选；不传则尝试从字段定义表推断）
+      "score": 98                          // 分数（必需；传 null/空字符串表示删除该字段的分数）
+    }
+
+    规则：
+    - 有 excel_filename：使用复合键名 field_name_excel_filename 写入，并清理同名简单键 field_name（避免重复）
+    - 无 excel_filename：写入简单键 field_name
+    - 更新后会同步重算 total_score（用于排序）
+    """
+    print("=" * 80)
+    print("[student-scores/set-score] ========== 收到设置分数请求 ==========")
+
+    def _parse_score_value(v):
+        """尽量把输入转换为数值；失败则按原值保留。"""
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            try:
+                return float(s)
+            except ValueError:
+                return s
+        return v
+
+    def _recalc_total_score(scores_dict: dict) -> Optional[float]:
+        """复用 save_student_scores 的策略：优先使用“总分/total”字段，否则求和。"""
+        total = None
+        try:
+            for k, v in (scores_dict or {}).items():
+                if ('总分' in str(k)) or ('total' in str(k).lower()):
+                    if isinstance(v, (int, float)):
+                        total = float(v)
+                    elif isinstance(v, str):
+                        try:
+                            total = float(v.strip())
+                        except Exception:
+                            pass
+            if total is not None:
+                return total
+
+            s = 0.0
+            has_number = False
+            for _, v in (scores_dict or {}).items():
+                if isinstance(v, (int, float)):
+                    s += float(v)
+                    has_number = True
+                elif isinstance(v, str):
+                    try:
+                        s += float(v.strip())
+                        has_number = True
+                    except Exception:
+                        pass
+            return s if has_number else None
+        except Exception:
+            return None
+
+    try:
+        body = await request.json()
+        score_header_id = body.get('score_header_id')
+        student_name = body.get('student_name')
+        student_id = body.get('student_id')  # 可选
+        field_name = body.get('field_name')
+        excel_filename = body.get('excel_filename')  # 可选
+        score_raw = body.get('score')
+
+        # 参数验证
+        if not score_header_id:
+            return safe_json_response({'message': '缺少必需参数: score_header_id', 'code': 400}, status_code=400)
+        if not student_name:
+            return safe_json_response({'message': '缺少必需参数: student_name', 'code': 400}, status_code=400)
+        if not field_name:
+            return safe_json_response({'message': '缺少必需参数: field_name', 'code': 400}, status_code=400)
+        # score 字段必须出现（允许为 null/空字符串，用于删除）
+        if 'score' not in body:
+            return safe_json_response({'message': '缺少必需参数: score', 'code': 400}, status_code=400)
+
+        print(f"[student-scores/set-score] 参数 - score_header_id: {score_header_id}, student_name: {student_name}, student_id: {student_id}, field_name: {field_name}, excel_filename: {excel_filename}, score: {score_raw}")
+        app_logger.info(f"[student-scores/set-score] 收到设置分数请求 - score_header_id: {score_header_id}, student_name: {student_name}, student_id: {student_id}, field_name: {field_name}, excel_filename: {excel_filename}")
+
+        connection = get_db_connection()
+        if connection is None:
+            return safe_json_response({'message': '数据库连接失败', 'code': 500}, status_code=500)
+
+        cursor = connection.cursor(dictionary=True)
+
+        # 如果没有提供 excel_filename，尝试从字段定义中查找
+        if not excel_filename:
+            cursor.execute(
+                "SELECT excel_filename FROM ta_student_score_field "
+                "WHERE score_header_id = %s AND field_name = %s "
+                "LIMIT 1",
+                (score_header_id, field_name)
+            )
+            field_result = cursor.fetchone()
+            if field_result and field_result.get('excel_filename'):
+                excel_filename = field_result['excel_filename']
+                print(f"[student-scores/set-score] 从字段定义中获取 excel_filename: {excel_filename}")
+
+        score_key = f"{field_name}_{excel_filename}" if excel_filename else field_name
+
+        # 查询学生成绩记录
+        if student_id:
+            cursor.execute(
+                "SELECT id, scores_json, total_score FROM ta_student_score_detail "
+                "WHERE score_header_id = %s AND student_name = %s AND student_id = %s "
+                "LIMIT 1",
+                (score_header_id, student_name, student_id)
+            )
+        else:
+            cursor.execute(
+                "SELECT id, scores_json, total_score FROM ta_student_score_detail "
+                "WHERE score_header_id = %s AND student_name = %s "
+                "LIMIT 1",
+                (score_header_id, student_name)
+            )
+
+        record = cursor.fetchone()
+        if not record:
+            return safe_json_response({'message': f'未找到学生成绩记录: {student_name}', 'code': 404}, status_code=404)
+
+        record_id = record['id']
+        existing_scores_json = record.get('scores_json')
+
+        # 解析现有的成绩JSON
+        if existing_scores_json:
+            if isinstance(existing_scores_json, str):
+                try:
+                    scores_dict = json.loads(existing_scores_json)
+                except json.JSONDecodeError:
+                    scores_dict = {}
+            else:
+                scores_dict = existing_scores_json
+        else:
+            scores_dict = {}
+
+        # 更新或删除分数字段
+        score_value = _parse_score_value(score_raw)
+        if score_value is None:
+            scores_dict.pop(score_key, None)
+            if excel_filename:
+                scores_dict.pop(field_name, None)
+            else:
+                scores_dict.pop(field_name, None)
+        else:
+            scores_dict[score_key] = score_value
+            if excel_filename:
+                scores_dict.pop(field_name, None)
+            else:
+                scores_dict[field_name] = score_value
+
+        # 重算 total_score
+        new_total_score = _recalc_total_score(scores_dict)
+
+        scores_json_str = json.dumps(scores_dict, ensure_ascii=False)
+        cursor.execute(
+            "UPDATE ta_student_score_detail "
+            "SET scores_json = %s, total_score = %s, updated_at = NOW() "
+            "WHERE id = %s",
+            (scores_json_str, new_total_score, record_id)
+        )
+        connection.commit()
+
+        print(f"[student-scores/set-score] ✅ 分数设置成功 - record_id: {record_id}, field_name: {field_name}, score: {score_raw}")
+        app_logger.info(f"[student-scores/set-score] ✅ 分数设置成功 - record_id: {record_id}, student_name: {student_name}, field_name: {field_name}, score: {score_raw}")
+
+        return safe_json_response({
+            'message': '分数设置成功',
+            'code': 200,
+            'data': {
+                'record_id': record_id,
+                'student_name': student_name,
+                'field_name': field_name,
+                'excel_filename': excel_filename,
+                'score_key': score_key,
+                'score': score_value,
+                'total_score': new_total_score,
+                'scores_json': scores_dict
+            }
+        })
+
+    except json.JSONDecodeError:
+        error_msg = '请求体JSON格式错误'
+        print(f"[student-scores/set-score] ❌ {error_msg}")
+        app_logger.error(f"[student-scores/set-score] ❌ {error_msg}")
+        return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
+    except mysql.connector.Error as e:
+        error_msg = f"数据库错误: {e}"
+        print(f"[student-scores/set-score] ❌ {error_msg}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[student-scores/set-score] 错误堆栈:\n{traceback_str}")
+        app_logger.error(f"[student-scores/set-score] ❌ {error_msg}\n{traceback_str}")
+        return safe_json_response({'message': f'数据库错误: {str(e)}', 'code': 500}, status_code=500)
+    except Exception as e:
+        error_msg = f"未知错误: {e}"
+        print(f"[student-scores/set-score] ❌ {error_msg}")
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"[student-scores/set-score] 错误堆栈:\n{traceback_str}")
+        app_logger.error(f"[student-scores/set-score] ❌ {error_msg}\n{traceback_str}")
+        return safe_json_response({'message': f'未知错误: {str(e)}', 'code': 500}, status_code=500)
+    finally:
+        if 'cursor' in locals() and cursor:
+            cursor.close()
+            print("[student-scores/set-score] 🔒 游标已关闭")
+        if 'connection' in locals() and connection and connection.is_connected():
+            connection.close()
+            print("[student-scores/set-score] 🔒 数据库连接已关闭")
+            app_logger.info(f"[student-scores/set-score] 数据库连接已关闭")
+        print("[student-scores/set-score] ========== 设置分数请求处理完成 ==========")
+        print("=" * 80)
+
 # ===== 小组管理表 API =====
 def save_group_scores(
     class_id: str,
