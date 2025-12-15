@@ -4084,6 +4084,7 @@ async def api_get_student_scores(
                 # 仅返回结构化成绩信息（scores_json_full + 注释等），避免重复下发
                 score_dict = {
                     'id': row['id'],
+                    'score_header_id': score_header_id,
                     'student_id': row.get('student_id'),
                     'student_name': row.get('student_name')
                 }
@@ -4160,6 +4161,7 @@ async def api_get_student_scores(
             
             header_dict = {
                 'id': header['id'],
+                'score_header_id': header['id'],
                 'class_id': header['class_id'],
                 'exam_name': header['exam_name'],
                 'term': header.get('term'),
@@ -4365,6 +4367,7 @@ async def api_get_student_score(
             # 仅返回结构化成绩信息（scores_json_full + 注释等），避免重复下发
             score_dict = {
                 'id': row['id'],
+                'score_header_id': score_header_id,
                 'student_id': row.get('student_id'),
                 'student_name': row.get('student_name')
             }
@@ -4455,6 +4458,7 @@ async def api_get_student_score(
         
         result = {
             'id': header['id'],
+            'score_header_id': header['id'],
             'class_id': header['class_id'],
             'exam_name': header['exam_name'],
             'term': header.get('term'),
