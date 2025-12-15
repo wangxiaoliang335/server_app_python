@@ -4803,6 +4803,22 @@ async def api_set_student_score_value(request: Request):
                 return s
         return v
 
+    def _to_float_or_none(v) -> Optional[float]:
+        """把值尽量转成 float；失败返回 None。"""
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            try:
+                return float(s)
+            except Exception:
+                return None
+        return None
+
     def _excel_filename_base(name: Optional[str]) -> str:
         """把 excel_filename 归一到“去扩展名”的基础名，用于清理重复键。"""
         if not name:
@@ -4845,36 +4861,88 @@ async def api_set_student_score_value(request: Request):
         return keys
 
     def _recalc_total_score(scores_dict: dict) -> Optional[float]:
-        """复用 save_student_scores 的策略：优先使用“总分/total”字段，否则求和。"""
-        total = None
+        """
+        重算记录的 total_score（用于排序）：
+        - 如果存在多个 “总分_* / total_*” 数值字段：取它们的和
+        - 否则：对所有数值字段求和（排除总分字段本身）
+        """
         try:
+            totals: List[float] = []
             for k, v in (scores_dict or {}).items():
-                if ('总分' in str(k)) or ('total' in str(k).lower()):
-                    if isinstance(v, (int, float)):
-                        total = float(v)
-                    elif isinstance(v, str):
-                        try:
-                            total = float(v.strip())
-                        except Exception:
-                            pass
-            if total is not None:
-                return total
+                ks = str(k)
+                if ks.startswith("总分") or ks.lower().startswith("total"):
+                    fv = _to_float_or_none(v)
+                    if fv is not None:
+                        totals.append(fv)
+            if totals:
+                return float(sum(totals))
 
             s = 0.0
             has_number = False
-            for _, v in (scores_dict or {}).items():
-                if isinstance(v, (int, float)):
-                    s += float(v)
+            for k, v in (scores_dict or {}).items():
+                ks = str(k)
+                if ks.startswith("总分") or ks.lower().startswith("total"):
+                    continue
+                fv = _to_float_or_none(v)
+                if fv is not None:
+                    s += fv
                     has_number = True
-                elif isinstance(v, str):
-                    try:
-                        s += float(v.strip())
-                        has_number = True
-                    except Exception:
-                        pass
             return s if has_number else None
         except Exception:
             return None
+
+    def _recalc_total_for_excel(scores_dict: dict, excel_filename: Optional[str]) -> Optional[float]:
+        """
+        对指定 excel_filename 重新计算 “总分_<excel>”：
+        - 清理同一 excel 的 “总分_<excel>” 旧变体（含是否带 .xlsx/.xls）
+        - 再把该 excel 下的所有数值字段求和写回
+        """
+        if not excel_filename:
+            return None
+        fn = str(excel_filename).strip()
+        if not fn:
+            return None
+
+        base = _excel_filename_base(fn)
+        variants = {fn, base}
+        if base:
+            variants.add(f"{base}.xlsx")
+            variants.add(f"{base}.xls")
+            variants.add(f"{base}.csv")
+        variants = {v.strip() for v in variants if v and str(v).strip()}
+        if not variants:
+            return None
+
+        # 先清理旧的总分键（同一 excel 的变体）
+        for var in list(variants):
+            scores_dict.pop(f"总分_{var}", None)
+            scores_dict.pop(f"total_{var}", None)
+
+        # 求和：只统计该 excel 的字段（key 以 _<excel> 结尾），排除总分自身
+        s = 0.0
+        has_number = False
+        for k, v in list((scores_dict or {}).items()):
+            ks = str(k)
+            if ks.startswith("总分_") or ks.lower().startswith("total_"):
+                continue
+            matched = False
+            for var in variants:
+                if ks.endswith(f"_{var}"):
+                    matched = True
+                    break
+            if not matched:
+                continue
+            fv = _to_float_or_none(v)
+            if fv is not None:
+                s += fv
+                has_number = True
+
+        if not has_number:
+            return None
+
+        # 只保留一个 canonical 的总分键（用 fn 本身）
+        scores_dict[f"总分_{fn}"] = float(s)
+        return float(s)
 
     try:
         body = await request.json()
@@ -4975,6 +5043,10 @@ async def api_set_student_score_value(request: Request):
             if not excel_filename:
                 scores_dict[field_name] = score_value
 
+        # 每次修改字段后，重算该 excel 对应的 “总分_<excel>”
+        # 这样可以避免出现：总分_学生体质统计表 与 总分_学生体质统计表.xlsx 等重复/不一致
+        recalced_excel_total = _recalc_total_for_excel(scores_dict, excel_filename)
+
         # 重算 total_score
         new_total_score = _recalc_total_score(scores_dict)
 
@@ -5000,6 +5072,7 @@ async def api_set_student_score_value(request: Request):
                 'excel_filename': excel_filename,
                 'score_key': score_key,
                 'score': score_value,
+                'excel_total_score': recalced_excel_total,
                 'total_score': new_total_score,
                 'scores_json': scores_dict
             }
