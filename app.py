@@ -4803,6 +4803,47 @@ async def api_set_student_score_value(request: Request):
                 return s
         return v
 
+    def _excel_filename_base(name: Optional[str]) -> str:
+        """把 excel_filename 归一到“去扩展名”的基础名，用于清理重复键。"""
+        if not name:
+            return ""
+        s = str(name).strip()
+        if not s:
+            return ""
+        lower = s.lower()
+        if lower.endswith(".xlsx"):
+            return s[:-5]
+        if lower.endswith(".xls"):
+            return s[:-4]
+        if lower.endswith(".csv"):
+            return s[:-4]
+        return s
+
+    def _candidate_score_keys(field: str, excel_filename: Optional[str]) -> set:
+        """
+        生成该字段可能存在的所有 key（用于清理重复/旧数据）。
+        例如：field='纪律', excel='学生体质统计表.xlsx'
+        会包含：
+        - '纪律'
+        - '纪律_学生体质统计表.xlsx'
+        - '纪律_学生体质统计表'
+        - '纪律_学生体质统计表.xls'
+        """
+        keys = set()
+        field_s = str(field).strip()
+        if not field_s:
+            return keys
+        keys.add(field_s)
+
+        if excel_filename:
+            fn = str(excel_filename).strip()
+            base = _excel_filename_base(fn)
+            for suffix in {fn, base, f"{base}.xlsx" if base else "", f"{base}.xls" if base else ""}:
+                suffix = (suffix or "").strip()
+                if suffix:
+                    keys.add(f"{field_s}_{suffix}")
+        return keys
+
     def _recalc_total_score(scores_dict: dict) -> Optional[float]:
         """复用 save_student_scores 的策略：优先使用“总分/total”字段，否则求和。"""
         total = None
@@ -4877,6 +4918,9 @@ async def api_set_student_score_value(request: Request):
                 excel_filename = field_result['excel_filename']
                 print(f"[student-scores/set-score] 从字段定义中获取 excel_filename: {excel_filename}")
 
+        if isinstance(excel_filename, str):
+            excel_filename = excel_filename.strip()
+
         score_key = f"{field_name}_{excel_filename}" if excel_filename else field_name
 
         # 查询学生成绩记录
@@ -4916,17 +4960,19 @@ async def api_set_student_score_value(request: Request):
 
         # 更新或删除分数字段
         score_value = _parse_score_value(score_raw)
+        candidate_keys = _candidate_score_keys(field_name, excel_filename)
         if score_value is None:
-            scores_dict.pop(score_key, None)
-            if excel_filename:
-                scores_dict.pop(field_name, None)
-            else:
-                scores_dict.pop(field_name, None)
+            # 删除：清理所有可能的重复键
+            for k in candidate_keys:
+                scores_dict.pop(k, None)
         else:
+            # 写入：先清理同字段的旧键（含是否带扩展名的 excel_filename 变体），只保留最新插入的 key
+            for k in candidate_keys:
+                if k != score_key:
+                    scores_dict.pop(k, None)
             scores_dict[score_key] = score_value
-            if excel_filename:
-                scores_dict.pop(field_name, None)
-            else:
+            # 无 excel_filename 时，兼容旧逻辑：确保简单键存在
+            if not excel_filename:
                 scores_dict[field_name] = score_value
 
         # 重算 total_score
