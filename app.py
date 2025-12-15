@@ -7182,6 +7182,182 @@ def _normalize_is_administrator(value: Optional[Union[str, int, bool]]) -> Optio
     return str(value)
 
 
+def _normalize_teachings_payload(data: Dict[str, Any]) -> List[Dict[str, str]]:
+    """
+    归一化“任教关系列表”输入，统一输出：
+    [
+      {"grade_level": "...", "grade": "...", "subject": "...", "class_taught": "..."}
+    ]
+    兼容入参：
+    - teachings / teaching_assignments / teachingAssignments
+    - 以及旧字段：grade_level/grade/subject/class_taught（作为兜底的一条）
+    """
+    raw = (
+        data.get("teachings")
+        or data.get("teaching_assignments")
+        or data.get("teachingAssignments")
+    )
+
+    # 允许前端把列表当字符串传
+    if isinstance(raw, str) and raw.strip():
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = None
+
+    items: List[Dict[str, Any]] = raw if isinstance(raw, list) else []
+
+    def _get_str(v: Any) -> str:
+        if v is None:
+            return ""
+        return str(v).strip()
+
+    teachings: List[Dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        grade_level = _get_str(item.get("grade_level") or item.get("gradeLevel"))
+        grade = _get_str(item.get("grade"))
+        subject = _get_str(item.get("subject"))
+        class_taught = _get_str(item.get("class_taught") or item.get("classTaught"))
+        if not (grade_level or grade or subject or class_taught):
+            continue
+        teachings.append(
+            {
+                "grade_level": grade_level,
+                "grade": grade,
+                "subject": subject,
+                "class_taught": class_taught,
+            }
+        )
+
+    # 兜底：旧字段作为一条任教关系
+    if not teachings:
+        fallback = {
+            "grade_level": _get_str(data.get("grade_level")),
+            "grade": _get_str(data.get("grade")),
+            "subject": _get_str(data.get("subject")),
+            "class_taught": _get_str(data.get("class_taught")),
+        }
+        if any(fallback.values()):
+            teachings.append(fallback)
+
+    # 去重（保持顺序）
+    seen = set()
+    deduped: List[Dict[str, str]] = []
+    for t in teachings:
+        key = (
+            t.get("grade_level", ""),
+            t.get("grade", ""),
+            t.get("subject", ""),
+            t.get("class_taught", ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(t)
+    return deduped
+
+
+def _replace_user_teachings(cursor, phone: str, teachings: List[Dict[str, str]]) -> None:
+    """
+    用 teach 关系表保存“一个老师多条任教记录”。
+    - 采用 delete + insert（带 sort_order），保持前端顺序
+    """
+    phone = str(phone or "").strip()
+    if not phone:
+        return
+
+    try:
+        cursor.execute("DELETE FROM ta_user_teachings WHERE phone = %s", (phone,))
+        if teachings:
+            insert_sql = """
+                INSERT INTO ta_user_teachings
+                (phone, grade_level, grade, subject, class_taught, sort_order)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """
+            for idx, t in enumerate(teachings):
+                cursor.execute(
+                    insert_sql,
+                    (
+                        phone,
+                        (t.get("grade_level") or "").strip(),
+                        (t.get("grade") or "").strip(),
+                        (t.get("subject") or "").strip(),
+                        (t.get("class_taught") or "").strip(),
+                        int(idx),
+                    ),
+                )
+    except Error as e:
+        raise
+
+
+@app.post("/updateUserTeachings")
+async def update_user_teachings(request: Request):
+    """
+    更新“一个老师多条任教记录”（写入 ta_user_teachings）。
+
+    请求体 JSON（兼容多种字段名）：
+    {
+      "phone": "138xxxx0000",              // phone 与 userid 二选一
+      "userid": 123,                       // 可选：从 ta_user.id 反查 phone
+      "teachings": [
+        {"grade_level":"小学","grade":"三年级","subject":"语文","class_taught":"3-1"},
+        {"grade_level":"小学","grade":"三年级","subject":"数学","class_taught":"3-2"}
+      ]
+      // 兼容别名：teaching_assignments / teachingAssignments
+      // 兼容旧字段兜底：grade_level/grade/subject/class_taught（当 teachings 为空时会作为一条记录）
+    }
+
+    返回：
+    { "data": { "message": "...", "code": 200, "teachings": [...] } }
+    """
+    data = await request.json()
+    phone = (data.get("phone") or "").strip()
+    userid = data.get("userid")
+
+    connection = get_db_connection()
+    if connection is None:
+        return JSONResponse({'data': {'message': '数据库连接失败', 'code': 500}}, status_code=500)
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+
+        # 允许只传 userid
+        if not phone and userid is not None:
+            cursor.execute("SELECT phone FROM ta_user WHERE id = %s", (userid,))
+            row = cursor.fetchone()
+            if not row or not row.get("phone"):
+                return JSONResponse({'data': {'message': '未找到该用户', 'code': 404}}, status_code=404)
+            phone = str(row["phone"]).strip()
+
+        if not phone:
+            return JSONResponse({'data': {'message': '缺少必要参数 phone 或 userid', 'code': 400}}, status_code=400)
+
+        teachings = _normalize_teachings_payload(data)
+        if not teachings:
+            return JSONResponse({'data': {'message': 'teachings 不能为空', 'code': 400}}, status_code=400)
+
+        _replace_user_teachings(cursor, phone, teachings)
+
+        connection.commit()
+        return safe_json_response({'data': {'message': '任教信息更新成功', 'code': 200, 'teachings': teachings}})
+    except Error as e:
+        # 1062: Duplicate entry（唯一约束冲突）
+        if getattr(e, "errno", None) == 1062:
+            connection.rollback()
+            return JSONResponse({'data': {'message': '任教记录重复（同一教师、学段/年级/科目/班级不能重复）', 'code': 409}}, status_code=409)
+        connection.rollback()
+        app_logger.error(f"数据库错误: 更新任教信息失败 phone={phone}: {e}")
+        return JSONResponse({'data': {'message': '任教信息更新失败', 'code': 500}}, status_code=500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+
+
 @app.post("/updateUserAdministrator")
 async def update_user_administrator(request: Request):
     data = await request.json()
@@ -7286,6 +7462,22 @@ async def list_userInfo(request: Request):
         cursor.execute(base_query, (phone_filter,))
         userinfo = cursor.fetchall()
 
+        # 附加任教关系列表（teachings[]），用于支持一个老师多个班级/科目
+        for user in userinfo:
+            teachings: List[Dict[str, Any]] = []
+            cursor.execute(
+                """
+                SELECT grade_level, grade, subject, class_taught, sort_order
+                FROM ta_user_teachings
+                WHERE phone = %s
+                ORDER BY sort_order ASC, id ASC
+                """,
+                (phone_filter,),
+            )
+            teachings = cursor.fetchall() or []
+
+            user["teachings"] = teachings
+
         # 附加头像Base64字段
         for user in userinfo:
             avatar_path = user.get("avatar")
@@ -7317,6 +7509,12 @@ async def list_userInfo(request: Request):
         if connection and connection.is_connected():
             connection.close()
             app_logger.info("Database connection closed after fetching userinfo.")
+
+
+# 兼容路由别名：部分客户端可能仍调用 /getUserInfo
+@app.get("/getUserInfo")
+async def get_user_info_alias(request: Request):
+    return await list_userInfo(request)
 
 def generate_class_code(connection, schoolid):
     """
@@ -8070,6 +8268,14 @@ async def add_teacher(request: Request):
         cursor.execute("SELECT phone FROM ta_user_details WHERE phone = %s", (data.get('phone'),))
         user_exists = cursor.fetchone()
 
+        # 2.1 解析“多条任教记录”（可选）
+        teachings = _normalize_teachings_payload(data)
+        # 不再回填/依赖 ta_user_details 的单值字段；若前端仍传旧字段则照常写入
+        grade_level_val = data.get('grade_level')
+        grade_val = data.get('grade')
+        subject_val = data.get('subject')
+        class_taught_val = data.get('class_taught')
+
         if user_exists:
             # 已存在 -> 更新信息
             sql_update_user_details = """
@@ -8083,10 +8289,10 @@ async def add_teacher(request: Request):
                 data.get('sex'),
                 data.get('address'),
                 data.get('school_name'),
-                data.get('grade_level'),
-                data.get('grade'),
-                data.get('subject'),
-                data.get('class_taught'),
+                grade_level_val,
+                grade_val,
+                subject_val,
+                class_taught_val,
                 str(is_admin_flag),
                 data.get('id_card'),  # 教师表的 id_card 对应用户表的 id_number
                 data.get('phone')
@@ -8106,14 +8312,18 @@ async def add_teacher(request: Request):
                 data.get('sex'),
                 data.get('address'),
                 data.get('school_name'),
-                data.get('grade_level'),
-                data.get('grade'),
-                data.get('subject'),
-                data.get('class_taught'),
+                grade_level_val,
+                grade_val,
+                subject_val,
+                class_taught_val,
                 str(is_admin_flag),
                 '',  # avatar 默认空字符串
                 data.get('id_card')
             ))
+
+        # 2.2 写入任教关系表
+        if teachings:
+            _replace_user_teachings(cursor, str(data.get('phone') or '').strip(), teachings)
         
         connection.commit()
         
@@ -8121,6 +8331,10 @@ async def add_teacher(request: Request):
         teacher_info = cursor.fetchone()
         return safe_json_response({'data': {'message': '新增教师成功', 'code': 200, 'teacher': teacher_info}})
     except Error as e:
+        # 1062: Duplicate entry（唯一约束冲突）
+        if getattr(e, "errno", None) == 1062:
+            connection.rollback()
+            return JSONResponse({'data': {'message': '任教记录重复（同一教师、学段/年级/科目/班级不能重复）', 'code': 409}}, status_code=409)
         connection.rollback()
         app_logger.error(f"Database error during adding teacher: {e}")
         return JSONResponse({'data': {'message': '新增教师失败', 'code': 500}}, status_code=500)
