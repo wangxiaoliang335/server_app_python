@@ -3987,7 +3987,6 @@ async def api_get_student_scores(
                 "url": "https://..."
               }
             ],
-            "excel_file_url_raw": "{\"期中成绩单.xlsx\": \"https://...\", \"学生体质统计表.xlsx\": \"https://...\"}",
             "created_at": "...",
             "updated_at": "...",
             "fields": [...],
@@ -3996,10 +3995,10 @@ async def api_get_student_scores(
                 "id": 1,
                 "student_id": "2024001",
                 "student_name": "张三",
-                "chinese": 100,
-                "math": 89,
-                "english": 95,
-                "total_score": 284
+                "scores_json_full": {
+                  "语文_期中成绩单.xlsx": 100,
+                  "数学_期中成绩单.xlsx": 89
+                }
               },
               ...
             ]
@@ -4082,11 +4081,11 @@ async def api_get_student_scores(
             # 解析JSON字段并构建成绩列表
             scores = []
             for row in score_rows:
+                # 仅返回结构化成绩信息（scores_json_full + 注释等），避免重复下发
                 score_dict = {
                     'id': row['id'],
                     'student_id': row.get('student_id'),
-                    'student_name': row.get('student_name'),
-                    'total_score': float(row['total_score']) if row['total_score'] is not None else None
+                    'student_name': row.get('student_name')
                 }
                 
                 # 解析成绩JSON字段（处理复合键名：字段名_Excel文件名）
@@ -4096,57 +4095,7 @@ async def api_get_student_scores(
                             scores_data = json.loads(row['scores_json'])
                         else:
                             scores_data = row['scores_json']
-                        
-                        # 解析 field_source_json（字段名到Excel文件名的映射）
-                        field_source_data = {}
-                        if row.get('field_source_json'):
-                            try:
-                                if isinstance(row['field_source_json'], str):
-                                    field_source_data = json.loads(row['field_source_json'])
-                                else:
-                                    field_source_data = row['field_source_json']
-                            except (json.JSONDecodeError, TypeError):
-                                pass
-                        
-                        # 将JSON中的字段添加到score_dict中
-                        # 支持两种方式：1. 使用复合键名查找 2. 使用简单字段名（如果有映射）
-                        # 同时收集所有来源的值（用于返回详细信息）
-                        field_sources_detail = {}  # 记录每个字段的所有来源值
-                        for field_name in field_names:
-                            # 优先使用简单字段名（兼容旧数据）
-                            if field_name in scores_data:
-                                score_dict[field_name] = scores_data[field_name]
-                                # 记录来源信息
-                                field_sources_detail[field_name] = {
-                                    'value': scores_data[field_name],
-                                    'sources': [field_source_data.get(field_name, 'unknown')] if field_source_data else ['unknown']
-                                }
-                            else:
-                                # 尝试使用复合键名查找
-                                excel_filenames = field_excel_map.get(field_name, [])
-                                found_value = None
-                                found_sources = []
-                                # 收集所有来源的值
-                                for excel_filename in excel_filenames:
-                                    composite_key = f"{field_name}_{excel_filename}"
-                                    if composite_key in scores_data:
-                                        if found_value is None:
-                                            found_value = scores_data[composite_key]  # 第一个作为默认值
-                                        found_sources.append({
-                                            'excel_filename': excel_filename,
-                                            'value': scores_data[composite_key]
-                                        })
-                                if found_value is not None:
-                                    score_dict[field_name] = found_value
-                                    # 记录所有来源信息
-                                    field_sources_detail[field_name] = {
-                                        'value': found_value,
-                                        'sources': found_sources if found_sources else [field_source_data.get(field_name, 'unknown')] if field_source_data else ['unknown']
-                                    }
-                        
-                        # 添加字段来源详细信息（供客户端区分不同Excel文件的相同字段）
-                        score_dict['field_sources'] = field_sources_detail
-                        # 同时返回完整的scores_json（包含所有复合键名），方便客户端直接访问
+                        # 仅返回完整的scores_json（包含所有复合键名），由客户端按复合键名取值
                         score_dict['scores_json_full'] = scores_data
                     except (json.JSONDecodeError, TypeError) as e:
                         print(f"[api_get_student_scores] 解析JSON失败: {e}, scores_json={row.get('scores_json')}")
@@ -4164,28 +4113,32 @@ async def api_get_student_scores(
                         print(f"[api_get_student_scores] 解析注释JSON失败: {e}, comments_json={row.get('comments_json')}")
                         app_logger.warning(f"[api_get_student_scores] 解析注释JSON失败: {e}")
                 
-                # 为每个字段添加注释（如果存在）
-                # 支持简单字段名（兼容旧数据）和复合键名
-                for field_name in field_names:
-                    comment_key = f"{field_name}_comment"
-                    # 优先使用简单字段名（兼容旧数据）
-                    if field_name in comments_dict:
-                        score_dict[comment_key] = comments_dict[field_name]
+                # 仅返回去重后的 comments：
+                # - 如果存在复合键（字段名_Excel文件名），则只返回复合键，避免与简单键重复
+                # - 否则（旧数据）保留原样
+                filtered_comments = comments_dict
+                try:
+                    if isinstance(comments_dict, dict) and comments_dict:
+                        all_excel_filenames = {fn for fns in field_excel_map.values() for fn in fns if fn}
+                        has_composite = False
+                        if all_excel_filenames:
+                            for k in comments_dict.keys():
+                                if any(k.endswith(f"_{fn}") for fn in all_excel_filenames):
+                                    has_composite = True
+                                    break
                     else:
-                        # 尝试使用复合键名查找
-                        excel_filenames = field_excel_map.get(field_name, [])
-                        found_comment = None
-                        # 如果字段有多个来源，优先使用第一个
-                        for excel_filename in excel_filenames:
-                            composite_comment_key = f"{field_name}_{excel_filename}"
-                            if composite_comment_key in comments_dict:
-                                found_comment = comments_dict[composite_comment_key]
-                                break  # 找到第一个就退出
-                        if found_comment is not None:
-                            score_dict[comment_key] = found_comment
-                
-                # 同时返回完整的注释对象（可选，方便前端使用）
-                score_dict['comments'] = comments_dict
+                            has_composite = any('_' in k for k in comments_dict.keys())
+
+                        if has_composite:
+                            if all_excel_filenames:
+                                filtered_comments = {k: v for k, v in comments_dict.items()
+                                                     if any(k.endswith(f"_{fn}") for fn in all_excel_filenames)}
+                            else:
+                                filtered_comments = {k: v for k, v in comments_dict.items() if '_' in k}
+                except Exception:
+                    filtered_comments = comments_dict
+
+                score_dict['comments'] = filtered_comments
                 
                 scores.append(score_dict)
             
@@ -4208,7 +4161,6 @@ async def api_get_student_scores(
                 'term': header.get('term'),
                 'remark': header.get('remark'),
                 'excel_file_url': excel_file_urls,  # 返回数组格式
-                'excel_file_url_raw': excel_file_url_raw,  # 保留原始值（可选，用于兼容）
                 'created_at': created_at,
                 'updated_at': updated_at,
                 'fields': fields,  # 字段定义列表
@@ -4302,7 +4254,6 @@ async def api_get_student_score(
             "url": "https://..."
           }
         ],
-        "excel_file_url_raw": "{\"期中成绩单.xlsx\": \"https://...\", \"学生体质统计表.xlsx\": \"https://...\"}",
         "created_at": "...",
         "updated_at": "...",
         "fields": [...],
@@ -4311,10 +4262,10 @@ async def api_get_student_score(
             "id": 1,
             "student_id": "2024001",
             "student_name": "张三",
-            "chinese": 100,
-            "math": 89,
-            "english": 95,
-            "total_score": 284
+            "scores_json_full": {
+              "语文_期中成绩单.xlsx": 100,
+              "数学_期中成绩单.xlsx": 89
+            }
           },
           ...
         ]
@@ -4407,11 +4358,11 @@ async def api_get_student_score(
         # 解析JSON字段并构建成绩列表
         scores = []
         for row in score_rows:
+            # 仅返回结构化成绩信息（scores_json_full + 注释等），避免重复下发
             score_dict = {
                 'id': row['id'],
                 'student_id': row.get('student_id'),
-                'student_name': row.get('student_name'),
-                'total_score': float(row['total_score']) if row['total_score'] is not None else None
+                'student_name': row.get('student_name')
             }
             
             # 解析成绩JSON字段（处理复合键名：字段名_Excel文件名）
@@ -4421,57 +4372,7 @@ async def api_get_student_score(
                         scores_data = json.loads(row['scores_json'])
                     else:
                         scores_data = row['scores_json']
-                    
-                    # 解析 field_source_json（字段名到Excel文件名的映射）
-                    field_source_data = {}
-                    if row.get('field_source_json'):
-                        try:
-                            if isinstance(row['field_source_json'], str):
-                                field_source_data = json.loads(row['field_source_json'])
-                            else:
-                                field_source_data = row['field_source_json']
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-                    
-                    # 将JSON中的字段添加到score_dict中
-                    # 支持两种方式：1. 使用复合键名查找 2. 使用简单字段名（如果有映射）
-                    # 同时收集所有来源的值（用于返回详细信息）
-                    field_sources_detail = {}  # 记录每个字段的所有来源值
-                    for field_name in field_names:
-                        # 优先使用简单字段名（兼容旧数据）
-                        if field_name in scores_data:
-                            score_dict[field_name] = scores_data[field_name]
-                            # 记录来源信息
-                            field_sources_detail[field_name] = {
-                                'value': scores_data[field_name],
-                                'sources': [field_source_data.get(field_name, 'unknown')] if field_source_data else ['unknown']
-                            }
-                        else:
-                            # 尝试使用复合键名查找
-                            excel_filenames = field_excel_map.get(field_name, [])
-                            found_value = None
-                            found_sources = []
-                            # 收集所有来源的值
-                            for excel_filename in excel_filenames:
-                                composite_key = f"{field_name}_{excel_filename}"
-                                if composite_key in scores_data:
-                                    if found_value is None:
-                                        found_value = scores_data[composite_key]  # 第一个作为默认值
-                                    found_sources.append({
-                                        'excel_filename': excel_filename,
-                                        'value': scores_data[composite_key]
-                                    })
-                            if found_value is not None:
-                                score_dict[field_name] = found_value
-                                # 记录所有来源信息
-                                field_sources_detail[field_name] = {
-                                    'value': found_value,
-                                    'sources': found_sources if found_sources else [field_source_data.get(field_name, 'unknown')] if field_source_data else ['unknown']
-                                }
-                    
-                    # 添加字段来源详细信息（供客户端区分不同Excel文件的相同字段）
-                    score_dict['field_sources'] = field_sources_detail
-                    # 同时返回完整的scores_json（包含所有复合键名），方便客户端直接访问
+                    # 仅返回完整的scores_json（包含所有复合键名），由客户端按复合键名取值
                     score_dict['scores_json_full'] = scores_data
                 except (json.JSONDecodeError, TypeError) as e:
                     print(f"[api_get_student_score] 解析JSON失败: {e}, scores_json={row.get('scores_json')}")
@@ -4489,28 +4390,30 @@ async def api_get_student_score(
                     print(f"[api_get_student_score] 解析注释JSON失败: {e}, comments_json={row.get('comments_json')}")
                     app_logger.warning(f"[api_get_student_score] 解析注释JSON失败: {e}")
             
-            # 为每个字段添加注释（如果存在）
-            # 支持简单字段名（兼容旧数据）和复合键名
-            for field_name in field_names:
-                comment_key = f"{field_name}_comment"
-                # 优先使用简单字段名（兼容旧数据）
-                if field_name in comments_dict:
-                    score_dict[comment_key] = comments_dict[field_name]
+            # 仅返回去重后的 comments（规则同 /student-scores）
+            filtered_comments = comments_dict
+            try:
+                if isinstance(comments_dict, dict) and comments_dict:
+                    all_excel_filenames = {fn for fns in field_excel_map.values() for fn in fns if fn}
+                    has_composite = False
+                    if all_excel_filenames:
+                        for k in comments_dict.keys():
+                            if any(k.endswith(f"_{fn}") for fn in all_excel_filenames):
+                                has_composite = True
+                                break
                 else:
-                    # 尝试使用复合键名查找
-                    excel_filenames = field_excel_map.get(field_name, [])
-                    found_comment = None
-                    # 如果字段有多个来源，优先使用第一个
-                    for excel_filename in excel_filenames:
-                        composite_comment_key = f"{field_name}_{excel_filename}"
-                        if composite_comment_key in comments_dict:
-                            found_comment = comments_dict[composite_comment_key]
-                            break  # 找到第一个就退出
-                    if found_comment is not None:
-                        score_dict[comment_key] = found_comment
-            
-            # 同时返回完整的注释对象（可选，方便前端使用）
-            score_dict['comments'] = comments_dict
+                        has_composite = any('_' in k for k in comments_dict.keys())
+
+                    if has_composite:
+                        if all_excel_filenames:
+                            filtered_comments = {k: v for k, v in comments_dict.items()
+                                                 if any(k.endswith(f"_{fn}") for fn in all_excel_filenames)}
+                        else:
+                            filtered_comments = {k: v for k, v in comments_dict.items() if '_' in k}
+            except Exception:
+                filtered_comments = comments_dict
+
+            score_dict['comments'] = filtered_comments
             
             scores.append(score_dict)
         
@@ -4549,7 +4452,6 @@ async def api_get_student_score(
             'term': header.get('term'),
             'remark': header.get('remark'),
             'excel_file_url': excel_file_urls,  # 返回数组格式
-            'excel_file_url_raw': excel_file_url_raw,  # 保留原始值（可选，用于兼容）
             'created_at': header.get('created_at'),
             'updated_at': header.get('updated_at'),
             'fields': fields,  # 字段定义列表
@@ -4614,7 +4516,8 @@ async def api_set_student_score_comment(request: Request):
       "comment": "需要加强练习"           // 注释内容（必需，如果要删除注释可以传空字符串）
     }
     注意：如果提供了 excel_filename，将使用复合键名（field_name_excel_filename）保存注释，
-         这样可以支持不同Excel文件中相同字段名的注释不互相覆盖
+         这样可以支持不同Excel文件中相同字段名的注释不互相覆盖。
+         为避免重复数据，本接口在存在 excel_filename 时**不会再额外写入简单字段名键**。
     """
     print("=" * 80)
     print("[student-scores/set-comment] ========== 收到设置注释请求 ==========")
@@ -4720,21 +4623,23 @@ async def api_set_student_score_comment(request: Request):
         else:
             comments_dict = {}
         
-        # 更新或添加注释（使用复合键名，如果提供了 excel_filename）
+        # 更新或添加注释
+        # 规则：
+        # - 有 excel_filename：只写入复合键名（field_name_excel_filename），并清理同名简单键 field_name（避免重复）
+        # - 无 excel_filename：写入简单键 field_name
         if comment.strip():  # 如果注释不为空，则设置
             comments_dict[comment_key] = comment
-            # 同时为了兼容性，也保留简单字段名（如果只有一个来源）
-            # 如果已经有多个来源的注释，则不覆盖简单字段名
-            if not excel_filename or field_name not in comments_dict:
+            if excel_filename:
+                # 清理历史兼容数据导致的重复键（如 "数学": "...", "数学_文件.xlsx": "..."）
+                comments_dict.pop(field_name, None)
+            else:
                 comments_dict[field_name] = comment
         else:  # 如果注释为空字符串，则删除该字段的注释
             comments_dict.pop(comment_key, None)
-            # 如果删除了复合键名的注释，也删除简单字段名的注释（如果存在且只有一个来源）
-            if excel_filename and field_name in comments_dict:
-                # 检查是否还有其他复合键名的注释
-                has_other_comments = any(k.startswith(f"{field_name}_") and k != comment_key 
-                                       for k in comments_dict.keys())
-                if not has_other_comments:
+            if excel_filename:
+                # 同步清理简单键，避免残留重复
+                comments_dict.pop(field_name, None)
+            else:
                     comments_dict.pop(field_name, None)
         
         # 将更新后的字典转换为JSON字符串
@@ -5979,7 +5884,6 @@ async def api_get_group_scores(
             # 解析scores_json（支持复合键名）
             scores_data = {}
             scores_data_full = {}  # 完整的scores_json（包含所有复合键名）
-            field_sources_detail = {}  # 字段来源详细信息
             if score.get('scores_json'):
                 try:
                     scores_data_raw = json.loads(score['scores_json']) if isinstance(score['scores_json'], str) else score['scores_json']
@@ -6007,12 +5911,6 @@ async def api_get_group_scores(
                                         'value': scores_data_raw[composite_key]
                                     })
                         
-                        # 记录字段来源信息
-                        if found_sources:
-                            field_sources_detail[field_name] = {
-                                'value': found_sources[0]['value'],  # 第一个作为默认值
-                                'sources': found_sources
-                            }
                     # 同时保留原始的scores_json（包含复合键名），方便调试
                     # scores_data 中现在包含解析后的简单字段名
                 except (json.JSONDecodeError, TypeError):
@@ -6034,8 +5932,7 @@ async def api_get_group_scores(
                 'total_score': float(score['total_score']) if score.get('total_score') is not None else None,
                 'group_total_score': float(score['group_total_score']) if score.get('group_total_score') is not None else None,
                 'scores': scores_data,  # 解析后的简单字段名（向后兼容）
-                'scores_json_full': scores_data_full,  # 完整的scores_json（包含所有复合键名）
-                'field_sources': field_sources_detail  # 字段来源详细信息
+                'scores_json_full': scores_data_full  # 完整的scores_json（包含所有复合键名）
             }
             
             # 将动态字段也平铺到顶层（方便客户端使用）
