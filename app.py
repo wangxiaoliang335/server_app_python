@@ -2874,12 +2874,27 @@ def save_student_scores(
         uploaded_filenames = set()           # 本次上传涉及的文件名
 
         # 1. 插入或获取成绩表头
-        print(f"[save_student_scores] 查询成绩表头 - class_id={class_id}, exam_name={exam_name}, term={term}")
-        app_logger.info(f"[save_student_scores] 查询成绩表头 - class_id={class_id}, exam_name={exam_name}, term={term}")
-        cursor.execute(
-            "SELECT id, excel_file_url FROM ta_student_score_header WHERE class_id = %s AND exam_name = %s AND (%s IS NULL OR term = %s) LIMIT 1",
-            (class_id, exam_name, term, term)
-        )
+        # 约定：class_id + term 能定位一张成绩表；exam_name 仅作为展示字段保留，不作为定位条件
+        print(f"[save_student_scores] 查询成绩表头 - class_id={class_id}, term={term}（忽略exam_name={exam_name}）")
+        app_logger.info(f"[save_student_scores] 查询成绩表头 - class_id={class_id}, term={term}（忽略exam_name={exam_name}）")
+        if term is None:
+            cursor.execute(
+                "SELECT id, excel_file_url "
+                "FROM ta_student_score_header "
+                "WHERE class_id = %s AND term IS NULL "
+                "ORDER BY created_at DESC, updated_at DESC "
+                "LIMIT 1",
+                (class_id,)
+            )
+        else:
+            cursor.execute(
+                "SELECT id, excel_file_url "
+                "FROM ta_student_score_header "
+                "WHERE class_id = %s AND term = %s "
+                "ORDER BY created_at DESC, updated_at DESC "
+                "LIMIT 1",
+                (class_id, term)
+            )
         header_row = cursor.fetchone()
         print(f"[save_student_scores] 查询成绩表头结果: {header_row}")
         app_logger.info(f"[save_student_scores] 查询成绩表头结果: {header_row}")
@@ -3960,7 +3975,7 @@ async def api_save_student_scores(request: Request):
 async def api_get_student_scores(
     request: Request,
     class_id: str = Query(..., description="班级ID"),
-    exam_name: Optional[str] = Query(None, description="考试名称，如不提供则返回该班级所有成绩表"),
+    exam_name: Optional[str] = Query(None, description="考试名称（兼容字段：不再作为查询条件）"),
     term: Optional[str] = Query(None, description="学期，可选")
 ):
     """
@@ -4023,20 +4038,23 @@ async def api_get_student_scores(
         cursor = connection.cursor(dictionary=True)
         
         # 查询成绩表头
-        if exam_name:
+        # 约定：class_id + term 能定位一张成绩表；exam_name 仅作为展示字段保留，不作为定位条件
+        if term is not None:
             cursor.execute(
                 "SELECT id, class_id, exam_name, term, remark, excel_file_url, created_at, updated_at "
                 "FROM ta_student_score_header "
-                "WHERE class_id = %s AND exam_name = %s AND (%s IS NULL OR term = %s)",
-                (class_id, exam_name, term, term)
+                "WHERE class_id = %s AND term = %s "
+                "ORDER BY created_at DESC, updated_at DESC "
+                "LIMIT 1",
+                (class_id, term)
             )
         else:
             cursor.execute(
                 "SELECT id, class_id, exam_name, term, remark, excel_file_url, created_at, updated_at "
                 "FROM ta_student_score_header "
-                "WHERE class_id = %s AND (%s IS NULL OR term = %s) "
-                "ORDER BY created_at DESC",
-                (class_id, term, term)
+                "WHERE class_id = %s "
+                "ORDER BY created_at DESC, updated_at DESC",
+                (class_id,)
             )
         
         headers = cursor.fetchall() or []
@@ -4239,7 +4257,7 @@ async def api_get_student_scores(
 @app.get("/student-scores/get")
 async def api_get_student_score(
     class_id: str = Query(..., description="班级ID"),
-    exam_name: str = Query(..., description="考试名称，如'期中考试'"),
+    exam_name: Optional[str] = Query(None, description="考试名称（兼容字段：不再作为查询条件）"),
     term: str = Query(..., description="学期，如'2025-2026-1'")
 ):
     """
@@ -4283,8 +4301,8 @@ async def api_get_student_score(
     }
     """
     print("=" * 80)
-    print(f"[student-scores/get] 收到查询请求 - class_id: {class_id}, exam_name: {exam_name}, term: {term}")
-    app_logger.info(f"[student-scores/get] 收到查询请求 - class_id: {class_id}, exam_name: {exam_name}, term: {term}")
+    print(f"[student-scores/get] 收到查询请求 - class_id: {class_id}, term: {term}（忽略exam_name: {exam_name}）")
+    app_logger.info(f"[student-scores/get] 收到查询请求 - class_id: {class_id}, term: {term}（忽略exam_name: {exam_name}）")
     
     connection = get_db_connection()
     if connection is None:
@@ -4305,10 +4323,10 @@ async def api_get_student_score(
         cursor.execute(
             "SELECT id, class_id, exam_name, term, remark, excel_file_url, created_at, updated_at "
             "FROM ta_student_score_header "
-            "WHERE class_id = %s AND exam_name = %s AND term = %s "
+            "WHERE class_id = %s AND term = %s "
             "ORDER BY created_at DESC, updated_at DESC "
             "LIMIT 1",
-            (class_id, exam_name, term)
+            (class_id, term)
         )
         
         header = cursor.fetchone()
