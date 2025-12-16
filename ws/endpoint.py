@@ -48,10 +48,7 @@ from ws.manager import (
 router = APIRouter()
 
 
-async def notify_tencent_group_sync(*args, **kwargs):
-    # 寤惰繜瀵煎叆锛岄伩鍏?ws.endpoint -> app 寰幆瀵煎叆
-    from app import notify_tencent_group_sync as _impl
-    return await _impl(*args, **kwargs)
+from services.tencent_groups import notify_tencent_group_sync
 
 @router.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
