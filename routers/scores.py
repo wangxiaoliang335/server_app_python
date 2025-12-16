@@ -398,7 +398,8 @@ async def api_save_student_scores(request: Request):
 @router.get("/student-scores")
 async def api_get_student_scores(
     request: Request,
-    class_id: str = Query(..., description="班级ID"),
+    class_id: Optional[str] = Query(None, description="班级ID（与 group_id 二选一；也可两者都传）"),
+    group_id: Optional[str] = Query(None, description="班级群ID（与 class_id 二选一；也可两者都传）"),
     exam_name: Optional[str] = Query(None, description="考试名称（兼容字段：不再作为查询条件）"),
     term: Optional[str] = Query(None, description="学期，可选")
 ):
@@ -447,6 +448,13 @@ async def api_get_student_scores(
       }
     }
     """
+    # 兼容：class_id / group_id 二选一；也可两者都传
+    class_id = str(class_id).strip() if class_id is not None else None
+    group_id = str(group_id).strip() if group_id is not None else None
+
+    if not class_id and not group_id:
+        return safe_json_response({"message": "缺少必要参数：class_id 或 group_id", "code": 400}, status_code=400)
+
     connection = get_db_connection()
     if connection is None:
         error_response = {'message': '数据库连接失败', 'code': 500}
@@ -460,6 +468,43 @@ async def api_get_student_scores(
 
     try:
         cursor = connection.cursor(dictionary=True)
+
+        # 如果传了 group_id，优先尝试从 groups 表解析出对应的 classid
+        # - 解析成功：用解析出的 classid 查询成绩
+        # - 解析失败（查不到/为空）：兜底把 group_id 当成 class_id（兼容老数据/老约定）
+        resolved_class_id: Optional[str] = class_id
+        if group_id:
+            group_classid: Optional[str] = None
+            try:
+                cursor.execute("SELECT classid FROM `groups` WHERE group_id = %s LIMIT 1", (group_id,))
+                row = cursor.fetchone() or {}
+                raw_classid = row.get("classid")
+                if raw_classid is not None:
+                    group_classid = str(raw_classid).strip()
+            except Exception:
+                group_classid = None
+
+            if group_classid:
+                if resolved_class_id and resolved_class_id != group_classid:
+                    return safe_json_response(
+                        {"message": "参数不一致：class_id 与 group_id 对应的 classid 不一致", "code": 400},
+                        status_code=400,
+                    )
+                resolved_class_id = group_classid
+            else:
+                # 无法解析 classid：如果同时传了 class_id，则无法校验一致性，除非两者相同
+                if resolved_class_id and resolved_class_id != group_id:
+                    return safe_json_response(
+                        {"message": "无法从 group_id 解析班级ID(classid)，请只传 class_id，或先在 groups 表补齐 classid", "code": 400},
+                        status_code=400,
+                    )
+                resolved_class_id = resolved_class_id or group_id
+
+        if not resolved_class_id:
+            return safe_json_response({"message": "无法确定班级ID（class_id）", "code": 400}, status_code=400)
+
+        # 统一用 resolved_class_id 走原有逻辑
+        class_id = resolved_class_id
         
         # 查询成绩表头
         # 约定：class_id + term 能定位一张成绩表；exam_name 仅作为展示字段保留，不作为定位条件
@@ -681,7 +726,8 @@ async def api_get_student_scores(
 
 @router.get("/student-scores/get")
 async def api_get_student_score(
-    class_id: str = Query(..., description="班级ID"),
+    class_id: Optional[str] = Query(None, description="班级ID（与 group_id 二选一；也可两者都传）"),
+    group_id: Optional[str] = Query(None, description="班级群ID（与 class_id 二选一；也可两者都传）"),
     exam_name: Optional[str] = Query(None, description="考试名称（兼容字段：不再作为查询条件）"),
     term: str = Query(..., description="学期，如'2025-2026-1'")
 ):
@@ -725,14 +771,20 @@ async def api_get_student_score(
       }
     }
     """
+    class_id = str(class_id).strip() if class_id is not None else None
+    group_id = str(group_id).strip() if group_id is not None else None
+
+    if not class_id and not group_id:
+        return safe_json_response({"message": "缺少必要参数：class_id 或 group_id", "code": 400}, status_code=400)
+
     print("=" * 80)
-    print(f"[student-scores/get] 收到查询请求 - class_id: {class_id}, term: {term}（忽略exam_name: {exam_name}）")
-    app_logger.info(f"[student-scores/get] 收到查询请求 - class_id: {class_id}, term: {term}（忽略exam_name: {exam_name}）")
+    print(f"[student-scores/get] 收到查询请求 - class_id: {class_id}, group_id: {group_id}, term: {term}（忽略exam_name: {exam_name}）")
+    app_logger.info(f"[student-scores/get] 收到查询请求 - class_id: {class_id}, group_id: {group_id}, term: {term}（忽略exam_name: {exam_name}）")
     
     connection = get_db_connection()
     if connection is None:
         print("[student-scores/get] 错误: 数据库连接失败")
-        app_logger.error(f"[student-scores/get] 数据库连接失败 - class_id: {class_id}, exam_name: {exam_name}, term: {term}")
+        app_logger.error(f"[student-scores/get] 数据库连接失败 - class_id: {class_id}, group_id: {group_id}, exam_name: {exam_name}, term: {term}")
         return safe_json_response({'message': '数据库连接失败', 'code': 500}, status_code=500)
     
     print("[student-scores/get] 数据库连接成功")
@@ -741,6 +793,39 @@ async def api_get_student_score(
     cursor = None
     try:
         cursor = connection.cursor(dictionary=True)
+
+        # group_id -> classid 映射（同 /student-scores）
+        resolved_class_id: Optional[str] = class_id
+        if group_id:
+            group_classid: Optional[str] = None
+            try:
+                cursor.execute("SELECT classid FROM `groups` WHERE group_id = %s LIMIT 1", (group_id,))
+                row = cursor.fetchone() or {}
+                raw_classid = row.get("classid")
+                if raw_classid is not None:
+                    group_classid = str(raw_classid).strip()
+            except Exception:
+                group_classid = None
+
+            if group_classid:
+                if resolved_class_id and resolved_class_id != group_classid:
+                    return safe_json_response(
+                        {"message": "参数不一致：class_id 与 group_id 对应的 classid 不一致", "code": 400},
+                        status_code=400,
+                    )
+                resolved_class_id = group_classid
+            else:
+                if resolved_class_id and resolved_class_id != group_id:
+                    return safe_json_response(
+                        {"message": "无法从 group_id 解析班级ID(classid)，请只传 class_id，或先在 groups 表补齐 classid", "code": 400},
+                        status_code=400,
+                    )
+                resolved_class_id = resolved_class_id or group_id
+
+        if not resolved_class_id:
+            return safe_json_response({"message": "无法确定班级ID（class_id）", "code": 400}, status_code=400)
+
+        class_id = resolved_class_id
         
         # 查询成绩表头，如果有多个则按创建时间降序排列，取最新的
         print(f"[student-scores/get] 查询成绩表头...")
