@@ -27,6 +27,68 @@ from ws.manager import active_temp_rooms
 
 router = APIRouter()
 
+# ===== group_members 扩展字段：教师任课科目（同一班级可多科） =====
+GROUP_MEMBERS_TEACH_SUBJECTS_COL = "teach_subjects"
+
+
+def _group_members_has_column(cursor, col_name: str) -> bool:
+    """检查 group_members 是否存在指定列。"""
+    cursor.execute("SHOW COLUMNS FROM `group_members` LIKE %s", (col_name,))
+    return cursor.fetchone() is not None
+
+
+def _ensure_group_members_teach_subjects_column(cursor) -> bool:
+    """
+    尝试为 group_members 增加 teach_subjects(JSON) 字段。
+    - 成功/已存在：返回 True
+    - 失败（权限不足等）：返回 False（上层可提示手工执行 ALTER TABLE）
+    """
+    try:
+        if _group_members_has_column(cursor, GROUP_MEMBERS_TEACH_SUBJECTS_COL):
+            return True
+        cursor.execute(
+            """
+            ALTER TABLE `group_members`
+            ADD COLUMN `teach_subjects` JSON NULL
+            COMMENT '教师在该班级教授的科目列表（JSON数组，可多科）'
+            AFTER `is_voice_enabled`
+            """
+        )
+        return True
+    except Exception as e:
+        # 兼容：有些线上账号可能没有 ALTER 权限
+        app_logger.warning(f"[schema] ensure group_members.teach_subjects failed: {e}")
+        return False
+
+
+def _normalize_teach_subjects(value: Any) -> List[str]:
+    """
+    将数据库返回的 teach_subjects 规范化为 list[str]。
+    MySQL JSON 列在 mysql-connector 下通常会以 str 返回。
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(x) for x in value if x is not None and str(x).strip() != ""]
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            # 兜底：如果数据库里是普通字符串，返回单元素列表
+            return [raw]
+        if isinstance(parsed, list):
+            return [str(x) for x in parsed if x is not None and str(x).strip() != ""]
+        if parsed is None:
+            return []
+        return [str(parsed)]
+    return [str(value)]
+
+
 # Tencent 配置（从环境变量读取；与 app.py 保持一致）
 TENCENT_API_SDK_APP_ID = os.getenv("TENCENT_API_SDK_APP_ID")
 TENCENT_API_IDENTIFIER = os.getenv("TENCENT_API_IDENTIFIER")
@@ -1198,6 +1260,7 @@ def get_group_members_by_group_id(group_id: str = Query(..., description="群组
 
         cursor = connection.cursor(dictionary=True)
 
+        has_teach_subjects = _group_members_has_column(cursor, GROUP_MEMBERS_TEACH_SUBJECTS_COL)
         sql = """
             SELECT 
                 gm.group_id,
@@ -1210,6 +1273,12 @@ def get_group_members_by_group_id(group_id: str = Query(..., description="群组
                 gm.readed_seq,
                 gm.unread_num,
                 gm.is_voice_enabled
+        """
+        if has_teach_subjects:
+            sql += """
+                , gm.teach_subjects
+            """
+        sql += """
             FROM `group_members` gm
             WHERE gm.group_id = %s
             ORDER BY gm.join_time ASC
@@ -1243,6 +1312,9 @@ def get_group_members_by_group_id(group_id: str = Query(..., description="群组
             role_name = {200: "普通成员", 300: "管理员", 400: "群主"}.get(self_role, f"未知({self_role})")
 
             print(f"[groups/members] 处理第 {idx+1}/{len(members)} 个成员: user_id={user_id}, user_name={user_name}, role={role_name}")
+
+            if has_teach_subjects:
+                member["teach_subjects"] = _normalize_teach_subjects(member.get("teach_subjects"))
 
             for key, value in member.items():
                 if isinstance(value, datetime.datetime):
@@ -1301,6 +1373,115 @@ def get_group_members_by_group_id(group_id: str = Query(..., description="群组
             connection.close()
             print("[groups/members] 数据库连接已关闭")
             app_logger.info(f"[groups/members] Database connection closed after get_group_members_by_group_id attempt for group_id={group_id}.")
+
+
+@router.post("/groups/member/teach-subjects")
+async def update_group_member_teach_subjects(request: Request):
+    """
+    设置/更新某个群成员（通常是老师）在该班级（group_id）里教授的科目列表。
+
+    请求体 JSON:
+    {
+      "group_id": "班级群ID",
+      "user_id": "老师/成员ID",
+      "teach_subjects": ["语文","数学"]  // 也兼容 "subjects"
+    }
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"data": {"message": "请求数据格式错误", "code": 400}}, status_code=400)
+
+    group_id = str((data or {}).get("group_id") or "").strip()
+    user_id = str((data or {}).get("user_id") or "").strip()
+    raw_subjects = (data or {}).get("teach_subjects")
+    if raw_subjects is None:
+        raw_subjects = (data or {}).get("subjects")
+
+    if not group_id or not user_id:
+        return JSONResponse({"data": {"message": "缺少 group_id 或 user_id", "code": 400}}, status_code=400)
+
+    # 兼容：传字符串（逗号分隔）/ JSON 字符串 / 列表
+    subjects: List[str] = []
+    if raw_subjects is None:
+        subjects = []
+    elif isinstance(raw_subjects, list):
+        subjects = [str(x).strip() for x in raw_subjects if x is not None and str(x).strip() != ""]
+    elif isinstance(raw_subjects, (bytes, bytearray)):
+        subjects = [raw_subjects.decode("utf-8", errors="replace").strip()]
+    elif isinstance(raw_subjects, str):
+        s = raw_subjects.strip()
+        if not s:
+            subjects = []
+        else:
+            # 尝试把字符串当 JSON 解析（["语文","数学"]），失败则按逗号切分
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    subjects = [str(x).strip() for x in parsed if x is not None and str(x).strip() != ""]
+                elif parsed is None:
+                    subjects = []
+                else:
+                    subjects = [str(parsed).strip()] if str(parsed).strip() else []
+            except Exception:
+                subjects = [x.strip() for x in s.replace("，", ",").split(",") if x.strip()]
+    else:
+        subjects = [str(raw_subjects).strip()] if str(raw_subjects).strip() else []
+
+    # 去重（保持顺序）
+    deduped: List[str] = []
+    seen = set()
+    for sub in subjects:
+        if sub in seen:
+            continue
+        seen.add(sub)
+        deduped.append(sub)
+
+    connection = get_db_connection()
+    if connection is None or not connection.is_connected():
+        return JSONResponse({"data": {"message": "数据库连接失败", "code": 500}}, status_code=500)
+
+    cursor = None
+    try:
+        cursor = connection.cursor()
+
+        # 确保字段存在（无 ALTER 权限时会返回 False）
+        ensured = _ensure_group_members_teach_subjects_column(cursor)
+        if not ensured:
+            return JSONResponse(
+                {
+                    "data": {
+                        "message": "数据库缺少字段 group_members.teach_subjects，请手工执行 ALTER TABLE 增加该字段后重试",
+                        "code": 500,
+                    }
+                },
+                status_code=500,
+            )
+
+        update_sql = "UPDATE `group_members` SET `teach_subjects` = %s WHERE `group_id` = %s AND `user_id` = %s"
+        cursor.execute(update_sql, (json.dumps(deduped, ensure_ascii=False), group_id, user_id))
+        connection.commit()
+
+        if cursor.rowcount <= 0:
+            return JSONResponse({"data": {"message": "未找到该群成员记录", "code": 404}}, status_code=404)
+
+        return JSONResponse(
+            {"data": {"message": "更新成功", "code": 200, "group_id": group_id, "user_id": user_id, "teach_subjects": deduped}},
+            status_code=200,
+        )
+    except mysql.connector.Error as e:
+        connection.rollback()
+        return JSONResponse({"data": {"message": f"更新失败: {str(e)}", "code": 500}}, status_code=500)
+    except Exception as e:
+        connection.rollback()
+        return JSONResponse({"data": {"message": f"更新失败: {str(e)}", "code": 500}}, status_code=500)
+    finally:
+        try:
+            if cursor:
+                cursor.close()
+        finally:
+            if connection and connection.is_connected():
+                connection.close()
 
 
 @router.get("/group/members")
@@ -1486,6 +1667,13 @@ async def sync_groups(request: Request):
                 print(f"[groups/sync] group_members 表字段信息:")
                 for col in group_members_columns:
                     print(f"  {col}")
+
+                # 尝试自动补齐 teach_subjects 字段（若账号无 ALTER 权限则跳过）
+                try:
+                    ensured = _ensure_group_members_teach_subjects_column(cursor)
+                    print(f"[groups/sync] schema ensure group_members.teach_subjects: {ensured}")
+                except Exception as e:
+                    print(f"[groups/sync] schema ensure group_members.teach_subjects exception: {e}")
 
             for idx, group in enumerate(groups):
                 try:
