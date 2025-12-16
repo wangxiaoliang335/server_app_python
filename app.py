@@ -3492,7 +3492,7 @@ def save_student_scores(
                 raise  # 重新抛出异常，让外层捕获
 
         app_logger.info(f"[save_student_scores] 成绩明细处理完成 - 插入={inserted_count}, 更新={updated_count}, 跳过={skipped_count}, 总计={len(scores)}")
-
+        
         connection.commit()
         total_processed = inserted_count + updated_count
         app_logger.info(f"[save_student_scores] 事务提交成功 - score_header_id={score_header_id}, 插入={inserted_count}, 更新={updated_count}, 删除字段={deleted_field_count}, 删除学生={deleted_student_count}, 总计={total_processed}")
