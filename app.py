@@ -2856,8 +2856,10 @@ def save_student_scores(
     elif operation_mode == 'append' and (not scores or not isinstance(scores, list)):
         return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '成绩明细列表不能为空' }
 
-    print(f"[save_student_scores] 开始保存成绩 - class_id={class_id}, exam_name={exam_name}, term={term}, operation_mode={operation_mode}, scores数量={len(scores) if scores else 0}")
-    app_logger.info(f"[save_student_scores] 开始保存成绩 - class_id={class_id}, exam_name={exam_name}, term={term}, scores数量={len(scores) if scores else 0}")
+    app_logger.info(
+        f"[save_student_scores] start class_id={class_id}, exam_name={exam_name}, term={term}, "
+        f"operation_mode={operation_mode}, scores_count={len(scores) if scores else 0}"
+    )
     
     connection = get_db_connection()
     if connection is None:
@@ -2866,8 +2868,6 @@ def save_student_scores(
         app_logger.error(error_msg)
         return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '数据库连接失败' }
 
-    print(f"[save_student_scores] 数据库连接成功，开始事务")
-    app_logger.info(f"[save_student_scores] 数据库连接成功，开始事务")
     try:
         connection.start_transaction()
         cursor = connection.cursor(dictionary=True)
@@ -2881,8 +2881,6 @@ def save_student_scores(
 
         # 1. 插入或获取成绩表头
         # 约定：class_id + term 能定位一张成绩表；exam_name 仅作为展示字段保留，不作为定位条件
-        print(f"[save_student_scores] 查询成绩表头 - class_id={class_id}, term={term}（忽略exam_name={provided_exam_name}）")
-        app_logger.info(f"[save_student_scores] 查询成绩表头 - class_id={class_id}, term={term}（忽略exam_name={provided_exam_name}）")
         if term is None:
             cursor.execute(
                 "SELECT id, excel_file_url "
@@ -2902,22 +2900,12 @@ def save_student_scores(
                 (class_id, term)
             )
         header_row = cursor.fetchone()
-        print(f"[save_student_scores] 查询成绩表头结果: {header_row}")
-        app_logger.info(f"[save_student_scores] 查询成绩表头结果: {header_row}")
 
         if header_row is None:
             # 插入新表头
-            print(f"[save_student_scores] ========== 插入新成绩表头 ==========")
-            app_logger.info(f"[save_student_scores] ========== 插入新成绩表头 ==========")
-            print(f"[save_student_scores] 📝 准备插入新表头:")
-            print(f"[save_student_scores]   - class_id: {class_id}")
-            print(f"[save_student_scores]   - exam_name: {exam_name}")
-            print(f"[save_student_scores]   - term: {term}")
-            print(f"[save_student_scores]   - remark: {remark}")
-            print(f"[save_student_scores]   - excel_file_url: {excel_file_url}")
-            print(f"[save_student_scores]   - excel_file_name: {excel_file_name}")
-            print(f"[save_student_scores]   - excel_file_url类型: {type(excel_file_url)}")
-            app_logger.info(f"[save_student_scores] 📝 准备插入新表头 - class_id={class_id}, exam_name={exam_name}, term={term}, remark={remark}, excel_file_url={excel_file_url}, excel_file_name={excel_file_name}, excel_file_url类型={type(excel_file_url)}")
+            app_logger.info(
+                f"[save_student_scores] insert header class_id={class_id}, term={term}, exam_name={exam_name}"
+            )
             
             # 处理excel文件信息，使用JSON格式存储（支持多个文件，包含description与fields）
             final_excel_file_url = None
@@ -2955,8 +2943,6 @@ def save_student_scores(
                 final_excel_file_url = json.dumps(url_dict, ensure_ascii=False)
             
             if final_excel_file_url:
-                print(f"[save_student_scores] 📝 新表头的excel_file_url（JSON格式）: {final_excel_file_url}")
-                app_logger.info(f"[save_student_scores] 📝 新表头的excel_file_url（JSON格式）: {final_excel_file_url}")
                 try:
                     parsed_dict = json.loads(final_excel_file_url)
                     if isinstance(parsed_dict, dict):
@@ -2964,30 +2950,18 @@ def save_student_scores(
                             if isinstance(v, dict):
                                 keep_fields_from_excel_urls.update(v.get('fields', []) or [])
                 except Exception as e:
-                    print(f"[save_student_scores] ⚠️ 解析excel_file_url失败: {e}")
-                    app_logger.warning(f"[save_student_scores] 解析excel_file_url失败: {e}")
-            else:
-                print(f"[save_student_scores] ℹ️ 未提供excel文件信息，将excel_file_url置为空")
-                app_logger.info(f"[save_student_scores] ℹ️ 未提供excel文件信息，将excel_file_url置为空")
+                    app_logger.warning(f"[save_student_scores] parse excel_file_url failed: {e}")
             
             insert_header_sql = (
                 "INSERT INTO ta_student_score_header (class_id, exam_name, term, remark, excel_file_url, created_at) "
                 "VALUES (%s, %s, %s, %s, %s, NOW())"
             )
-            print(f"[save_student_scores] 📝 SQL语句: {insert_header_sql}")
-            print(f"[save_student_scores] 📝 SQL参数: ({class_id}, {exam_name}, {term}, {remark}, {final_excel_file_url})")
-            app_logger.info(f"[save_student_scores] 📝 SQL语句: {insert_header_sql}, SQL参数: ({class_id}, {exam_name}, {term}, {remark}, {final_excel_file_url})")
             cursor.execute(insert_header_sql, (class_id, exam_name, term, remark, final_excel_file_url))
             score_header_id = cursor.lastrowid
-            print(f"[save_student_scores] ✅ 插入成绩表头成功 - score_header_id={score_header_id}")
-            print(f"[save_student_scores] ✅ excel_file_url已写入数据库: {excel_file_url}")
-            app_logger.info(f"[save_student_scores] ✅ 插入成绩表头成功 - score_header_id={score_header_id}, excel_file_url={excel_file_url}")
+            app_logger.info(f"[save_student_scores] header inserted score_header_id={score_header_id}")
         else:
             score_header_id = header_row['id']
-            print(f"[save_student_scores] ========== 成绩表头已存在，准备更新 ==========")
-            app_logger.info(f"[save_student_scores] ========== 成绩表头已存在，准备更新 ==========")
-            print(f"[save_student_scores] 📋 现有表头ID: {score_header_id}")
-            app_logger.info(f"[save_student_scores] 📋 现有表头ID: {score_header_id}")
+            app_logger.info(f"[save_student_scores] header exists score_header_id={score_header_id}")
             # 更新表头信息（若存在）
             update_fields = []
             update_values = []
@@ -2997,21 +2971,14 @@ def save_student_scores(
                 if normalized_exam_name:
                     update_fields.append("exam_name = %s")
                     update_values.append(normalized_exam_name)
-                    print(f"[save_student_scores] 📝 将更新exam_name字段: {normalized_exam_name}")
-                    app_logger.info(f"[save_student_scores] 📝 将更新exam_name字段: {normalized_exam_name}")
+                    app_logger.info(f"[save_student_scores] update header exam_name={normalized_exam_name}")
             if remark is not None:
                 update_fields.append("remark = %s")
                 update_values.append(remark)
-                print(f"[save_student_scores] 📝 将更新remark字段: {remark}")
-                app_logger.info(f"[save_student_scores] 📝 将更新remark字段: {remark}")
             # 更新 excel_file_url（支持excel_files数组，或单个excel_file_url）：
             # - 同名文件则覆盖（url/description/fields）
             # - 不同文件追加
-            print(f"[save_student_scores] 🔍 检查excel文件信息是否需要更新:")
-            print(f"[save_student_scores]   - excel_files数量: {len(excel_files) if excel_files else 0}")
-            print(f"[save_student_scores]   - excel_file_url值: {excel_file_url}")
-            print(f"[save_student_scores]   - excel_file_name值: {excel_file_name}")
-            app_logger.info(f"[save_student_scores] 🔍 检查excel文件信息是否需要更新: excel_files数量={len(excel_files) if excel_files else 0}, excel_file_url={excel_file_url}, excel_file_name={excel_file_name}")
+            # NOTE: 这里不再打印 excel_file_url / SQL 等调试信息，避免日志爆炸
             
             # 记录本次上传涉及的文件名
             if excel_files and isinstance(excel_files, list) and len(excel_files) > 0:
@@ -3085,8 +3052,7 @@ def save_student_scores(
                             current_excel_new_fields.update(url_dict[fn]['fields'])
                         else:
                             other_excels_fields.update(url_dict[fn]['fields'])
-                        print(f"[save_student_scores] 📝 更新/添加URL: {fn} -> {ef.get('url','')}, description: {ef.get('description','')}, fields_count={len(ef.get('fields',[]) or [])}")
-                        app_logger.info(f"[save_student_scores] 📝 更新/添加URL: {fn} -> {ef.get('url','')}, description: {ef.get('description','')}, fields_count={len(ef.get('fields',[]) or [])}")
+                        pass
                 elif excel_file_url:
                     if excel_file_name:
                         url_dict[excel_file_name] = {
@@ -3095,8 +3061,7 @@ def save_student_scores(
                             'fields': []
                         }
                         current_excel_new_fields.update(url_dict[excel_file_name]['fields'])
-                        print(f"[save_student_scores] 📝 更新/添加URL: {excel_file_name} -> {excel_file_url}, description: {excel_file_description}")
-                        app_logger.info(f"[save_student_scores] 📝 更新/添加URL: {excel_file_name} -> {excel_file_url}, description: {excel_file_description}")
+                        pass
                     else:
                         timestamp = int(time.time())
                         default_key = f"excel_file_{timestamp}"
@@ -3106,13 +3071,10 @@ def save_student_scores(
                             'fields': []
                         }
                         current_excel_new_fields.update(url_dict[default_key]['fields'])
-                        print(f"[save_student_scores] 📝 添加URL（无文件名）: {default_key} -> {excel_file_url}, description: {excel_file_description}")
-                        app_logger.info(f"[save_student_scores] 📝 添加URL（无文件名）: {default_key} -> {excel_file_url}, description: {excel_file_description}")
+                        pass
                 
                 # 将字典转换为JSON字符串保存
                 updated_excel_file_url = json.dumps(url_dict, ensure_ascii=False)
-                print(f"[save_student_scores] ✅ 更新后的excel_file_url（JSON格式）: {updated_excel_file_url}")
-                app_logger.info(f"[save_student_scores] ✅ 更新后的excel_file_url（JSON格式）: {updated_excel_file_url}")
                 
                 update_fields.append("excel_file_url = %s")
                 update_values.append(updated_excel_file_url)
@@ -3120,48 +3082,28 @@ def save_student_scores(
                 # 仅保留其他excel的字段，当前上传excel的字段不加入保留集
                 keep_fields_from_excel_urls = set(other_excels_fields)
             else:
-                print(f"[save_student_scores] ⚠️ 未提供excel文件信息，不更新excel_file_url字段，保留原值")
-                app_logger.info(f"[save_student_scores] ⚠️ 未提供excel文件信息，不更新excel_file_url字段，保留原值")
+                pass
             if update_fields:
                 update_values.append(score_header_id)
                 update_sql = f"UPDATE ta_student_score_header SET {', '.join(update_fields)}, updated_at = NOW() WHERE id = %s"
-                print(f"[save_student_scores] 📝 准备执行UPDATE SQL:")
-                print(f"[save_student_scores]   - SQL语句: {update_sql}")
-                print(f"[save_student_scores]   - 更新字段: {', '.join(update_fields)}")
-                print(f"[save_student_scores]   - SQL参数: {tuple(update_values)}")
-                app_logger.info(f"[save_student_scores] 📝 准备执行UPDATE SQL: {update_sql}, 更新字段: {', '.join(update_fields)}, SQL参数: {tuple(update_values)}")
                 cursor.execute(update_sql, tuple(update_values))
-                print(f"[save_student_scores] ✅ UPDATE执行成功，影响行数: {cursor.rowcount}")
-                app_logger.info(f"[save_student_scores] ✅ UPDATE执行成功，影响行数: {cursor.rowcount}")
-                if excel_file_url:
-                    print(f"[save_student_scores] ✅ excel_file_url已更新到数据库: {excel_file_url}")
-                    app_logger.info(f"[save_student_scores] ✅ excel_file_url已更新到数据库: {excel_file_url}")
+                app_logger.info(f"[save_student_scores] header updated score_header_id={score_header_id}, rowcount={cursor.rowcount}")
             else:
-                print(f"[save_student_scores] ℹ️ 没有需要更新的字段")
-                app_logger.info(f"[save_student_scores] ℹ️ 没有需要更新的字段")
+                pass
             # 不删除旧的成绩明细和字段定义，而是追加新的数据
-            print(f"[save_student_scores] 表头已存在，将追加新的字段定义和成绩明细 - score_header_id={score_header_id}")
-            app_logger.info(f"[save_student_scores] 表头已存在，将追加新的字段定义和成绩明细 - score_header_id={score_header_id}")
+            app_logger.info(f"[save_student_scores] append mode on existing header score_header_id={score_header_id}")
 
-        # 2. 打印scores数据用于调试
-        print(f"[save_student_scores] ========== 收到scores数据 ==========")
-        print(f"[save_student_scores] scores数量: {len(scores)}")
-        for idx, score_item in enumerate(scores):
-            print(f"[save_student_scores] 第{idx+1}条: {json.dumps(score_item, ensure_ascii=False)}")
-        print(f"[save_student_scores] =====================================")
-        app_logger.info(f"[save_student_scores] 收到scores数据: {json.dumps(scores, ensure_ascii=False, indent=2)}")
-        
-        # 3. 处理字段定义
-        print(f"[save_student_scores] 开始处理字段定义 - score_header_id={score_header_id}, operation_mode={operation_mode}")
-        app_logger.info(f"[save_student_scores] 开始处理字段定义 - score_header_id={score_header_id}, operation_mode={operation_mode}")
+        # 2/3. 不再打印 scores 明细与字段列表（过大）；仅记录摘要
+        app_logger.info(
+            f"[save_student_scores] process fields/details score_header_id={score_header_id}, "
+            f"operation_mode={operation_mode}, scores_count={len(scores)}"
+        )
         
         # 如果提供了fields参数，使用fields；否则从scores中提取。并合并excel_file_url中的字段，避免误删其他excel字段。
         if fields and isinstance(fields, list) and len(fields) > 0:
             # 使用提供的字段定义
             field_definitions = fields
             field_name_set = {f.get('field_name') for f in field_definitions if f.get('field_name')}
-            print(f"[save_student_scores] 使用提供的字段定义: {[f.get('field_name') for f in field_definitions]}")
-            app_logger.info(f"[save_student_scores] 使用提供的字段定义: {[f.get('field_name') for f in field_definitions]}")
         else:
             # 从scores数据中提取所有字段名（除了student_id和student_name）
             field_set = set()
@@ -3180,8 +3122,6 @@ def save_student_scores(
                     'is_total': 1 if '总分' in field_name or 'total' in field_name.lower() else 0
                 })
             field_name_set = field_set
-            print(f"[save_student_scores] 从scores中提取的字段: {[f.get('field_name') for f in field_definitions]}")
-            app_logger.info(f"[save_student_scores] 从scores中提取的字段: {[f.get('field_name') for f in field_definitions]}")
 
         # 合并excel_file_url中的“其他excel字段”，防止替换模式误删它们；当前上传的excel字段不加入保留集
         if keep_fields_from_excel_urls:
@@ -3199,8 +3139,7 @@ def save_student_scores(
                         'field_order': append_idx,
                         'is_total': 1 if '总分' in fname or 'total' in fname.lower() else 0
                     })
-            print(f"[save_student_scores] 合并“其他excel字段”后保留字段: {sorted(list(field_name_set))}")
-            app_logger.info(f"[save_student_scores] 合并“其他excel字段”后保留字段: {sorted(list(field_name_set))}")
+            pass
 
         # 当前上传中涉及的字段集合（用于替换模式时保留其他excel的字段）
         upload_field_set = set()
@@ -3222,7 +3161,6 @@ def save_student_scores(
         # 如果无法确定文件名，使用默认值（避免 NOT NULL 约束错误）
         if not current_excel_filename:
             current_excel_filename = f"excel_file_{int(time.time())}"
-            print(f"[save_student_scores] ⚠️ 无法确定Excel文件名，使用默认值: {current_excel_filename}")
             app_logger.warning(f"[save_student_scores] ⚠️ 无法确定Excel文件名，使用默认值: {current_excel_filename}")
         
         # 4. 在替换模式下，删除不在新数据中的字段（需要按 excel_filename 和 field_name 组合删除）
@@ -3243,9 +3181,7 @@ def save_student_scores(
                 for field_name in fields_to_delete:
                     cursor.execute(delete_field_sql, (score_header_id, field_name, current_excel_filename))
                     deleted_field_count += 1
-                    print(f"[save_student_scores] 删除字段: {field_name} (来自 {current_excel_filename})")
                     app_logger.info(f"[save_student_scores] 删除字段: {field_name} (来自 {current_excel_filename})")
-                print(f"[save_student_scores] 替换模式下删除字段完成 - 删除{deleted_field_count}个字段")
                 app_logger.info(f"[save_student_scores] 替换模式下删除字段完成 - 删除{deleted_field_count}个字段")
         
         # 5. 保存或更新字段定义（添加 excel_filename 字段支持）
@@ -3501,10 +3437,8 @@ def save_student_scores(
                     preserved_comments = {k: v for k, v in existing_comments_json.items() 
                                          if not k.endswith(f"_{current_excel_filename}")}
                     comments_json = {**preserved_comments, **comments_json}
-                    print(f"[save_student_scores] 替换模式保留其他excel字段 - student_name={student_name}, 保留字段数={len(preserved)}, 新字段数={len(scores_json)}")
                     app_logger.info(f"[save_student_scores] 替换模式保留其他excel字段 - student_name={student_name}")
                 except (json.JSONDecodeError, TypeError) as e:
-                    print(f"[save_student_scores] 替换模式解析已有JSON失败，使用新数据 - student_name={student_name}, error={e}")
                     app_logger.warning(f"[save_student_scores] 替换模式解析已有JSON失败，使用新数据 - student_name={student_name}, error={e}")
             
             # 如果没有找到总分字段，自动计算总分（所有数字字段的和）
@@ -3523,8 +3457,7 @@ def save_student_scores(
             
             is_update = existing_record is not None
             action = "更新" if is_update else "插入"
-            print(f"[save_student_scores] {action}第{idx+1}条成绩 - student_name={student_name}, student_id={student_id}, scores_json={scores_json_str}, comments_json={comments_json_str}, field_source_json={field_source_json_str}, total_score={total_score}")
-            app_logger.info(f"[save_student_scores] {action}第{idx+1}条成绩 - student_name={student_name}, student_id={student_id}, total_score={total_score}")
+            # 逐条成绩明细不再打印 JSON（过大）；只在失败时记录
             
             try:
                 # 如果记录已存在，使用UPDATE语句
@@ -3542,7 +3475,6 @@ def save_student_scores(
                         existing_record['id']
                     ))
                     updated_count += 1
-                    print(f"[save_student_scores] 第{idx+1}条成绩更新成功 - rowcount={cursor.rowcount}")
                 else:
                     # 新记录，使用INSERT
                     cursor.execute(insert_detail_sql, (
@@ -3555,20 +3487,14 @@ def save_student_scores(
                         total_score
                     ))
                     inserted_count += 1
-                    print(f"[save_student_scores] 第{idx+1}条成绩插入成功 - rowcount={cursor.rowcount}")
             except Exception as insert_error:
-                print(f"[save_student_scores] 第{idx+1}条成绩{action}失败 - student_name={student_name}, error={insert_error}")
                 app_logger.error(f"[save_student_scores] 第{idx+1}条成绩{action}失败 - student_name={student_name}, error={insert_error}", exc_info=True)
                 raise  # 重新抛出异常，让外层捕获
 
-        print(f"[save_student_scores] 成绩明细处理完成 - 插入={inserted_count}, 更新={updated_count}, 跳过={skipped_count}, 总计={len(scores)}")
         app_logger.info(f"[save_student_scores] 成绩明细处理完成 - 插入={inserted_count}, 更新={updated_count}, 跳过={skipped_count}, 总计={len(scores)}")
-        
-        print(f"[save_student_scores] 开始提交事务")
-        app_logger.info(f"[save_student_scores] 开始提交事务")
+
         connection.commit()
         total_processed = inserted_count + updated_count
-        print(f"[save_student_scores] 事务提交成功 - score_header_id={score_header_id}, 插入={inserted_count}, 更新={updated_count}, 删除字段={deleted_field_count}, 删除学生={deleted_student_count}, 总计={total_processed}")
         app_logger.info(f"[save_student_scores] 事务提交成功 - score_header_id={score_header_id}, 插入={inserted_count}, 更新={updated_count}, 删除字段={deleted_field_count}, 删除学生={deleted_student_count}, 总计={total_processed}")
         return { 
             'success': True, 
@@ -3581,29 +3507,19 @@ def save_student_scores(
         }
     except mysql.connector.Error as e:
         if connection and connection.is_connected():
-            print(f"[save_student_scores] 数据库错误，回滚事务 - error={e}")
             app_logger.error(f"[save_student_scores] 数据库错误，回滚事务 - error={e}")
             connection.rollback()
         else:
-            print(f"[save_student_scores] 数据库错误，连接已断开 - error={e}")
             app_logger.error(f"[save_student_scores] 数据库错误，连接已断开 - error={e}")
-        import traceback
-        traceback_str = traceback.format_exc()
-        print(f"[save_student_scores] 数据库错误堆栈:\n{traceback_str}")
-        app_logger.error(f"Database error during save_student_scores: {e}\n{traceback_str}")
+        app_logger.error(f"Database error during save_student_scores: {e}", exc_info=True)
         return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': f'数据库错误: {e}' }
     except Exception as e:
         if connection and connection.is_connected():
-            print(f"[save_student_scores] 未知错误，回滚事务 - error={e}")
             app_logger.error(f"[save_student_scores] 未知错误，回滚事务 - error={e}")
             connection.rollback()
         else:
-            print(f"[save_student_scores] 未知错误，连接已断开 - error={e}")
             app_logger.error(f"[save_student_scores] 未知错误，连接已断开 - error={e}")
-        import traceback
-        traceback_str = traceback.format_exc()
-        print(f"[save_student_scores] 未知错误堆栈:\n{traceback_str}")
-        app_logger.error(f"Unexpected error during save_student_scores: {e}\n{traceback_str}")
+        app_logger.error(f"Unexpected error during save_student_scores: {e}", exc_info=True)
         return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': f'未知错误: {e}' }
     finally:
         if connection and connection.is_connected():
@@ -4784,9 +4700,6 @@ async def api_set_student_score_value(request: Request):
     - 无 excel_filename：写入简单键 field_name
     - 更新后会同步重算 total_score（用于排序）
     """
-    print("=" * 80)
-    print("[student-scores/set-score] ========== 收到设置分数请求 ==========")
-
     def _parse_score_value(v):
         """尽量把输入转换为数值；失败则按原值保留。"""
         if v is None:
@@ -4964,8 +4877,10 @@ async def api_set_student_score_value(request: Request):
         if 'score' not in body:
             return safe_json_response({'message': '缺少必需参数: score', 'code': 400}, status_code=400)
 
-        print(f"[student-scores/set-score] 参数 - score_header_id: {score_header_id}, student_name: {student_name}, student_id: {student_id}, field_name: {field_name}, excel_filename: {excel_filename}, score: {score_raw}")
-        app_logger.info(f"[student-scores/set-score] 收到设置分数请求 - score_header_id: {score_header_id}, student_name: {student_name}, student_id: {student_id}, field_name: {field_name}, excel_filename: {excel_filename}")
+        app_logger.info(
+            f"[student-scores/set-score] request score_header_id={score_header_id}, "
+            f"student_id={student_id}, field_name={field_name}, excel_filename={excel_filename}"
+        )
 
         connection = get_db_connection()
         if connection is None:
@@ -4984,7 +4899,6 @@ async def api_set_student_score_value(request: Request):
             field_result = cursor.fetchone()
             if field_result and field_result.get('excel_filename'):
                 excel_filename = field_result['excel_filename']
-                print(f"[student-scores/set-score] 从字段定义中获取 excel_filename: {excel_filename}")
 
         if isinstance(excel_filename, str):
             excel_filename = excel_filename.strip()
@@ -5059,8 +4973,11 @@ async def api_set_student_score_value(request: Request):
         )
         connection.commit()
 
-        print(f"[student-scores/set-score] ✅ 分数设置成功 - record_id: {record_id}, field_name: {field_name}, score: {score_raw}")
-        app_logger.info(f"[student-scores/set-score] ✅ 分数设置成功 - record_id: {record_id}, student_name: {student_name}, field_name: {field_name}, score: {score_raw}")
+        action = "delete" if score_value is None else "set"
+        app_logger.info(
+            f"[student-scores/set-score] success action={action}, record_id={record_id}, "
+            f"score_key={score_key}, excel_total={recalced_excel_total}, total_score={new_total_score}"
+        )
 
         return safe_json_response({
             'message': '分数设置成功',
@@ -5080,35 +4997,22 @@ async def api_set_student_score_value(request: Request):
 
     except json.JSONDecodeError:
         error_msg = '请求体JSON格式错误'
-        print(f"[student-scores/set-score] ❌ {error_msg}")
-        app_logger.error(f"[student-scores/set-score] ❌ {error_msg}")
+        app_logger.error(f"[student-scores/set-score] {error_msg}")
         return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
     except mysql.connector.Error as e:
         error_msg = f"数据库错误: {e}"
-        print(f"[student-scores/set-score] ❌ {error_msg}")
-        import traceback
-        traceback_str = traceback.format_exc()
-        print(f"[student-scores/set-score] 错误堆栈:\n{traceback_str}")
-        app_logger.error(f"[student-scores/set-score] ❌ {error_msg}\n{traceback_str}")
+        app_logger.error(f"[student-scores/set-score] {error_msg}", exc_info=True)
         return safe_json_response({'message': f'数据库错误: {str(e)}', 'code': 500}, status_code=500)
     except Exception as e:
         error_msg = f"未知错误: {e}"
-        print(f"[student-scores/set-score] ❌ {error_msg}")
-        import traceback
-        traceback_str = traceback.format_exc()
-        print(f"[student-scores/set-score] 错误堆栈:\n{traceback_str}")
-        app_logger.error(f"[student-scores/set-score] ❌ {error_msg}\n{traceback_str}")
+        app_logger.error(f"[student-scores/set-score] {error_msg}", exc_info=True)
         return safe_json_response({'message': f'未知错误: {str(e)}', 'code': 500}, status_code=500)
     finally:
         if 'cursor' in locals() and cursor:
             cursor.close()
-            print("[student-scores/set-score] 🔒 游标已关闭")
         if 'connection' in locals() and connection and connection.is_connected():
             connection.close()
-            print("[student-scores/set-score] 🔒 数据库连接已关闭")
-            app_logger.info(f"[student-scores/set-score] 数据库连接已关闭")
-        print("[student-scores/set-score] ========== 设置分数请求处理完成 ==========")
-        print("=" * 80)
+            app_logger.debug("[student-scores/set-score] db connection closed")
 
 # ===== 小组管理表 API =====
 def save_group_scores(
@@ -7465,16 +7369,16 @@ async def list_userInfo(request: Request):
         # 附加任教关系列表（teachings[]），用于支持一个老师多个班级/科目
         for user in userinfo:
             teachings: List[Dict[str, Any]] = []
-            cursor.execute(
-                """
-                SELECT grade_level, grade, subject, class_taught, sort_order
-                FROM ta_user_teachings
-                WHERE phone = %s
-                ORDER BY sort_order ASC, id ASC
-                """,
-                (phone_filter,),
-            )
-            teachings = cursor.fetchall() or []
+                cursor.execute(
+                    """
+                    SELECT grade_level, grade, subject, class_taught, sort_order
+                    FROM ta_user_teachings
+                    WHERE phone = %s
+                    ORDER BY sort_order ASC, id ASC
+                    """,
+                    (phone_filter,),
+                )
+                teachings = cursor.fetchall() or []
 
             user["teachings"] = teachings
 
