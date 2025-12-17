@@ -50,6 +50,218 @@ router = APIRouter()
 
 from services.tencent_groups import notify_tencent_group_sync
 
+
+async def handle_homework_publish(
+    *,
+    websocket: WebSocket,
+    user_id: str,
+    connection: mysql.connector.MySQLConnection,
+    group_id: Optional[str],
+    msg_data: Dict[str, Any],
+) -> None:
+    """
+    处理教师发布作业：
+    - 校验群组
+    - 保存 homework_messages + homework_receivers
+    - 给在线成员推送并标记已读
+    - 给发送者回执
+    """
+    group_id = (str(group_id).strip() if group_id is not None else "") or None
+    if not group_id:
+        error_msg = "缺少 group_id（作业消息无法路由到群组）"
+        app_logger.warning(f"[homework] {error_msg}, user_id={user_id}, raw={str(msg_data)[:300]}")
+        print(f"[homework] {error_msg}")
+        await websocket.send_text(json.dumps({"type": "error", "message": error_msg}, ensure_ascii=False))
+        return
+
+    class_id = msg_data.get("class_id")
+    school_id = msg_data.get("school_id")
+    subject = msg_data.get("subject", "") or ""
+    content = msg_data.get("content", "") or ""
+    date_str = msg_data.get("date", "") or ""
+    sender_id = msg_data.get("sender_id") or user_id
+    sender_name = msg_data.get("sender_name", "") or ""
+
+    app_logger.info(
+        f"[homework] 收到作业消息 - user_id={user_id}, group_id={group_id}, sender_id={sender_id}, "
+        f"class_id={class_id}, school_id={school_id}, subject={subject}, date={date_str}, content_length={len(content)}"
+    )
+    print(f"[homework] 收到作业消息 user_id={user_id}, group_id={group_id}, sender_id={sender_id}")
+
+    cursor = connection.cursor(dictionary=True)
+    try:
+        # 验证群组是否存在
+        cursor.execute(
+            """
+            SELECT group_id, group_name, owner_identifier
+            FROM `groups`
+            WHERE group_id = %s
+            """,
+            (group_id,),
+        )
+        group_info = cursor.fetchone()
+        if not group_info:
+            error_msg = f"群组 {group_id} 不存在"
+            app_logger.warning(f"[homework] {error_msg}, user_id={user_id}")
+            await websocket.send_text(json.dumps({"type": "error", "message": error_msg}, ensure_ascii=False))
+            return
+
+        group_name = group_info.get("group_name", "") or ""
+        owner_identifier = group_info.get("owner_identifier", "") or ""
+        app_logger.info(
+            f"[homework] 群组验证成功 - group_id={group_id}, group_name={group_name}, owner_identifier={owner_identifier}"
+        )
+
+        # 获取群组所有成员（排除发送者自己）
+        cursor.execute(
+            """
+            SELECT user_id
+            FROM `group_members`
+            WHERE group_id = %s AND user_id != %s
+            """,
+            (group_id, sender_id),
+        )
+        members = cursor.fetchall()
+        total_members = len(members)
+        app_logger.info(f"[homework] 获取群组成员 - group_id={group_id}, 总成员数={total_members}（排除发送者）")
+
+        # 解析日期
+        try:
+            if date_str:
+                date_obj = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+            else:
+                date_obj = datetime.date.today()
+        except ValueError:
+            date_obj = datetime.date.today()
+            app_logger.warning(f"[homework] 日期格式错误，使用今天: {date_str}")
+
+        # 构建推送消息（字符串，避免重复 dumps）
+        homework_message = json.dumps(
+            {
+                "type": "homework",
+                "class_id": class_id,
+                "school_id": school_id,
+                "subject": subject,
+                "content": content,
+                "date": date_obj.strftime("%Y-%m-%d"),
+                "sender_id": sender_id,
+                "sender_name": sender_name,
+                "group_id": group_id,
+                "group_name": group_name,
+            },
+            ensure_ascii=False,
+        )
+
+        # 先为所有成员保存到数据库（不管是否在线）
+        app_logger.info(f"[homework] 开始保存作业数据到数据库，成员数={total_members}, group_id={group_id}")
+        print(f"[homework] 开始入库 group_id={group_id}, members={total_members}")
+
+        homework_id: Optional[int] = None
+        try:
+            cursor.execute(
+                """
+                INSERT INTO homework_messages (
+                    group_id, class_id, school_id, subject, content, date, sender_id, sender_name, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                """,
+                (group_id, class_id, school_id, subject, content, date_obj, sender_id, sender_name),
+            )
+            homework_id = cursor.lastrowid
+            app_logger.info(f"[homework] 插入主记录成功，homework_id={homework_id}")
+
+            # 为每个成员插入接收记录（is_read=0 表示未读）
+            for member in members:
+                member_id = member["user_id"]
+                cursor.execute(
+                    """
+                    INSERT INTO homework_receivers (
+                        homework_id, receiver_id, is_read, created_at
+                    ) VALUES (%s, %s, 0, NOW())
+                    ON DUPLICATE KEY UPDATE is_read = 0, created_at = NOW()
+                    """,
+                    (homework_id, member_id),
+                )
+
+            connection.commit()
+            app_logger.info(f"[homework] 入库成功 - homework_id={homework_id}, receivers={total_members}")
+            print(f"[homework] 入库成功 homework_id={homework_id}")
+        except Exception as e:
+            connection.rollback()
+            app_logger.error(
+                f"[homework] 入库失败 - group_id={group_id}, sender_id={sender_id}, error={e}",
+                exc_info=True,
+            )
+            print(f"[homework] 入库失败: {e}")
+            await websocket.send_text(json.dumps({"type": "error", "message": "作业保存失败"}, ensure_ascii=False))
+            return
+
+        online_count = 0
+        offline_count = 0
+        online_members: List[str] = []
+        offline_members: List[str] = []
+
+        # 然后推送在线的成员
+        for member in members:
+            member_id = member["user_id"]
+            target_conn = connections.get(member_id)
+
+            if target_conn:
+                app_logger.debug(f"[homework] 用户 {member_id} 在线，推送消息并标记为已读")
+                print(f"[homework] push online -> {member_id}")
+                online_count += 1
+                online_members.append(member_id)
+                try:
+                    await target_conn["ws"].send_text(homework_message)
+                    cursor.execute(
+                        """
+                        UPDATE homework_receivers
+                        SET is_read = 1, read_at = NOW()
+                        WHERE homework_id = %s AND receiver_id = %s
+                        """,
+                        (homework_id, member_id),
+                    )
+                except Exception as e:
+                    # 单个用户推送失败不影响整体
+                    app_logger.error(
+                        f"[homework] 推送/标记已读失败 - homework_id={homework_id}, receiver_id={member_id}, error={e}",
+                        exc_info=True,
+                    )
+            else:
+                app_logger.debug(f"[homework] 用户 {member_id} 不在线，已保存到数据库，等待登录时获取")
+                offline_count += 1
+                offline_members.append(member_id)
+
+        try:
+            connection.commit()
+        except Exception as e:
+            connection.rollback()
+            app_logger.error(f"[homework] 提交已读标记失败 - homework_id={homework_id}, error={e}", exc_info=True)
+
+        # 给发送者返回结果
+        result_message = f"作业已发布，在线: {online_count} 人，离线: {offline_count} 人"
+        app_logger.info(
+            f"[homework] 完成 - group_id={group_id}, class_id={class_id}, subject={subject}, "
+            f"在线={online_count}, 离线={offline_count}, 在线成员={online_members}, 离线成员={offline_members}"
+        )
+        print(f"[homework] 完成 online={online_count}, offline={offline_count}")
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "homework",
+                    "status": "success",
+                    "message": result_message,
+                    "online_count": online_count,
+                    "offline_count": offline_count,
+                },
+                ensure_ascii=False,
+            )
+        )
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+
 @router.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
     current_online = len(connections)
@@ -148,6 +360,68 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         SET is_read = 1, read_at = NOW()
                         WHERE prepare_id = %s AND receiver_id = %s
                     """, (prep_id, user_id))
+                connection.commit()
+        
+        # 查询所有未读作业消息，逐个推送（格式与在线用户收到的格式一致）
+        # 注意：线上库存在 utf8mb4_0900_ai_ci / utf8mb4_unicode_ci 混用，容易触发 “Illegal mix of collations”
+        # 这里对字符串比较显式指定 COLLATE，避免 WS 登录阶段直接异常断开
+        homework_rows = []
+        try:
+            cursor.execute(
+                """
+                SELECT
+                    hm.homework_id, hm.group_id, hm.class_id, hm.school_id, hm.subject, hm.content, hm.date,
+                    hm.sender_id, hm.sender_name, hm.created_at, g.group_name, hr.is_read
+                FROM homework_messages hm
+                INNER JOIN homework_receivers hr ON hm.homework_id = hr.homework_id
+                LEFT JOIN `groups` g
+                    ON (hm.group_id COLLATE utf8mb4_unicode_ci) = (g.group_id COLLATE utf8mb4_unicode_ci)
+                WHERE (hr.receiver_id COLLATE utf8mb4_unicode_ci) = %s AND hr.is_read = 0
+                ORDER BY hm.created_at DESC
+                """,
+                (user_id,),
+            )
+            homework_rows = cursor.fetchall()
+        except Exception as e:
+            app_logger.error(f"[homework] 登录查询离线作业失败: user_id={user_id}, error={e}", exc_info=True)
+            print(f"[homework] 登录查询离线作业失败: {e}")
+
+        if homework_rows:
+            unread_homework_updates: List[int] = []
+            
+            # 逐个推送，格式与在线用户收到的格式完全一致
+            for hw in homework_rows:
+                homework_message = {
+                    "type": "homework",
+                    "class_id": hw.get("class_id"),
+                    "school_id": hw.get("school_id"),
+                    "subject": hw.get("subject"),
+                    "content": hw.get("content"),
+                    "date": hw.get("date").strftime("%Y-%m-%d") if hw.get("date") else None,
+                    "sender_id": hw.get("sender_id"),
+                    "sender_name": hw.get("sender_name"),
+                    "group_id": hw.get("group_id"),
+                    "group_name": hw.get("group_name") or ""
+                }
+                
+                payload_str = json.dumps(homework_message, ensure_ascii=False)
+                app_logger.info(f"[homework] 用户 {user_id} 登录，推送离线作业: {payload_str}")
+                print(f"[homework] 登录推送离线作业: {payload_str}")
+                await websocket.send_text(payload_str)
+                
+                # 标记为已读
+                hw_id = hw.get("homework_id")
+                if hw_id:
+                    unread_homework_updates.append(hw_id)
+
+            if unread_homework_updates:
+                app_logger.info(f"[homework] 标记 {len(unread_homework_updates)} 条作业为已读，user_id={user_id}")
+                for hw_id in unread_homework_updates:
+                    cursor.execute("""
+                        UPDATE homework_receivers
+                        SET is_read = 1, read_at = NOW()
+                        WHERE homework_id = %s AND receiver_id = %s
+                    """, (hw_id, user_id))
                 connection.commit()
 
         async def handle_temp_room_creation(msg_data1: Dict[str, Any]):
@@ -874,9 +1148,23 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     parts = data.split(":", 2)
                     if len(parts) == 3:
                         target_id, msg = parts[1], parts[2]
-                        msg_data1 = json.loads(msg)
+                        try:
+                            msg_data1 = json.loads(msg)
+                        except Exception as e:
+                            app_logger.error(
+                                f"[websocket][{user_id}] 解析 to: 消息 JSON 失败: error={e}, raw={msg[:500]}",
+                                exc_info=True,
+                            )
+                            print(f"[websocket][{user_id}] 解析 to: 消息 JSON 失败: {e}")
+                            await websocket.send_text("格式错误: to:<target_id>:<JSON消息>")
+                            continue
+
+                        msg_type = msg_data1.get("type") if isinstance(msg_data1, dict) else None
+                        app_logger.info(
+                            f"[websocket][{user_id}] 收到 to: 消息: target_id={target_id}, type={msg_type}, raw={msg[:300]}"
+                        )
                         print(msg)
-                        print(msg_data1['type'])
+                        print(msg_type)
                         if msg_data1['type'] == "1":
                             print(" 加好友消息")
                             target_conn = connections.get(target_id)
@@ -1855,6 +2143,16 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                 "offline_count": offline_count
                             }, ensure_ascii=False))
                             continue
+                        # 作业消息: 发送给群组所有成员
+                        elif msg_data1['type'] == "homework":
+                            await handle_homework_publish(
+                                websocket=websocket,
+                                user_id=user_id,
+                                connection=connection,
+                                group_id=target_id,
+                                msg_data=msg_data1,
+                            )
+                            continue
                         # WebRTC 信令消息处理
                         elif msg_data1['type'] == "webrtc_offer":
                             await handle_webrtc_signal(msg_data1, "offer")
@@ -1889,6 +2187,25 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         continue
                     if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") == "temp_room_owner_leave":
                         await handle_temp_room_owner_leave(msg_data_raw.get("group_id"))
+                        continue
+                    # 兼容纯 JSON 格式的作业发布（不带 to: 前缀）
+                    if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") == "homework":
+                        group_id_from_msg = (
+                            msg_data_raw.get("group_id")
+                            or msg_data_raw.get("target_id")
+                            or msg_data_raw.get("to")
+                        )
+                        app_logger.info(
+                            f"[homework] 收到纯JSON作业消息 - user_id={user_id}, group_id={group_id_from_msg}, raw={data[:300]}"
+                        )
+                        print(f"[homework] 收到纯JSON作业消息 group_id={group_id_from_msg}")
+                        await handle_homework_publish(
+                            websocket=websocket,
+                            user_id=user_id,
+                            connection=connection,
+                            group_id=group_id_from_msg,
+                            msg_data=msg_data_raw,
+                        )
                         continue
                     # WebRTC 信令消息处理（纯 JSON 格式）
                     if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") == "webrtc_offer":

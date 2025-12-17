@@ -35,12 +35,14 @@ def format_notification_time(notification: dict) -> dict:
 
 
 def _build_app_logger() -> logging.Logger:
-    if not os.path.exists("logs"):
-        os.makedirs("logs")
+    # 使用绝对路径，避免因启动工作目录不同导致日志落到意外的位置
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    log_dir = os.path.join(base_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
 
     # 创建一个 TimedRotatingFileHandler，每天 (midnight) 轮转，保留 30 天的日志
     file_handler = TimedRotatingFileHandler(
-        filename="logs/app.log",
+        filename=os.path.join(log_dir, "app.log"),
         when="midnight",
         interval=1,
         backupCount=30,
