@@ -814,7 +814,7 @@ def save_student_scores(
 
 def save_group_scores(
     class_id: str,
-    exam_name: str,
+    exam_name: Optional[str] = None,
     term: Optional[str] = None,
     remark: Optional[str] = None,
     scores: List[Dict] = None,
@@ -829,7 +829,7 @@ def save_group_scores(
     保存小组成绩表（支持动态字段，使用JSON存储）
     参数说明：
     - class_id: 班级ID（必需）
-    - exam_name: 考试名称（必需，如"期中考试"、"期末考试"）
+    - exam_name: 考试/表名称（可选，仅展示字段；不再作为定位条件）
     - term: 学期（可选，如 '2025-2026-1'）
     - remark: 备注（可选）
     - excel_file_url: Excel文件在OSS的URL（可选）
@@ -865,8 +865,10 @@ def save_group_scores(
     返回：
     - { success, score_header_id, inserted_count, updated_count, deleted_count, message }
     """
-    if not class_id or not exam_name:
-        return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '缺少必要参数 class_id 或 exam_name' }
+    if not class_id:
+        return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '缺少必要参数 class_id' }
+
+    exam_name_norm = str(exam_name).strip() if exam_name is not None and str(exam_name).strip() else None
     
     # 验证operation_mode
     if operation_mode not in ['append', 'replace']:
@@ -878,8 +880,8 @@ def save_group_scores(
     elif operation_mode == 'append' and (not scores or not isinstance(scores, list)):
         return { 'success': False, 'score_header_id': None, 'inserted_count': 0, 'message': '成绩明细列表不能为空' }
 
-    print(f"[save_group_scores] 开始保存小组成绩 - class_id={class_id}, exam_name={exam_name}, term={term}, operation_mode={operation_mode}, scores数量={len(scores) if scores else 0}")
-    app_logger.info(f"[save_group_scores] 开始保存小组成绩 - class_id={class_id}, exam_name={exam_name}, term={term}, operation_mode={operation_mode}, scores数量={len(scores) if scores else 0}")
+    print(f"[save_group_scores] 开始保存小组成绩 - class_id={class_id}, exam_name={exam_name_norm}, term={term}, operation_mode={operation_mode}, scores数量={len(scores) if scores else 0}")
+    app_logger.info(f"[save_group_scores] 开始保存小组成绩 - class_id={class_id}, exam_name={exam_name_norm}, term={term}, operation_mode={operation_mode}, scores数量={len(scores) if scores else 0}")
     
     connection = get_db_connection()
     if connection is None:
@@ -895,11 +897,15 @@ def save_group_scores(
         cursor = connection.cursor(dictionary=True)
 
         # 1. 插入或获取小组成绩表头
-        print(f"[save_group_scores] 查询小组成绩表头 - class_id={class_id}, exam_name={exam_name}, term={term}")
-        app_logger.info(f"[save_group_scores] 查询小组成绩表头 - class_id={class_id}, exam_name={exam_name}, term={term}")
+        # 约定：class_id + term 唯一定位一张小组成绩表；exam_name 仅展示字段，不参与定位
+        print(f"[save_group_scores] 查询小组成绩表头 - class_id={class_id}, term={term}（忽略exam_name定位：{exam_name_norm}）")
+        app_logger.info(f"[save_group_scores] 查询小组成绩表头 - class_id={class_id}, term={term}（忽略exam_name定位：{exam_name_norm}）")
         cursor.execute(
-            "SELECT id, excel_file_url FROM ta_group_score_header WHERE class_id = %s AND exam_name = %s AND (%s IS NULL OR term = %s) LIMIT 1",
-            (class_id, exam_name, term, term)
+            "SELECT id, excel_file_url, exam_name "
+            "FROM ta_group_score_header "
+            "WHERE class_id = %s AND ((%s IS NULL AND term IS NULL) OR term = %s) "
+            "ORDER BY created_at DESC LIMIT 1",
+            (class_id, term, term)
         )
         header_row = cursor.fetchone()
         print(f"[save_group_scores] 查询小组成绩表头结果: {header_row}")
@@ -920,6 +926,9 @@ def save_group_scores(
             # 插入新表头
             print(f"[save_group_scores] ========== 插入新小组成绩表头 ==========")
             app_logger.info(f"[save_group_scores] ========== 插入新小组成绩表头 ==========")
+
+            # exam_name 允许不传，但列为 NOT NULL，这里给默认展示名
+            exam_name_to_store = exam_name_norm or "小组成绩"
             
             # 处理Excel文件URL（类似学生成绩接口）
             final_excel_file_url = None
@@ -963,7 +972,7 @@ def save_group_scores(
                 "INSERT INTO ta_group_score_header (class_id, exam_name, term, remark, excel_file_url, created_at) "
                 "VALUES (%s, %s, %s, %s, %s, NOW())"
             )
-            cursor.execute(insert_header_sql, (class_id, exam_name, term, remark, final_excel_file_url))
+            cursor.execute(insert_header_sql, (class_id, exam_name_to_store, term, remark, final_excel_file_url))
             score_header_id = cursor.lastrowid
             print(f"[save_group_scores] ✅ 插入小组成绩表头成功 - score_header_id={score_header_id}")
             app_logger.info(f"[save_group_scores] ✅ 插入小组成绩表头成功 - score_header_id={score_header_id}")
@@ -975,6 +984,10 @@ def save_group_scores(
             # 更新表头信息（类似学生成绩接口的Excel文件处理逻辑）
             update_fields = []
             update_values = []
+            # exam_name 不再参与定位：如果客户端传了，则作为展示字段更新
+            if exam_name_norm is not None:
+                update_fields.append("exam_name = %s")
+                update_values.append(exam_name_norm)
             if remark is not None:
                 update_fields.append("remark = %s")
                 update_values.append(remark)

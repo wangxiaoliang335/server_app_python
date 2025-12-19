@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import json
 import os
+import re
 import time
 import traceback
 from typing import Any, Dict, List, Optional
@@ -17,6 +18,36 @@ from services.oss_upload import upload_excel_to_oss
 
 
 router = APIRouter()
+
+def _normalize_excel_table_name(raw: Optional[str]) -> Optional[str]:
+    """
+    table_name（客户端传入）指的是“Excel 表/文件名”的基名：
+    - 允许传：期中成绩单 / 期中成绩单.xlsx
+    - 统一去掉末尾 .xlsx
+    """
+    if raw is None:
+        return None
+    name = str(raw).strip()
+    if not name:
+        return None
+    if name.lower().endswith(".xlsx"):
+        name = name[:-5]
+    return name.strip() or None
+
+
+def _excel_filename_matches_table_name(excel_filename: str, table_name_base: str) -> bool:
+    """
+    判断某个 excel_filename 是否属于客户端传入的 table_name：
+    - table_name=期中成绩单
+    - 精确匹配：仅匹配 期中成绩单.xlsx
+    """
+    if not excel_filename:
+        return False
+    base = excel_filename
+    if base.lower().endswith(".xlsx"):
+        base = base[:-5]
+    base = str(base).strip()
+    return base == table_name_base
 
 
 @router.post("/student-scores/save")
@@ -1074,6 +1105,8 @@ async def api_set_student_score_comment(request: Request):
     try:
         body = await request.json()
         score_header_id = body.get('score_header_id')
+        class_id = body.get('class_id')
+        term = body.get('term')
         student_name = body.get('student_name')
         student_id = body.get('student_id')  # 可选
         field_name = body.get('field_name')
@@ -1081,11 +1114,11 @@ async def api_set_student_score_comment(request: Request):
         comment = body.get('comment')
         
         # 参数验证
+        # 兼容：允许不传 score_header_id，改用 class_id + term 定位表头
         if not score_header_id:
-            return safe_json_response({
-                'message': '缺少必需参数: score_header_id',
-                'code': 400
-            }, status_code=400)
+            class_id = str(class_id).strip() if class_id is not None else ""
+            if not class_id:
+                return safe_json_response({'message': '缺少必需参数: score_header_id 或 class_id', 'code': 400}, status_code=400)
         
         if not student_name:
             return safe_json_response({
@@ -1105,8 +1138,8 @@ async def api_set_student_score_comment(request: Request):
                 'code': 400
             }, status_code=400)
         
-        print(f"[student-scores/set-comment] 参数 - score_header_id: {score_header_id}, student_name: {student_name}, student_id: {student_id}, field_name: {field_name}, excel_filename: {excel_filename}, comment: {comment}")
-        app_logger.info(f"[student-scores/set-comment] 收到设置注释请求 - score_header_id: {score_header_id}, student_name: {student_name}, student_id: {student_id}, field_name: {field_name}, excel_filename: {excel_filename}")
+        print(f"[student-scores/set-comment] 参数 - score_header_id: {score_header_id}, class_id: {class_id}, term: {term}, student_name: {student_name}, student_id: {student_id}, field_name: {field_name}, excel_filename: {excel_filename}, comment: {comment}")
+        app_logger.info(f"[student-scores/set-comment] 收到设置注释请求 - score_header_id: {score_header_id}, class_id: {class_id}, term: {term}, student_name: {student_name}, student_id: {student_id}, field_name: {field_name}, excel_filename: {excel_filename}")
         
         connection = get_db_connection()
         if connection is None:
@@ -1116,6 +1149,20 @@ async def api_set_student_score_comment(request: Request):
             }, status_code=500)
         
         cursor = connection.cursor(dictionary=True)
+
+        # 如果没有提供 score_header_id，则尝试用 class_id + term 找到表头
+        if not score_header_id:
+            cursor.execute(
+                "SELECT id FROM ta_student_score_header "
+                "WHERE class_id = %s AND ((%s IS NULL AND term IS NULL) OR term = %s) "
+                "ORDER BY created_at DESC, updated_at DESC "
+                "LIMIT 1",
+                (class_id, term, term),
+            )
+            header_row = cursor.fetchone()
+            if not header_row:
+                return safe_json_response({'message': '未找到学生成绩表头（请确认 class_id/term）', 'code': 404}, status_code=404)
+            score_header_id = header_row.get("id")
         
         # 如果没有提供 excel_filename，尝试从字段定义中查找
         if not excel_filename:
@@ -1441,6 +1488,8 @@ async def api_set_student_score_value(request: Request):
     try:
         body = await request.json()
         score_header_id = body.get('score_header_id')
+        class_id = body.get('class_id')
+        term = body.get('term')
         student_name = body.get('student_name')
         student_id = body.get('student_id')  # 可选
         field_name = body.get('field_name')
@@ -1448,8 +1497,11 @@ async def api_set_student_score_value(request: Request):
         score_raw = body.get('score')
 
         # 参数验证
+        # 兼容：允许不传 score_header_id，改用 class_id + term 定位表头
         if not score_header_id:
-            return safe_json_response({'message': '缺少必需参数: score_header_id', 'code': 400}, status_code=400)
+            class_id = str(class_id).strip() if class_id is not None else ""
+            if not class_id:
+                return safe_json_response({'message': '缺少必需参数: score_header_id 或 class_id', 'code': 400}, status_code=400)
         if not student_name:
             return safe_json_response({'message': '缺少必需参数: student_name', 'code': 400}, status_code=400)
         if not field_name:
@@ -1460,7 +1512,7 @@ async def api_set_student_score_value(request: Request):
 
         app_logger.info(
             f"[student-scores/set-score] request score_header_id={score_header_id}, "
-            f"student_id={student_id}, field_name={field_name}, excel_filename={excel_filename}"
+            f"class_id={class_id}, term={term}, student_id={student_id}, field_name={field_name}, excel_filename={excel_filename}"
         )
 
         connection = get_db_connection()
@@ -1468,6 +1520,20 @@ async def api_set_student_score_value(request: Request):
             return safe_json_response({'message': '数据库连接失败', 'code': 500}, status_code=500)
 
         cursor = connection.cursor(dictionary=True)
+
+        # 如果没有提供 score_header_id，则尝试用 class_id + term 找到表头
+        if not score_header_id:
+            cursor.execute(
+                "SELECT id FROM ta_student_score_header "
+                "WHERE class_id = %s AND ((%s IS NULL AND term IS NULL) OR term = %s) "
+                "ORDER BY created_at DESC, updated_at DESC "
+                "LIMIT 1",
+                (class_id, term, term),
+            )
+            header_row = cursor.fetchone()
+            if not header_row:
+                return safe_json_response({'message': '未找到学生成绩表头（请确认 class_id/term）', 'code': 404}, status_code=404)
+            score_header_id = header_row.get("id")
 
         # 如果没有提供 excel_filename，尝试从字段定义中查找
         if not excel_filename:
@@ -1603,7 +1669,7 @@ async def api_save_group_scores(request: Request):
     请求体 JSON:
     {
       "class_id": "class_1001",
-      "exam_name": "期中考试",           // 考试名称（必需）
+      "exam_name": "期中考试",           // 考试/表名称（可选，仅展示字段）
       "term": "2025-2026-1",            // 可选
       "remark": "备注信息",              // 可选
       "operation_mode": "append",       // 可选，"append"（追加，默认）或 "replace"（替换）
@@ -2003,11 +2069,7 @@ async def api_save_group_scores(request: Request):
         app_logger.error(f"[group-scores/save] ❌ {error_msg}")
         return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
     
-    if not exam_name:
-        error_msg = '缺少必要参数 exam_name'
-        print(f"[group-scores/save] ❌ {error_msg}")
-        app_logger.error(f"[group-scores/save] ❌ {error_msg}")
-        return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
+    # exam_name 已改为可选（展示字段，不作为定位条件）
     
     if operation_mode not in ['append', 'replace']:
         error_msg = f'无效的 operation_mode: {operation_mode}，必须是 "append" 或 "replace"'
@@ -2076,7 +2138,7 @@ async def api_save_group_scores(request: Request):
 async def api_get_group_scores(
     request: Request,
     class_id: str = Query(..., description="班级ID"),
-    exam_name: Optional[str] = Query(None, description="考试名称，可选"),
+    exam_name: Optional[str] = Query(None, description="考试名称（可选，仅展示字段；不再作为查询条件）"),
     term: Optional[str] = Query(None, description="学期，可选")
 ):
     """
@@ -2144,22 +2206,14 @@ async def api_get_group_scores(
         cursor = connection.cursor(dictionary=True)
         
         # 查询小组成绩表头
-        if exam_name:
-            cursor.execute(
-                "SELECT id, class_id, exam_name, term, remark, excel_file_url, created_at, updated_at "
-                "FROM ta_group_score_header "
-                "WHERE class_id = %s AND exam_name = %s AND (%s IS NULL OR term = %s) "
-                "ORDER BY created_at DESC LIMIT 1",
-                (class_id, exam_name, term, term)
-            )
-        else:
-            cursor.execute(
-                "SELECT id, class_id, exam_name, term, remark, excel_file_url, created_at, updated_at "
-                "FROM ta_group_score_header "
-                "WHERE class_id = %s AND (%s IS NULL OR term = %s) "
-                "ORDER BY created_at DESC LIMIT 1",
-                (class_id, term, term)
-            )
+        # 约定：class_id + term 唯一定位一张小组成绩表；exam_name 仅展示字段，不参与定位
+        cursor.execute(
+            "SELECT id, class_id, exam_name, term, remark, excel_file_url, created_at, updated_at "
+            "FROM ta_group_score_header "
+            "WHERE class_id = %s AND ((%s IS NULL AND term IS NULL) OR term = %s) "
+            "ORDER BY created_at DESC LIMIT 1",
+            (class_id, term, term)
+        )
         
         header = cursor.fetchone()
         if not header:
@@ -2174,13 +2228,30 @@ async def api_get_group_scores(
 
         score_header_id = header['id']
         
+        # 明细表列探测：comments_json 可能需要迁移后才存在
+        cursor.execute("SHOW COLUMNS FROM `ta_group_score_detail`")
+        detail_cols = [r.get("Field") for r in (cursor.fetchall() or []) if isinstance(r, dict)]
+        has_comments_json = "comments_json" in detail_cols
+
         # 查询所有成绩明细，按小组名称和学生姓名排序
+        detail_select_cols = [
+            "id",
+            "group_name",
+            "student_id",
+            "student_name",
+            "scores_json",
+            "total_score",
+            "group_total_score",
+        ]
+        if has_comments_json:
+            detail_select_cols.append("comments_json")
+
         cursor.execute(
-            "SELECT id, group_name, student_id, student_name, scores_json, total_score, group_total_score "
+            f"SELECT {', '.join(detail_select_cols)} "
             "FROM ta_group_score_detail "
             "WHERE score_header_id = %s "
             "ORDER BY group_name ASC, student_name ASC",
-            (score_header_id,)
+            (score_header_id,),
         )
         all_scores = cursor.fetchall() or []
         
@@ -2229,6 +2300,7 @@ async def api_get_group_scores(
             # 解析scores_json（支持复合键名）
             scores_data = {}
             scores_data_full = {}  # 完整的scores_json（包含所有复合键名）
+            comments_data_full = {}  # 完整的comments_json（包含所有复合键名）
             if score.get('scores_json'):
                 try:
                     scores_data_raw = json.loads(score['scores_json']) if isinstance(score['scores_json'], str) else score['scores_json']
@@ -2261,6 +2333,16 @@ async def api_get_group_scores(
                 except (json.JSONDecodeError, TypeError):
                     scores_data = {}
                     scores_data_full = {}
+
+            # 解析 comments_json（完整返回，避免重复下发）
+            if has_comments_json and score.get("comments_json"):
+                try:
+                    comments_raw = score.get("comments_json")
+                    comments_data_full = json.loads(comments_raw) if isinstance(comments_raw, str) else comments_raw
+                    if not isinstance(comments_data_full, dict):
+                        comments_data_full = {}
+                except (json.JSONDecodeError, TypeError):
+                    comments_data_full = {}
             
             if group_name not in group_dict:
                 group_dict[group_name] = {
@@ -2269,20 +2351,16 @@ async def api_get_group_scores(
                     'students': []
                 }
             
-            # 构建学生信息（包含所有动态字段）
+            # 构建学生信息（仅返回 scores_json_full + comments_json_full，避免重复下发）
             student_info = {
                 'id': score['id'],
                 'student_id': score.get('student_id'),
                 'student_name': score.get('student_name', ''),
                 'total_score': float(score['total_score']) if score.get('total_score') is not None else None,
                 'group_total_score': float(score['group_total_score']) if score.get('group_total_score') is not None else None,
-                'scores': scores_data,  # 解析后的简单字段名（向后兼容）
-                'scores_json_full': scores_data_full  # 完整的scores_json（包含所有复合键名）
+                'scores_json_full': scores_data_full,  # 完整的scores_json（包含所有复合键名）
+                'comments_json_full': comments_data_full if has_comments_json else {}  # 完整的comments_json（包含所有复合键名）
             }
-            
-            # 将动态字段也平铺到顶层（方便客户端使用）
-            for key, value in scores_data.items():
-                student_info[key] = value
             
             group_dict[group_name]['students'].append(student_info)
         
@@ -2370,4 +2448,1176 @@ async def api_get_group_scores(
             connection.close()
             app_logger.info("Database connection closed after fetching group scores.")
 
+
+@router.post("/group-scores/set-score")
+async def api_set_group_score_value(request: Request):
+    """
+    小组成绩：设置/更新某个学生某个字段的分数（更新 ta_group_score_detail.scores_json）。
+
+    请求体 JSON:
+    {
+      "class_id": "class_1001",                 // 必需（用于定位 header：class_id + term）
+      "term": "2025-2026-1",                    // 可选（不传则定位 term IS NULL 的那条）
+      "student_id": "2024001",                  // 可选（与 student_name 二选一；推荐传）
+      "student_name": "张三",                   // 可选（与 student_id 二选一）
+      "field_name": "纪律",                     // 必需
+      "excel_filename": "学生体质统计表.xlsx",   // 可选：用于复合键名 field_excel
+      "table_name": "学生体质统计表",            // 可选：excel_filename 的基名替代；精确匹配到 *.xlsx
+      "score": 98                               // 必需：分数；传 null/空字符串表示删除该字段
+    }
+    """
+    def _parse_score_value(v):
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            try:
+                return float(s)
+            except ValueError:
+                return s
+        return v
+
+    def _to_float_or_none(v) -> Optional[float]:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            try:
+                return float(s)
+            except Exception:
+                return None
+        return None
+
+    def _excel_filename_base(name: Optional[str]) -> str:
+        if not name:
+            return ""
+        s = str(name).strip()
+        if not s:
+            return ""
+        lower = s.lower()
+        if lower.endswith(".xlsx"):
+            return s[:-5]
+        if lower.endswith(".xls"):
+            return s[:-4]
+        if lower.endswith(".csv"):
+            return s[:-4]
+        return s
+
+    def _candidate_score_keys(field: str, excel_filename: Optional[str]) -> set:
+        keys = set()
+        field_s = str(field).strip()
+        if not field_s:
+            return keys
+        keys.add(field_s)
+        if excel_filename:
+            fn = str(excel_filename).strip()
+            base = _excel_filename_base(fn)
+            for suffix in {fn, base, f"{base}.xlsx" if base else "", f"{base}.xls" if base else ""}:
+                suffix = (suffix or "").strip()
+                if suffix:
+                    keys.add(f"{field_s}_{suffix}")
+        return keys
+
+    def _recalc_total_score(scores_dict: dict) -> Optional[float]:
+        try:
+            totals: List[float] = []
+            for k, v in (scores_dict or {}).items():
+                ks = str(k)
+                if ks.startswith("总分") or ks.lower().startswith("total"):
+                    fv = _to_float_or_none(v)
+                    if fv is not None:
+                        totals.append(fv)
+            if totals:
+                return float(sum(totals))
+
+            s = 0.0
+            has_number = False
+            for k, v in (scores_dict or {}).items():
+                ks = str(k)
+                if ks.startswith("总分") or ks.lower().startswith("total"):
+                    continue
+                fv = _to_float_or_none(v)
+                if fv is not None:
+                    s += fv
+                    has_number = True
+            return s if has_number else None
+        except Exception:
+            return None
+
+    def _recalc_total_for_excel(scores_dict: dict, excel_filename: Optional[str]) -> Optional[float]:
+        if not excel_filename:
+            return None
+        fn = str(excel_filename).strip()
+        if not fn:
+            return None
+
+        base = _excel_filename_base(fn)
+        variants = {fn, base}
+        if base:
+            variants.add(f"{base}.xlsx")
+            variants.add(f"{base}.xls")
+            variants.add(f"{base}.csv")
+        variants = {v.strip() for v in variants if v and str(v).strip()}
+        if not variants:
+            return None
+
+        for var in list(variants):
+            scores_dict.pop(f"总分_{var}", None)
+            scores_dict.pop(f"total_{var}", None)
+
+        s = 0.0
+        has_number = False
+        for k, v in list((scores_dict or {}).items()):
+            ks = str(k)
+            if ks.startswith("总分_") or ks.lower().startswith("total_"):
+                continue
+            matched = False
+            for var in variants:
+                if ks.endswith(f"_{var}"):
+                    matched = True
+                    break
+            if not matched:
+                continue
+            fv = _to_float_or_none(v)
+            if fv is not None:
+                s += fv
+                has_number = True
+
+        if not has_number:
+            return None
+
+        scores_dict[f"总分_{fn}"] = float(s)
+        return float(s)
+
+    def _calc_total_for_excel(scores_dict: dict, excel_filename: Optional[str]) -> Optional[float]:
+        """
+        计算某个 excel 维度下的“表内总分”（不修改 scores_dict）。
+        - 仅统计 key 形如：xxx_{excel} / xxx_{excel_base} 等变体
+        - 跳过 总分_/total_ 开头的字段
+        """
+        if not excel_filename:
+            return None
+        try:
+            fn = str(excel_filename).strip()
+            if not fn:
+                return None
+            base = _excel_filename_base(fn)
+            variants = {fn, base}
+            if base:
+                variants.add(f"{base}.xlsx")
+                variants.add(f"{base}.xls")
+                variants.add(f"{base}.csv")
+            variants = {v.strip() for v in variants if v and str(v).strip()}
+            if not variants:
+                return None
+
+            s = 0.0
+            has_number = False
+            for k, v in (scores_dict or {}).items():
+                ks = str(k)
+                if ks.startswith("总分_") or ks.lower().startswith("total_"):
+                    continue
+                matched = False
+                for var in variants:
+                    if ks.endswith(f"_{var}"):
+                        matched = True
+                        break
+                if not matched:
+                    continue
+                fv = _to_float_or_none(v)
+                if fv is not None:
+                    s += fv
+                    has_number = True
+            return float(s) if has_number else None
+        except Exception:
+            return None
+
+    def _return_with_log(payload: dict, status_code: int = 200):
+        """
+        统一打印并记录本接口的返回消息，便于排查前端/接口调用问题。
+        - 控制台：print（开发/容器日志可见）
+        - 文件日志：app_logger（logs/app.log）
+        """
+        try:
+            msg = ""
+            if isinstance(payload, dict):
+                msg = str(payload.get("message") or "")
+            response_json_pretty = json.dumps(payload, ensure_ascii=False, indent=2)
+            print(f"[group-scores/set-score] 返回 message={msg} status_code={status_code}\n{response_json_pretty}")
+
+            response_json_compact = json.dumps(payload, ensure_ascii=False)
+            if status_code >= 500:
+                app_logger.error(
+                    f"[group-scores/set-score] 返回 message={msg} status_code={status_code} payload={response_json_compact}"
+                )
+            elif status_code >= 400:
+                app_logger.warning(
+                    f"[group-scores/set-score] 返回 message={msg} status_code={status_code} payload={response_json_compact}"
+                )
+            else:
+                app_logger.info(
+                    f"[group-scores/set-score] 返回 message={msg} status_code={status_code} payload={response_json_compact}"
+                )
+        except Exception as log_error:
+            print(f"[group-scores/set-score] 打印返回消息时出错: {log_error}")
+            try:
+                app_logger.warning(f"[group-scores/set-score] 打印返回消息时出错: {log_error}")
+            except Exception:
+                pass
+
+        return safe_json_response(payload, status_code=status_code)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return _return_with_log({"message": "请求体JSON格式错误", "code": 400}, status_code=400)
+
+    class_id = (data.get("class_id") or "").strip()
+    term = data.get("term")
+    student_id = (data.get("student_id") or "").strip() or None
+    student_name = (data.get("student_name") or "").strip() or None
+    field_name = (data.get("field_name") or "").strip()
+    excel_filename = (data.get("excel_filename") or "").strip() or None
+    table_name = (data.get("table_name") or "").strip() or None
+    score_raw = data.get("score")
+
+    if not class_id:
+        return _return_with_log({"message": "缺少必要参数 class_id", "code": 400}, status_code=400)
+    if not (student_id or student_name):
+        return _return_with_log({"message": "缺少必要参数 student_id 或 student_name", "code": 400}, status_code=400)
+    if not field_name:
+        return _return_with_log({"message": "缺少必要参数 field_name", "code": 400}, status_code=400)
+    if not (excel_filename or table_name):
+        return _return_with_log({"message": "缺少必要参数：excel_filename 或 table_name（必须二选一传入）", "code": 400}, status_code=400)
+
+    connection = get_db_connection()
+    if connection is None:
+        return _return_with_log({"message": "数据库连接失败", "code": 500}, status_code=500)
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+
+        # 定位 header：class_id + term
+        cursor.execute(
+            "SELECT id, class_id, term, excel_file_url FROM ta_group_score_header "
+            "WHERE class_id = %s AND ((%s IS NULL AND term IS NULL) OR term = %s) "
+            "ORDER BY created_at DESC LIMIT 1",
+            (class_id, term, term),
+        )
+        header_row = cursor.fetchone()
+        if not header_row:
+            return _return_with_log({"message": "未找到小组成绩表头（请确认 class_id/term）", "code": 404}, status_code=404)
+
+        shid = int(header_row["id"])
+
+        # 解析 header.excel_file_url 中的 excel 文件名（用于 table_name -> excel_filename）
+        excel_filenames: List[str] = []
+        try:
+            raw = header_row.get("excel_file_url")
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(parsed, dict):
+                excel_filenames = [str(k) for k in parsed.keys() if k]
+        except Exception:
+            excel_filenames = []
+
+        def _resolve_excel_filename() -> Optional[str]:
+            if excel_filename:
+                return excel_filename
+            if table_name:
+                base = table_name[:-5] if table_name.lower().endswith(".xlsx") else table_name
+                base = base.strip()
+                for fn in excel_filenames:
+                    b = fn[:-5] if fn.lower().endswith(".xlsx") else fn
+                    if str(b).strip() == base:
+                        return fn
+                return None
+            return None
+
+        resolved_excel = _resolve_excel_filename()
+        if not resolved_excel:
+            return _return_with_log(
+                {"message": "无法解析 excel_filename/table_name 到具体 Excel 文件名，请检查参数", "code": 400},
+                status_code=400,
+            )
+        score_key = f"{field_name}_{resolved_excel}" if resolved_excel else field_name
+
+        # 定位学生记录
+        where = ["score_header_id = %s"]
+        params: List[Any] = [shid]
+        if student_id:
+            where.append("student_id = %s")
+            params.append(student_id)
+        else:
+            where.append("student_name = %s")
+            params.append(student_name)
+
+        cursor.execute(
+            "SELECT id, group_name, student_id, student_name, scores_json "
+            "FROM ta_group_score_detail "
+            f"WHERE {' AND '.join(where)} "
+            "ORDER BY id DESC LIMIT 1",
+            tuple(params),
+        )
+        record = cursor.fetchone()
+        if not record:
+            return _return_with_log({"message": "未找到该学生的小组成绩明细", "code": 404}, status_code=404)
+
+        record_id = int(record["id"])
+        record_group_name = (record.get("group_name") or "").strip() or ""
+
+        # 解析 scores_json
+        scores_json_raw = record.get("scores_json")
+        if scores_json_raw:
+            if isinstance(scores_json_raw, str):
+                try:
+                    scores_dict = json.loads(scores_json_raw)
+                except json.JSONDecodeError:
+                    scores_dict = {}
+            else:
+                scores_dict = scores_json_raw
+        else:
+            scores_dict = {}
+        if not isinstance(scores_dict, dict):
+            scores_dict = {}
+
+        score_value = _parse_score_value(score_raw)
+        candidate_keys = _candidate_score_keys(field_name, resolved_excel) if resolved_excel else {field_name}
+
+        if score_value is None:
+            for k in candidate_keys:
+                scores_dict.pop(k, None)
+        else:
+            for k in candidate_keys:
+                if k != score_key:
+                    scores_dict.pop(k, None)
+            scores_dict[score_key] = score_value
+            if not resolved_excel:
+                scores_dict[field_name] = score_value
+
+        excel_total = _recalc_total_for_excel(scores_dict, resolved_excel) if resolved_excel else None
+        new_total_score = _recalc_total_score(scores_dict)
+
+        cursor.execute(
+            "UPDATE ta_group_score_detail "
+            "SET scores_json = %s, total_score = %s, updated_at = NOW() "
+            "WHERE id = %s",
+            (json.dumps(scores_dict, ensure_ascii=False), new_total_score, record_id),
+        )
+
+        # 重算该组 group_total_score：求和该组所有学生 total_score，并回写到同组所有行
+        group_total_score = None
+        if record_group_name:
+            # 注意：这里的 group_total_score 需要表示“当前表（resolved_excel）的小组总分”，
+            # 不能简单 SUM(total_score)（total_score 往往是跨表累计的总分）。
+            cursor.execute(
+                "SELECT scores_json FROM ta_group_score_detail "
+                "WHERE score_header_id = %s AND group_name = %s",
+                (shid, record_group_name),
+            )
+            rows = cursor.fetchall() or []
+            s = 0.0
+            has_number = False
+            for r in rows:
+                raw_scores = (r or {}).get("scores_json")
+                sd = {}
+                if raw_scores:
+                    if isinstance(raw_scores, str):
+                        try:
+                            sd = json.loads(raw_scores)
+                        except Exception:
+                            sd = {}
+                    elif isinstance(raw_scores, dict):
+                        sd = raw_scores
+                if not isinstance(sd, dict):
+                    sd = {}
+
+                # 优先使用已保存的“表内总分”字段，总能更快也更稳定
+                key_total = f"总分_{resolved_excel}" if resolved_excel else None
+                ft = _to_float_or_none(sd.get(key_total)) if key_total else None
+                if ft is None:
+                    ft = _calc_total_for_excel(sd, resolved_excel)
+                if ft is not None:
+                    s += float(ft)
+                    has_number = True
+            group_total_score = float(s) if has_number else None
+
+            cursor.execute(
+                "UPDATE ta_group_score_detail "
+                "SET group_total_score = %s, updated_at = NOW() "
+                "WHERE score_header_id = %s AND group_name = %s",
+                (group_total_score, shid, record_group_name),
+            )
+
+        connection.commit()
+
+        action = "delete" if score_value is None else "set"
+        return _return_with_log(
+            {
+                "message": "分数设置成功",
+                "code": 200,
+                "data": {
+                    "action": action,
+                    "score_header_id": shid,
+                    "record_id": record_id,
+                    "group_name": record_group_name,
+                    "student_id": record.get("student_id"),
+                    "student_name": record.get("student_name"),
+                    "field_name": field_name,
+                    "excel_filename": resolved_excel,
+                    "table_name": table_name,
+                    "score_key": score_key,
+                    "score": score_value,
+                    "excel_total_score": excel_total,
+                    "total_score": new_total_score,
+                    "group_total_score": group_total_score,
+                },
+            },
+            status_code=200,
+        )
+    except mysql.connector.Error as e:
+        if connection:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+        app_logger.error(f"[group-scores/set-score] Database error: {e}", exc_info=True)
+        return _return_with_log({"message": f"数据库错误: {str(e)}", "code": 500}, status_code=500)
+    except Exception as e:
+        if connection:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+        app_logger.error(f"[group-scores/set-score] Unexpected error: {e}", exc_info=True)
+        return _return_with_log({"message": f"未知错误: {str(e)}", "code": 500}, status_code=500)
+    finally:
+        try:
+            if cursor:
+                cursor.close()
+        except Exception:
+            pass
+        try:
+            if connection and connection.is_connected():
+                connection.close()
+        except Exception:
+            pass
+
+
+@router.post("/group-scores/set-comment")
+async def api_set_group_score_comment(request: Request):
+    """
+    小组成绩：设置/更新某个学生某个字段的注释（更新 ta_group_score_detail.comments_json）。
+
+    注意：需要先给 ta_group_score_detail 增加 comments_json 字段（JSON）。
+    """
+    def _return_with_log(payload: dict, status_code: int = 200):
+        """
+        统一打印并记录本接口的返回消息，便于排查前端/接口调用问题。
+        - 控制台：print（开发/容器日志可见）
+        - 文件日志：app_logger（logs/app.log）
+        """
+        try:
+            msg = ""
+            if isinstance(payload, dict):
+                msg = str(payload.get("message") or "")
+            response_json_pretty = json.dumps(payload, ensure_ascii=False, indent=2)
+            print(f"[group-scores/set-comment] 返回 message={msg} status_code={status_code}\n{response_json_pretty}")
+
+            response_json_compact = json.dumps(payload, ensure_ascii=False)
+            if status_code >= 500:
+                app_logger.error(
+                    f"[group-scores/set-comment] 返回 message={msg} status_code={status_code} payload={response_json_compact}"
+                )
+            elif status_code >= 400:
+                app_logger.warning(
+                    f"[group-scores/set-comment] 返回 message={msg} status_code={status_code} payload={response_json_compact}"
+                )
+            else:
+                app_logger.info(
+                    f"[group-scores/set-comment] 返回 message={msg} status_code={status_code} payload={response_json_compact}"
+                )
+        except Exception as log_error:
+            print(f"[group-scores/set-comment] 打印返回消息时出错: {log_error}")
+            try:
+                app_logger.warning(f"[group-scores/set-comment] 打印返回消息时出错: {log_error}")
+            except Exception:
+                pass
+
+        return safe_json_response(payload, status_code=status_code)
+
+    def _to_float_or_none(v) -> Optional[float]:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            try:
+                return float(s)
+            except Exception:
+                return None
+        return None
+
+    def _excel_filename_base(name: Optional[str]) -> str:
+        if not name:
+            return ""
+        s = str(name).strip()
+        if not s:
+            return ""
+        lower = s.lower()
+        if lower.endswith(".xlsx"):
+            return s[:-5]
+        if lower.endswith(".xls"):
+            return s[:-4]
+        if lower.endswith(".csv"):
+            return s[:-4]
+        return s
+
+    def _calc_total_for_excel(scores_dict: dict, excel_filename: Optional[str]) -> Optional[float]:
+        """
+        计算某个 excel 维度下的“表内总分”（不修改 scores_dict）。
+        - 仅统计 key 形如：xxx_{excel} / xxx_{excel_base} 等变体
+        - 跳过 总分_/total_ 开头的字段
+        """
+        if not excel_filename:
+            return None
+        try:
+            fn = str(excel_filename).strip()
+            if not fn:
+                return None
+            base = _excel_filename_base(fn)
+            variants = {fn, base}
+            if base:
+                variants.add(f"{base}.xlsx")
+                variants.add(f"{base}.xls")
+                variants.add(f"{base}.csv")
+            variants = {v.strip() for v in variants if v and str(v).strip()}
+            if not variants:
+                return None
+
+            s = 0.0
+            has_number = False
+            for k, v in (scores_dict or {}).items():
+                ks = str(k)
+                if ks.startswith("总分_") or ks.lower().startswith("total_"):
+                    continue
+                matched = False
+                for var in variants:
+                    if ks.endswith(f"_{var}"):
+                        matched = True
+                        break
+                if not matched:
+                    continue
+                fv = _to_float_or_none(v)
+                if fv is not None:
+                    s += fv
+                    has_number = True
+            return float(s) if has_number else None
+        except Exception:
+            return None
+
+    try:
+        data = await request.json()
+    except Exception:
+        return _return_with_log({"message": "请求体JSON格式错误", "code": 400}, status_code=400)
+
+    class_id = (data.get("class_id") or "").strip()
+    term = data.get("term")
+    student_id = (data.get("student_id") or "").strip() or None
+    student_name = (data.get("student_name") or "").strip() or None
+    field_name = (data.get("field_name") or "").strip()
+    excel_filename = (data.get("excel_filename") or "").strip() or None
+    table_name = (data.get("table_name") or "").strip() or None
+    comment = data.get("comment")
+
+    if not class_id:
+        return _return_with_log({"message": "缺少必要参数 class_id", "code": 400}, status_code=400)
+    if not (student_id or student_name):
+        return _return_with_log({"message": "缺少必要参数 student_id 或 student_name", "code": 400}, status_code=400)
+    if not field_name:
+        return _return_with_log({"message": "缺少必要参数 field_name", "code": 400}, status_code=400)
+    if not (excel_filename or table_name):
+        return _return_with_log({"message": "缺少必要参数：excel_filename 或 table_name（必须二选一传入）", "code": 400}, status_code=400)
+
+    connection = get_db_connection()
+    if connection is None:
+        return _return_with_log({"message": "数据库连接失败", "code": 500}, status_code=500)
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+
+        # 检查 comments_json 字段是否存在
+        cursor.execute("SHOW COLUMNS FROM `ta_group_score_detail`")
+        cols = [r.get("Field") for r in (cursor.fetchall() or []) if isinstance(r, dict)]
+        if "comments_json" not in cols:
+            return _return_with_log(
+                {
+                    "message": "小组成绩表缺少 comments_json 字段，请先执行 add_comments_json_to_group_score_detail.sql",
+                    "code": 500,
+                },
+                status_code=500,
+            )
+
+        # 定位 header：class_id + term
+        cursor.execute(
+            "SELECT id, class_id, term, excel_file_url FROM ta_group_score_header "
+            "WHERE class_id = %s AND ((%s IS NULL AND term IS NULL) OR term = %s) "
+            "ORDER BY created_at DESC LIMIT 1",
+            (class_id, term, term),
+        )
+        header_row = cursor.fetchone()
+        if not header_row:
+            return _return_with_log({"message": "未找到小组成绩表头（请确认 class_id/term）", "code": 404}, status_code=404)
+
+        shid = int(header_row["id"])
+
+        # excel 文件名列表
+        excel_filenames: List[str] = []
+        try:
+            raw = header_row.get("excel_file_url")
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(parsed, dict):
+                excel_filenames = [str(k) for k in parsed.keys() if k]
+        except Exception:
+            excel_filenames = []
+
+        # 定位学生记录（读出 comments_json/field_source_json 便于推断 excel_filename）
+        where = ["score_header_id = %s"]
+        params: List[Any] = [shid]
+        if student_id:
+            where.append("student_id = %s")
+            params.append(student_id)
+        else:
+            where.append("student_name = %s")
+            params.append(student_name)
+
+        select_cols = ["id", "group_name", "student_id", "student_name", "comments_json", "scores_json"]
+        if "field_source_json" in cols:
+            select_cols.append("field_source_json")
+
+        cursor.execute(
+            f"SELECT {', '.join(select_cols)} FROM ta_group_score_detail WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT 1",
+            tuple(params),
+        )
+        record = cursor.fetchone()
+        if not record:
+            return _return_with_log({"message": "未找到该学生的小组成绩明细", "code": 404}, status_code=404)
+
+        def _resolve_excel_filename_from_context() -> Optional[str]:
+            if excel_filename:
+                return excel_filename
+            if table_name:
+                base = table_name[:-5] if table_name.lower().endswith(".xlsx") else table_name
+                base = base.strip()
+                for fn in excel_filenames:
+                    b = fn[:-5] if fn.lower().endswith(".xlsx") else fn
+                    if str(b).strip() == base:
+                        return fn
+                return None
+            return None
+
+        resolved_excel = _resolve_excel_filename_from_context()
+        if not resolved_excel:
+            return _return_with_log(
+                {"message": "无法解析 excel_filename/table_name 到具体 Excel 文件名，请检查参数", "code": 400},
+                status_code=400,
+            )
+        comment_key = f"{field_name}_{resolved_excel}" if resolved_excel else field_name
+        record_group_name = (record.get("group_name") or "").strip() or ""
+
+        # 解析 comments_json
+        comments_raw = record.get("comments_json")
+        if comments_raw:
+            if isinstance(comments_raw, str):
+                try:
+                    comments_dict = json.loads(comments_raw)
+                except json.JSONDecodeError:
+                    comments_dict = {}
+            else:
+                comments_dict = comments_raw
+        else:
+            comments_dict = {}
+        if not isinstance(comments_dict, dict):
+            comments_dict = {}
+
+        # 删除/写入
+        if comment is None or (isinstance(comment, str) and not comment.strip()):
+            comments_dict.pop(comment_key, None)
+        else:
+            # 有复合键时，避免简单键重复
+            if resolved_excel:
+                comments_dict.pop(field_name, None)
+            comments_dict[comment_key] = comment
+
+        cursor.execute(
+            "UPDATE ta_group_score_detail SET comments_json = %s, updated_at = NOW() WHERE id = %s",
+            (json.dumps(comments_dict, ensure_ascii=False), int(record["id"])),
+        )
+
+        # 计算并回写“当前表维度”的小组总分（便于前端刷新展示）
+        group_total_score = None
+        if record_group_name:
+            cursor.execute(
+                "SELECT scores_json FROM ta_group_score_detail "
+                "WHERE score_header_id = %s AND group_name = %s",
+                (shid, record_group_name),
+            )
+            rows = cursor.fetchall() or []
+            s = 0.0
+            has_number = False
+            for r in rows:
+                raw_scores = (r or {}).get("scores_json")
+                sd = {}
+                if raw_scores:
+                    if isinstance(raw_scores, str):
+                        try:
+                            sd = json.loads(raw_scores)
+                        except Exception:
+                            sd = {}
+                    elif isinstance(raw_scores, dict):
+                        sd = raw_scores
+                if not isinstance(sd, dict):
+                    sd = {}
+
+                key_total = f"总分_{resolved_excel}" if resolved_excel else None
+                ft = _to_float_or_none(sd.get(key_total)) if key_total else None
+                if ft is None:
+                    ft = _calc_total_for_excel(sd, resolved_excel)
+                if ft is not None:
+                    s += float(ft)
+                    has_number = True
+            group_total_score = float(s) if has_number else None
+
+            cursor.execute(
+                "UPDATE ta_group_score_detail "
+                "SET group_total_score = %s, updated_at = NOW() "
+                "WHERE score_header_id = %s AND group_name = %s",
+                (group_total_score, shid, record_group_name),
+            )
+
+        connection.commit()
+
+        return _return_with_log(
+            {
+                "message": "注释设置成功",
+                "code": 200,
+                "data": {
+                    "score_header_id": shid,
+                    "record_id": int(record["id"]),
+                    "group_name": record.get("group_name"),
+                    "student_id": record.get("student_id"),
+                    "student_name": record.get("student_name"),
+                    "field_name": field_name,
+                    "excel_filename": resolved_excel,
+                    "table_name": table_name,
+                    "comment_key": comment_key,
+                    "comment": comment,
+                    "comments_json": comments_dict,
+                    "group_total_score": group_total_score,
+                },
+            },
+            status_code=200,
+        )
+    except mysql.connector.Error as e:
+        if connection:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+        app_logger.error(f"[group-scores/set-comment] Database error: {e}", exc_info=True)
+        return _return_with_log({"message": f"数据库错误: {str(e)}", "code": 500}, status_code=500)
+    except Exception as e:
+        if connection:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+        app_logger.error(f"[group-scores/set-comment] Unexpected error: {e}", exc_info=True)
+        return _return_with_log({"message": f"未知错误: {str(e)}", "code": 500}, status_code=500)
+    finally:
+        try:
+            if cursor:
+                cursor.close()
+        except Exception:
+            pass
+        try:
+            if connection and connection.is_connected():
+                connection.close()
+        except Exception:
+            pass
+
+
+@router.get("/group-scores/get-student-attr")
+async def api_get_group_student_attr(
+    class_id: str = Query(..., description="班级ID"),
+    term: Optional[str] = Query(None, description="学期（可选；不传则 term IS NULL）"),
+    student_id: Optional[str] = Query(None, description="学号（可选，与 student_name 二选一）"),
+    student_name: Optional[str] = Query(None, description="学生姓名（可选，与 student_id 二选一）"),
+    field_name: str = Query(..., description="字段名，如：纪律/早读/语文"),
+    excel_filename: Optional[str] = Query(None, description="可选：Excel文件名，如：学生体质统计表.xlsx"),
+    table_name: Optional[str] = Query(None, description="可选：Excel表名基名，如：学生体质统计表（精确匹配到 *.xlsx）"),
+):
+    """小组成绩：单独查询某个学生的某个属性（值 + 注释）。"""
+    sid = (str(student_id).strip() if student_id is not None else "") or None
+    sname = (str(student_name).strip() if student_name is not None else "") or None
+    ef = (str(excel_filename).strip() if excel_filename is not None else "") or None
+    tn = (str(table_name).strip() if table_name is not None else "") or None
+    fname = (str(field_name).strip() if field_name is not None else "") or ""
+
+    if not (sid or sname):
+        return safe_json_response({"message": "缺少必要参数 student_id 或 student_name", "code": 400}, status_code=400)
+    if not fname:
+        return safe_json_response({"message": "缺少必要参数 field_name", "code": 400}, status_code=400)
+    if not (ef or tn):
+        return safe_json_response({"message": "缺少必要参数：excel_filename 或 table_name（必须二选一传入）", "code": 400}, status_code=400)
+
+    connection = get_db_connection()
+    if connection is None:
+        return safe_json_response({"message": "数据库连接失败", "code": 500}, status_code=500)
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+
+        # header：class_id + term
+        cursor.execute(
+            "SELECT id, class_id, term, excel_file_url FROM ta_group_score_header "
+            "WHERE class_id = %s AND ((%s IS NULL AND term IS NULL) OR term = %s) "
+            "ORDER BY created_at DESC LIMIT 1",
+            (class_id, term, term),
+        )
+        header_row = cursor.fetchone()
+        if not header_row:
+            return safe_json_response({"message": "未找到小组成绩表头（请确认 class_id/term）", "code": 404}, status_code=404)
+
+        shid = int(header_row["id"])
+
+        # columns & excel filenames
+        cursor.execute("SHOW COLUMNS FROM `ta_group_score_detail`")
+        cols = [r.get("Field") for r in (cursor.fetchall() or []) if isinstance(r, dict)]
+
+        excel_filenames: List[str] = []
+        try:
+            raw = header_row.get("excel_file_url")
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(parsed, dict):
+                excel_filenames = [str(k) for k in parsed.keys() if k]
+        except Exception:
+            excel_filenames = []
+
+        def _resolve_excel() -> Optional[str]:
+            if ef:
+                return ef
+            if tn:
+                base = tn[:-5] if tn.lower().endswith(".xlsx") else tn
+                base = base.strip()
+                for fn in excel_filenames:
+                    b = fn[:-5] if fn.lower().endswith(".xlsx") else fn
+                    if str(b).strip() == base:
+                        return fn
+                return None
+            return None
+
+        resolved_excel = _resolve_excel()
+        if not resolved_excel:
+            return safe_json_response(
+                {"message": "无法解析 excel_filename/table_name 到具体 Excel 文件名，请检查参数", "code": 400},
+                status_code=400,
+            )
+        score_key = f"{fname}_{resolved_excel}" if resolved_excel else fname
+        comment_key = score_key
+
+        # record
+        where = ["score_header_id = %s"]
+        params: List[Any] = [shid]
+        if sid:
+            where.append("student_id = %s")
+            params.append(sid)
+        else:
+            where.append("student_name = %s")
+            params.append(sname)
+
+        select_cols = ["id", "group_name", "student_id", "student_name", "scores_json", "total_score", "group_total_score"]
+        if "comments_json" in cols:
+            select_cols.append("comments_json")
+
+        cursor.execute(
+            f"SELECT {', '.join(select_cols)} FROM ta_group_score_detail WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT 1",
+            tuple(params),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return safe_json_response({"message": "未找到该学生的小组成绩明细", "code": 404}, status_code=404)
+
+        scores_raw = row.get("scores_json")
+        scores_dict = json.loads(scores_raw) if isinstance(scores_raw, str) else (scores_raw or {})
+        if not isinstance(scores_dict, dict):
+            scores_dict = {}
+        value = scores_dict.get(score_key)
+
+        comment_value = None
+        comments_dict = {}
+        if "comments_json" in cols:
+            comments_raw = row.get("comments_json")
+            comments_dict = json.loads(comments_raw) if isinstance(comments_raw, str) else (comments_raw or {})
+            if not isinstance(comments_dict, dict):
+                comments_dict = {}
+            comment_value = comments_dict.get(comment_key)
+
+        return safe_json_response(
+            {
+                "message": "查询成功",
+                "code": 200,
+                "data": {
+                    "score_header_id": shid,
+                    "record_id": int(row["id"]),
+                    "group_name": row.get("group_name"),
+                    "student_id": row.get("student_id"),
+                    "student_name": row.get("student_name"),
+                    "field_name": fname,
+                    "excel_filename": resolved_excel,
+                    "table_name": tn,
+                    "score_key": score_key,
+                    "value": value,
+                    "comment": comment_value,
+                    "total_score": row.get("total_score"),
+                    "group_total_score": row.get("group_total_score"),
+                },
+            }
+        )
+    except mysql.connector.Error as e:
+        app_logger.error(f"[group-scores/get-student-attr] Database error: {e}", exc_info=True)
+        return safe_json_response({"message": f"数据库错误: {str(e)}", "code": 500}, status_code=500)
+    except Exception as e:
+        app_logger.error(f"[group-scores/get-student-attr] Unexpected error: {e}", exc_info=True)
+        return safe_json_response({"message": f"未知错误: {str(e)}", "code": 500}, status_code=500)
+    finally:
+        try:
+            if cursor:
+                cursor.close()
+        except Exception:
+            pass
+        try:
+            if connection and connection.is_connected():
+                connection.close()
+        except Exception:
+            pass
+
+
+@router.get("/student-scores/student-record")
+async def api_get_student_record_from_excel_table(
+    table_name: str = Query(..., description="Excel表名/文件基名，如：期中成绩单（可带 .xlsx；支持期中成绩单1/2 等变体）"),
+    student_id: Optional[str] = Query(None, description="学号（可选，与 student_name 二选一）"),
+    student_name: Optional[str] = Query(None, description="学生姓名（可选，与 student_id 二选一）"),
+    class_id: Optional[str] = Query(None, description="可选：班级ID(classid)，用于限定查询范围"),
+    score_header_id: Optional[int] = Query(None, description="可选：限定在某个成绩表(score_header_id)内查询"),
+    limit: int = Query(20, ge=1, le=100, description="最多返回匹配的成绩明细行数（按 id 倒序），默认 20，最大 100"),
+):
+    """
+    按学生 + “Excel表名(table_name)” 查询该学生在 ta_student_score_detail 中属于该 Excel 的所有字段：
+    - 从 scores_json（复合键名：字段名_Excel文件名）中筛选出属于该 table_name 的字段集合
+    - 同时从 comments_json 中筛选对应注释（如果存在）
+
+    例：
+    - table_name=期中成绩单 -> 仅匹配 期中成绩单.xlsx（精确匹配）
+    """
+    table_base = _normalize_excel_table_name(table_name)
+    if not table_base:
+        return safe_json_response({"message": "table_name 不能为空", "code": 400}, status_code=400)
+
+    sid = str(student_id).strip() if student_id is not None else None
+    sname = str(student_name).strip() if student_name is not None else None
+    cid = str(class_id).strip() if class_id is not None else None
+    if not sid and not sname:
+        return safe_json_response({"message": "缺少必要参数：student_id 或 student_name", "code": 400}, status_code=400)
+
+    connection = get_db_connection()
+    if connection is None:
+        return safe_json_response({"message": "数据库连接失败", "code": 500}, status_code=500)
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+
+        student_where_parts: List[str] = []
+        student_params: List[Any] = []
+        if sid:
+            student_where_parts.append("student_id = %s")
+            student_params.append(sid)
+        if sname:
+            student_where_parts.append("student_name = %s")
+            student_params.append(sname)
+
+        student_where_sql = " OR ".join(student_where_parts)
+        if len(student_where_parts) > 1:
+            student_where_sql = f"({student_where_sql})"
+
+        if score_header_id is not None:
+            where_sql = f"{student_where_sql} AND score_header_id = %s"
+            params: List[Any] = [*student_params, int(score_header_id)]
+        else:
+            where_sql = student_where_sql
+            params = [*student_params]
+
+        # 可选：通过表头过滤 class_id（score_header_id -> ta_student_score_header.id）
+        if cid:
+            sql = (
+                "SELECT d.id, d.score_header_id, d.student_id, d.student_name, d.scores_json, d.comments_json, "
+                "d.total_score, d.created_at, d.updated_at "
+                "FROM ta_student_score_detail d "
+                "JOIN ta_student_score_header h ON d.score_header_id = h.id "
+                f"WHERE {where_sql} AND h.class_id = %s "
+                "ORDER BY d.id DESC "
+                "LIMIT %s"
+            )
+            params.append(cid)
+        else:
+            sql = (
+                "SELECT id, score_header_id, student_id, student_name, scores_json, comments_json, total_score, created_at, updated_at "
+                "FROM ta_student_score_detail "
+                f"WHERE {where_sql} "
+                "ORDER BY id DESC "
+                "LIMIT %s"
+            )
+        params.append(limit)
+
+        cursor.execute(sql, tuple(params))
+        detail_rows = cursor.fetchall() or []
+        if not detail_rows:
+            return safe_json_response(
+                {"message": "未找到学生成绩明细", "code": 404, "data": {"table_name": table_base, "rows": []}},
+                status_code=404,
+            )
+
+        # 缓存每个 score_header_id 的 excel_filename 列表（来自字段定义表）
+        excel_filenames_cache: Dict[int, List[str]] = {}
+
+        results: List[Dict[str, Any]] = []
+        for row in detail_rows:
+            shid = row.get("score_header_id")
+            if shid is None:
+                continue
+            shid_int = int(shid)
+
+            if shid_int not in excel_filenames_cache:
+                cursor.execute(
+                    "SELECT DISTINCT excel_filename "
+                    "FROM ta_student_score_field "
+                    "WHERE score_header_id = %s AND excel_filename IS NOT NULL AND excel_filename != ''",
+                    (shid_int,),
+                )
+                excel_rows = cursor.fetchall() or []
+                excel_filenames_cache[shid_int] = [
+                    (er.get("excel_filename") if isinstance(er, dict) else None) for er in excel_rows
+                ]
+                excel_filenames_cache[shid_int] = [fn for fn in excel_filenames_cache[shid_int] if fn]
+
+            excel_filenames = excel_filenames_cache.get(shid_int, [])
+            matched_excel_filenames = [fn for fn in excel_filenames if _excel_filename_matches_table_name(fn, table_base)]
+
+            # 如果字段定义表里没有 excel_filename（极端情况），尝试从 JSON key 中推断（仅作为兜底）
+            if not matched_excel_filenames:
+                try:
+                    scores_raw = row.get("scores_json")
+                    scores_data = json.loads(scores_raw) if isinstance(scores_raw, str) else (scores_raw or {})
+                    if isinstance(scores_data, dict):
+                        for k in scores_data.keys():
+                            if not isinstance(k, str):
+                                continue
+                            # 兜底假设 key 格式为 <field>_<excel>.xlsx（excel 里不含下划线）
+                            if k.endswith(".xlsx") and "_" in k:
+                                maybe_excel = k.split("_")[-1]
+                                if _excel_filename_matches_table_name(maybe_excel, table_base):
+                                    matched_excel_filenames.append(maybe_excel)
+                    matched_excel_filenames = sorted(list(set(matched_excel_filenames)))
+                except Exception:
+                    matched_excel_filenames = []
+
+            if not matched_excel_filenames:
+                # 该明细行不包含目标 table_name 的字段，跳过
+                continue
+
+            # 解析 scores_json / comments_json，并按 matched_excel_filenames 过滤
+            scores_raw = row.get("scores_json")
+            scores_data = json.loads(scores_raw) if isinstance(scores_raw, str) else (scores_raw or {})
+            if not isinstance(scores_data, dict):
+                scores_data = {}
+
+            comments_raw = row.get("comments_json")
+            comments_data = json.loads(comments_raw) if isinstance(comments_raw, str) else (comments_raw or {})
+            if not isinstance(comments_data, dict):
+                comments_data = {}
+
+            scores_by_excel: Dict[str, Dict[str, Any]] = {}
+            comments_by_excel: Dict[str, Dict[str, Any]] = {}
+
+            for fn in matched_excel_filenames:
+                suffix = f"_{fn}"
+                scores_by_excel[fn] = {}
+                comments_by_excel[fn] = {}
+
+                for k, v in scores_data.items():
+                    if isinstance(k, str) and k.endswith(suffix):
+                        field_name = k[: -len(suffix)]
+                        scores_by_excel[fn][field_name] = v
+
+                for k, v in comments_data.items():
+                    if isinstance(k, str) and k.endswith(suffix):
+                        field_name = k[: -len(suffix)]
+                        comments_by_excel[fn][field_name] = v
+
+            results.append(
+                {
+                    "id": row.get("id"),
+                    "score_header_id": shid_int,
+                    "student_id": row.get("student_id"),
+                    "student_name": row.get("student_name"),
+                    "table_name": table_base,
+                    "matched_excel_filenames": matched_excel_filenames,
+                    "scores": scores_by_excel,
+                    "comments": comments_by_excel,
+                }
+            )
+
+        if not results:
+            # 给出一些可用的 excel_filename 供排查
+            available_by_header: Dict[str, List[str]] = {}
+            for shid, fns in excel_filenames_cache.items():
+                available_by_header[str(shid)] = fns
+            return safe_json_response(
+                {
+                    "message": "未找到该 table_name 对应的数据（该学生存在，但该 Excel 表名未匹配到字段）",
+                    "code": 404,
+                    "data": {"table_name": table_base, "available_excel_filenames_by_score_header_id": available_by_header},
+                },
+                status_code=404,
+            )
+
+        return safe_json_response({"message": "查询成功", "code": 200, "data": {"rows": results}})
+    except mysql.connector.Error as e:
+        app_logger.error(f"[student-record] Database error: {e}", exc_info=True)
+        return safe_json_response({"message": "数据库错误", "code": 500}, status_code=500)
+    except Exception as e:
+        app_logger.error(f"[student-record] Unexpected error: {e}", exc_info=True)
+        return safe_json_response({"message": f"未知错误: {str(e)}", "code": 500}, status_code=500)
+    finally:
+        try:
+            if cursor is not None:
+                cursor.close()
+        except Exception:
+            pass
+        if connection and connection.is_connected():
+            connection.close()
 
