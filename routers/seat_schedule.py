@@ -485,3 +485,133 @@ async def api_get_course_schedule(
             app_logger.info("Database connection closed after fetching course schedule.")
 
 
+@router.get("/course-schedule/school")
+async def api_get_school_course_schedules(
+    request: Request,
+    school_id: str = Query(..., description="学校ID"),
+    term: Optional[str] = Query(None, description="学期，如 2025-2026-1。如果不传或为空，则返回该学校所有班级所有学期的课表"),
+):
+    """
+    获取学校所有班级的课程表
+    一次性返回该学校下所有班级的课程表数据
+    """
+    connection = get_db_connection()
+    if connection is None:
+        return safe_json_response({"message": "数据库连接失败", "code": 500}, status_code=500)
+
+    try:
+        cursor = connection.cursor(dictionary=True)
+
+        # 查询该学校下的所有班级
+        cursor.execute(
+            "SELECT class_code, class_name, school_stage, grade FROM ta_classes WHERE schoolid = %s",
+            (school_id,),
+        )
+        classes = cursor.fetchall()
+
+        if not classes:
+            return safe_json_response(
+                {"message": f"未找到学校 {school_id} 下的班级", "code": 404, "data": []}, status_code=404
+            )
+
+        term_empty = not term or (isinstance(term, str) and term.strip() == "")
+        all_class_schedules = []
+
+        # 遍历每个班级，获取其课程表
+        for class_info in classes:
+            class_id = class_info.get("class_code")
+
+            if term_empty:
+                # 查询该班级所有学期的课程表
+                cursor.execute(
+                    "SELECT id, class_id, term, days_json, times_json, remark, updated_at "
+                    "FROM course_schedule WHERE class_id = %s ORDER BY term DESC",
+                    (class_id,),
+                )
+                headers = cursor.fetchall()
+            else:
+                # 查询指定学期的课程表
+                cursor.execute(
+                    "SELECT id, class_id, term, days_json, times_json, remark, updated_at "
+                    "FROM course_schedule WHERE class_id = %s AND term = %s LIMIT 1",
+                    (class_id, term),
+                )
+                headers = cursor.fetchall()
+
+            if not headers:
+                # 该班级没有课程表，跳过
+                continue
+
+            class_schedules = []
+            for header in headers:
+                schedule_id = header["id"]
+
+                try:
+                    days = json.loads(header["days_json"]) if header.get("days_json") else []
+                except Exception:
+                    days = header.get("days_json") or []
+                try:
+                    times = json.loads(header["times_json"]) if header.get("times_json") else []
+                except Exception:
+                    times = header.get("times_json") or []
+
+                schedule = {
+                    "id": schedule_id,
+                    "class_id": header.get("class_id"),
+                    "term": header.get("term"),
+                    "days": days,
+                    "times": times,
+                    "remark": header.get("remark"),
+                    "updated_at": header.get("updated_at"),
+                }
+
+                # 查询该课程表的所有单元格
+                cursor.execute(
+                    "SELECT row_index, col_index, course_name, is_highlight "
+                    "FROM course_schedule_cell WHERE schedule_id = %s",
+                    (schedule_id,),
+                )
+                rows = cursor.fetchall() or []
+                cells = []
+                for r in rows:
+                    cells.append(
+                        {
+                            "row_index": r.get("row_index"),
+                            "col_index": r.get("col_index"),
+                            "course_name": r.get("course_name"),
+                            "is_highlight": r.get("is_highlight"),
+                        }
+                    )
+
+                class_schedules.append({"schedule": schedule, "cells": cells})
+
+            # 如果该班级有课程表，添加到结果中
+            if class_schedules:
+                all_class_schedules.append(
+                    {
+                        "class_id": class_id,
+                        "class_name": class_info.get("class_name"),
+                        "school_stage": class_info.get("school_stage"),
+                        "grade": class_info.get("grade"),
+                        "schedules": class_schedules if term_empty else class_schedules[0],
+                    }
+                )
+
+        if not all_class_schedules:
+            return safe_json_response(
+                {"message": f"学校 {school_id} 下没有找到课程表数据", "code": 404, "data": []}, status_code=404
+            )
+
+        return safe_json_response({"message": "查询成功", "code": 200, "data": all_class_schedules})
+    except mysql.connector.Error as e:
+        app_logger.error(f"Database error during api_get_school_course_schedules: {e}")
+        return safe_json_response({"message": "数据库错误", "code": 500}, status_code=500)
+    except Exception as e:
+        app_logger.error(f"Unexpected error during api_get_school_course_schedules: {e}")
+        return safe_json_response({"message": "未知错误", "code": 500}, status_code=500)
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info("Database connection closed after fetching school course schedules.")
+
+
