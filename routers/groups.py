@@ -18,14 +18,140 @@ from starlette.requests import ClientDisconnect
 from common import app_logger
 from db import get_db_connection
 from realtime.srs import SRS_APP, SRS_WEBRTC_API_URL
-from services.avatars import resolve_local_avatar_file_path
-from services.tencent_api import build_tencent_request_url, resolve_tencent_identifier
-from services.tencent_groups import notify_tencent_group_sync
+from services.avatars import resolve_local_avatar_file_path, upload_avatar_to_oss
+from services.tencent_api import build_tencent_request_url, build_tencent_headers, resolve_tencent_identifier
+from services.tencent_groups import notify_tencent_group_sync, normalize_tencent_group_id
 from services.tencent_sig import generate_tencent_user_sig
 from ws.manager import active_temp_rooms
 
 
 router = APIRouter()
+
+
+async def sync_group_info_to_tencent(group_id: str, face_url: Optional[str] = None, group_name: Optional[str] = None) -> Dict[str, Any]:
+    """
+    同步群组信息到腾讯服务器
+    成功保存到数据库后调用此函数同步到腾讯
+    
+    Args:
+        group_id: 群组ID
+        face_url: 群组头像URL（可选）
+        group_name: 群组名称（可选）
+    
+    Returns:
+        包含同步结果的字典
+    """
+    app_logger.info(f"[sync_group_info_to_tencent] 开始同步群组信息到腾讯 - group_id={group_id}, face_url={face_url}, group_name={group_name}")
+    print(f"[sync_group_info_to_tencent] 开始同步群组信息到腾讯 - group_id={group_id}")
+    
+    # 检查腾讯接口配置
+    if not TENCENT_API_SDK_APP_ID:
+        error_msg = "TENCENT_API_SDK_APP_ID 未配置，跳过腾讯同步"
+        app_logger.warning(f"[sync_group_info_to_tencent] {error_msg}")
+        return {"status": "skipped", "reason": "missing_config", "error": error_msg}
+    
+    if not TENCENT_API_IDENTIFIER:
+        error_msg = "TENCENT_API_IDENTIFIER 未配置，跳过腾讯同步"
+        app_logger.warning(f"[sync_group_info_to_tencent] {error_msg}")
+        return {"status": "skipped", "reason": "missing_config", "error": error_msg}
+    
+    # 生成或获取 UserSig
+    usersig_to_use = None
+    if TENCENT_API_SECRET_KEY:
+        try:
+            usersig_to_use = generate_tencent_user_sig(TENCENT_API_IDENTIFIER)
+            app_logger.info(f"[sync_group_info_to_tencent] 为管理员账号生成 UserSig 成功")
+        except Exception as e:
+            app_logger.warning(f"[sync_group_info_to_tencent] 自动生成 UserSig 失败: {e}")
+    
+    if not usersig_to_use:
+        usersig_to_use = TENCENT_API_USER_SIG
+    
+    if not usersig_to_use:
+        error_msg = "缺少可用的管理员 UserSig，跳过腾讯同步"
+        app_logger.warning(f"[sync_group_info_to_tencent] {error_msg}")
+        return {"status": "skipped", "reason": "missing_usersig", "error": error_msg}
+    
+    # 构建腾讯接口 URL
+    tencent_url = build_tencent_request_url(
+        identifier=TENCENT_API_IDENTIFIER,
+        usersig=usersig_to_use,
+        path_override="v4/group_open_http_svc/modify_group_base_info"
+    )
+    
+    if not tencent_url:
+        error_msg = "无法构建腾讯接口 URL，跳过同步"
+        app_logger.error(f"[sync_group_info_to_tencent] {error_msg}")
+        return {"status": "error", "error": error_msg}
+    
+    # 清理群组ID（移除 @TGS# 前缀）
+    cleaned_group_id = normalize_tencent_group_id(group_id)
+    
+    # 构建请求 payload
+    payload: Dict[str, Any] = {
+        "GroupId": cleaned_group_id,
+    }
+    
+    if face_url:
+        payload["FaceUrl"] = face_url
+    
+    if group_name:
+        payload["Name"] = group_name
+    
+    # 如果没有要更新的字段，跳过
+    if not face_url and not group_name:
+        app_logger.info(f"[sync_group_info_to_tencent] 没有要更新的字段，跳过同步")
+        return {"status": "skipped", "reason": "no_fields_to_update"}
+    
+    app_logger.info(f"[sync_group_info_to_tencent] 请求URL: {tencent_url}")
+    app_logger.info(f"[sync_group_info_to_tencent] 请求payload: {payload}")
+    
+    # 发送HTTP请求
+    headers = build_tencent_headers()
+    encoded_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(url=tencent_url, data=encoded_payload, headers=headers, method="POST")
+    
+    try:
+        with urllib.request.urlopen(request, timeout=TENCENT_API_TIMEOUT) as response:
+            raw_body = response.read()
+            text_body = raw_body.decode("utf-8", errors="replace")
+            try:
+                parsed_body = json.loads(text_body)
+            except json.JSONDecodeError:
+                parsed_body = None
+            
+            app_logger.info(f"[sync_group_info_to_tencent] 腾讯接口响应: {parsed_body or text_body}")
+            
+            if parsed_body and isinstance(parsed_body, dict):
+                action_status = parsed_body.get("ActionStatus")
+                error_code = parsed_body.get("ErrorCode")
+                error_info = parsed_body.get("ErrorInfo")
+                
+                if action_status == "OK":
+                    app_logger.info(f"[sync_group_info_to_tencent] 同步成功 - group_id={group_id}")
+                    print(f"[sync_group_info_to_tencent] 同步成功 - group_id={group_id}")
+                    return {"status": "success", "response": parsed_body}
+                else:
+                    error_msg = f"腾讯接口返回错误: ErrorCode={error_code}, ErrorInfo={error_info}"
+                    app_logger.error(f"[sync_group_info_to_tencent] {error_msg}")
+                    return {"status": "error", "error": error_msg, "error_code": error_code, "error_info": error_info}
+            
+            return {"status": "success", "response": parsed_body or text_body}
+            
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        error_msg = f"腾讯接口调用失败 (HTTP {e.code}): {body}"
+        app_logger.error(f"[sync_group_info_to_tencent] {error_msg}")
+        return {"status": "error", "http_status": e.code, "error": error_msg}
+    except urllib.error.URLError as e:
+        error_msg = f"腾讯接口调用异常: {e}"
+        app_logger.error(f"[sync_group_info_to_tencent] {error_msg}")
+        return {"status": "error", "error": error_msg}
+    except Exception as exc:
+        error_msg = f"腾讯接口调用未知异常: {exc}"
+        app_logger.exception(f"[sync_group_info_to_tencent] {error_msg}")
+        return {"status": "error", "error": error_msg}
+
 
 # ===== group_members 扩展字段：教师任课科目（同一班级可多科） =====
 GROUP_MEMBERS_TEACH_SUBJECTS_COL = "teach_subjects"
@@ -1602,6 +1728,254 @@ async def updateGroupInfo(request: Request):
         if connection and connection.is_connected():
             connection.close()
             app_logger.info(f"Database connection closed after updating group info for {unique_group_id}.")
+
+
+@router.post("/groups/update-avatar")
+async def update_group_avatar(request: Request):
+    """
+    单独更新班级群的头像
+    1. 上传头像到阿里云OSS
+    2. 将OSS URL保存到groups表的face_url字段
+    
+    请求体：
+    {
+        "unique_group_id": "群唯一ID（或group_id）",
+        "avatar": "base64编码的头像数据（支持 data:image/... 前缀）"
+    }
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"data": {"message": "无效的 JSON 请求体", "code": 400}}, status_code=400)
+
+    unique_group_id = data.get("unique_group_id")
+    avatar = data.get("avatar")
+
+    if not unique_group_id:
+        app_logger.warning("UpdateGroupAvatar failed: Missing unique_group_id.")
+        return JSONResponse({"data": {"message": "群ID必须提供", "code": 400}}, status_code=400)
+
+    if not avatar:
+        app_logger.warning("UpdateGroupAvatar failed: Missing avatar.")
+        return JSONResponse({"data": {"message": "头像数据必须提供", "code": 400}}, status_code=400)
+
+    app_logger.info(f"[UpdateGroupAvatar] 收到请求 - unique_group_id={unique_group_id}, avatar数据长度={len(avatar) if avatar else 0}")
+    print(f"[UpdateGroupAvatar] 收到请求 - unique_group_id={unique_group_id}")
+
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("UpdateGroupAvatar failed: Database connection error.")
+        return JSONResponse({"data": {"message": "数据库连接失败", "code": 500}}, status_code=500)
+
+    try:
+        # 解码 Base64 头像（支持 data:image/... 前缀）
+        if isinstance(avatar, str) and avatar.startswith("data:image/"):
+            # 移除 data:image/xxx;base64, 前缀
+            avatar = avatar.split(",", 1)[1] if "," in avatar else avatar
+        avatar_bytes = base64.b64decode(avatar)
+    except Exception as e:
+        app_logger.error(f"Base64 decode error for unique_group_id={unique_group_id}: {e}")
+        return JSONResponse({"data": {"message": "头像数据解析失败", "code": 400}}, status_code=400)
+
+    # 上传头像到OSS
+    object_name = f"group-avatars/{unique_group_id}_{int(time.time())}.png"
+    oss_url = upload_avatar_to_oss(avatar_bytes, object_name)
+    
+    if not oss_url:
+        app_logger.error(f"UpdateGroupAvatar: OSS上传失败 for {unique_group_id}")
+        return JSONResponse({"data": {"message": "头像上传到OSS失败，请检查OSS配置", "code": 500}}, status_code=500)
+
+    app_logger.info(f"[UpdateGroupAvatar] OSS上传成功 for {unique_group_id} -> {oss_url}")
+    print(f"[UpdateGroupAvatar] OSS上传成功 for {unique_group_id} -> {oss_url}")
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+        
+        # unique_group_id 对应 groups 表的 group_id 字段
+        group_id = unique_group_id
+        
+        app_logger.info(f"[UpdateGroupAvatar] 更新 groups 表 - group_id={group_id}, face_url={oss_url}")
+        print(f"[UpdateGroupAvatar] 更新 groups 表 - group_id={group_id}")
+        
+        # 先检查群组是否存在
+        cursor.execute("SELECT group_id, group_name, face_url FROM `groups` WHERE group_id = %s LIMIT 1", (group_id,))
+        group_row = cursor.fetchone()
+        if not group_row:
+            app_logger.warning(f"[UpdateGroupAvatar] groups 表中未找到 group_id={group_id}")
+            print(f"[UpdateGroupAvatar] groups 表中未找到 group_id={group_id}")
+            connection.rollback()
+            return JSONResponse({"data": {"message": "未找到指定的群组", "code": 404}}, status_code=404)
+        
+        app_logger.info(f"[UpdateGroupAvatar] 找到群组记录: group_id={group_row.get('group_id')}, group_name={group_row.get('group_name')}, 当前face_url={group_row.get('face_url')}")
+        print(f"[UpdateGroupAvatar] 找到群组记录: group_id={group_row.get('group_id')}, group_name={group_row.get('group_name')}")
+
+        # 更新groups表的face_url字段
+        update_query = """
+            UPDATE `groups`
+            SET face_url = %s
+            WHERE group_id = %s
+        """
+        cursor.execute(update_query, (oss_url, group_id))
+        
+        if cursor.rowcount == 0:
+            connection.rollback()
+            app_logger.warning(f"[UpdateGroupAvatar] 更新失败，影响行数为0 - group_id={group_id}")
+            print(f"[UpdateGroupAvatar] 更新失败，影响行数为0 - group_id={group_id}")
+            return JSONResponse({"data": {"message": "更新失败", "code": 500}}, status_code=500)
+        
+        connection.commit()
+        app_logger.info(f"[UpdateGroupAvatar] 更新成功 - group_id={group_id}, face_url={oss_url}, 影响行数={cursor.rowcount}")
+        print(f"[UpdateGroupAvatar] 更新成功 - group_id={group_id}, face_url={oss_url}, 影响行数={cursor.rowcount}")
+        cursor.close()
+
+        # 同步到腾讯服务器
+        try:
+            tencent_result = await sync_group_info_to_tencent(group_id=group_id, face_url=oss_url)
+            if tencent_result.get("status") == "success":
+                app_logger.info(f"[UpdateGroupAvatar] 腾讯同步成功 - group_id={group_id}")
+            else:
+                app_logger.warning(f"[UpdateGroupAvatar] 腾讯同步失败或跳过 - group_id={group_id}, result={tencent_result}")
+        except Exception as e:
+            app_logger.error(f"[UpdateGroupAvatar] 腾讯同步异常 - group_id={group_id}, error={e}", exc_info=True)
+
+        return JSONResponse({
+            "data": {
+                "message": "头像更新成功",
+                "code": 200,
+                "face_url": oss_url
+            }
+        })
+    except mysql.connector.Error as e:
+        if connection and connection.is_connected():
+            connection.rollback()
+        app_logger.error(f"Database error during updateGroupAvatar for {unique_group_id}: {e}")
+        return JSONResponse({"data": {"message": "更新失败", "code": 500}}, status_code=500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info(f"Database connection closed after updating group avatar for {unique_group_id}.")
+
+
+@router.post("/groups/update-nickname")
+async def update_group_nickname(request: Request):
+    """
+    单独更新班级群的昵称
+    请求体：
+    {
+        "unique_group_id": "群唯一ID",
+        "nickname": "新的群昵称"
+    }
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"data": {"message": "无效的 JSON 请求体", "code": 400}}, status_code=400)
+
+    unique_group_id = data.get("unique_group_id")
+    nickname = data.get("nickname")
+
+    if not unique_group_id:
+        app_logger.warning("UpdateGroupNickname failed: Missing unique_group_id.")
+        return JSONResponse({"data": {"message": "群ID必须提供", "code": 400}}, status_code=400)
+
+    if nickname is None:
+        app_logger.warning("UpdateGroupNickname failed: Missing nickname.")
+        return JSONResponse({"data": {"message": "昵称必须提供", "code": 400}}, status_code=400)
+
+    # 允许空字符串（清空昵称）
+    nickname = str(nickname).strip() if nickname else ""
+
+    app_logger.info(f"[UpdateGroupNickname] 收到请求 - unique_group_id={unique_group_id}, nickname长度={len(nickname)}")
+    print(f"[UpdateGroupNickname] 收到请求 - unique_group_id={unique_group_id}, nickname={nickname[:50]}...")
+
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("UpdateGroupNickname failed: Database connection error.")
+        return JSONResponse({"data": {"message": "数据库连接失败", "code": 500}}, status_code=500)
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+        
+        # unique_group_id 对应 groups 表的 group_id 字段
+        group_id = unique_group_id
+        
+        app_logger.info(f"[UpdateGroupNickname] 更新 groups 表 - group_id={group_id}, nickname={nickname}")
+        print(f"[UpdateGroupNickname] 更新 groups 表 - group_id={group_id}, nickname={nickname}")
+        
+        # 先检查群组是否存在
+        cursor.execute("SELECT group_id, group_name FROM `groups` WHERE group_id = %s LIMIT 1", (group_id,))
+        group_row = cursor.fetchone()
+        if not group_row:
+            app_logger.warning(f"[UpdateGroupNickname] groups 表中未找到 group_id={group_id}")
+            print(f"[UpdateGroupNickname] groups 表中未找到 group_id={group_id}")
+            connection.rollback()
+            return JSONResponse({"data": {"message": "未找到指定的群组", "code": 404}}, status_code=404)
+        
+        app_logger.info(f"[UpdateGroupNickname] 找到群组记录: {group_row}")
+        print(f"[UpdateGroupNickname] 找到群组记录: group_id={group_row.get('group_id')}, group_name={group_row.get('group_name')}")
+        
+        # 更新 groups 表的 nickname 字段（如果存在）或 group_name 字段
+        # 先尝试更新 nickname 字段
+        try:
+            update_query = """
+                UPDATE `groups`
+                SET nickname = %s
+                WHERE group_id = %s
+            """
+            cursor.execute(update_query, (nickname, group_id))
+            app_logger.info(f"[UpdateGroupNickname] 尝试更新 nickname 字段，影响行数={cursor.rowcount}")
+            print(f"[UpdateGroupNickname] 尝试更新 nickname 字段，影响行数={cursor.rowcount}")
+        except mysql.connector.Error as e:
+            if "1054" in str(e) and "Unknown column 'nickname'" in str(e):
+                # nickname 字段不存在，使用 group_name 字段
+                app_logger.info(f"[UpdateGroupNickname] nickname 字段不存在，使用 group_name 字段更新")
+                print(f"[UpdateGroupNickname] nickname 字段不存在，使用 group_name 字段更新")
+                update_query = """
+                    UPDATE `groups`
+                    SET group_name = %s
+                    WHERE group_id = %s
+                """
+                cursor.execute(update_query, (nickname, group_id))
+            else:
+                raise
+        
+        if cursor.rowcount == 0:
+            connection.rollback()
+            app_logger.warning(f"[UpdateGroupNickname] 更新失败，影响行数为0 - group_id={group_id}")
+            print(f"[UpdateGroupNickname] 更新失败，影响行数为0 - group_id={group_id}")
+            return JSONResponse({"data": {"message": "更新失败", "code": 500}}, status_code=500)
+        
+        connection.commit()
+        app_logger.info(f"[UpdateGroupNickname] 更新成功 - group_id={group_id}, nickname={nickname}, 影响行数={cursor.rowcount}")
+        print(f"[UpdateGroupNickname] 更新成功 - group_id={group_id}, nickname={nickname}, 影响行数={cursor.rowcount}")
+        cursor.close()
+
+        # 同步到腾讯服务器
+        try:
+            tencent_result = await sync_group_info_to_tencent(group_id=group_id, group_name=nickname)
+            if tencent_result.get("status") == "success":
+                app_logger.info(f"[UpdateGroupNickname] 腾讯同步成功 - group_id={group_id}")
+            else:
+                app_logger.warning(f"[UpdateGroupNickname] 腾讯同步失败或跳过 - group_id={group_id}, result={tencent_result}")
+        except Exception as e:
+            app_logger.error(f"[UpdateGroupNickname] 腾讯同步异常 - group_id={group_id}, error={e}", exc_info=True)
+
+        return JSONResponse({"data": {"message": "昵称更新成功", "code": 200}})
+    except mysql.connector.Error as e:
+        if connection and connection.is_connected():
+            connection.rollback()
+        app_logger.error(f"Database error during updateGroupNickname for {unique_group_id}: {e}")
+        return JSONResponse({"data": {"message": "更新失败", "code": 500}}, status_code=500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info(f"Database connection closed after updating group nickname for {unique_group_id}.")
 
 
 @router.post("/groups/sync")
