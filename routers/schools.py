@@ -1,4 +1,6 @@
+import base64
 import json
+import time
 
 import mysql.connector
 from mysql.connector import Error
@@ -8,6 +10,7 @@ from fastapi.responses import JSONResponse
 
 from common import app_logger, safe_json_response
 from db import get_db_connection
+from services.avatars import upload_avatar_to_oss
 
 
 router = APIRouter()
@@ -378,7 +381,7 @@ async def get_classes_by_prefix(request: Request):
     try:
         cursor = connection.cursor(dictionary=True)
         sql = """
-        SELECT class_code, school_stage, grade, class_name, remark, schoolid, created_at
+        SELECT class_code, school_stage, grade, class_name, remark, schoolid, face_url, created_at
         FROM ta_classes
         WHERE LEFT(class_code, 6) = %s
         """
@@ -439,7 +442,7 @@ async def get_class_info(request: Request):
         cursor = connection.cursor(dictionary=True)
         cursor.execute(
             """
-            SELECT class_code, class_name, school_stage, grade, schoolid, remark, created_at
+            SELECT class_code, class_name, school_stage, grade, schoolid, remark, face_url, created_at
             FROM ta_classes
             WHERE class_code = %s
             """,
@@ -469,6 +472,7 @@ async def get_class_info(request: Request):
             "grade": class_info.get("grade"),
             "schoolid": schoolid,
             "remark": class_info.get("remark"),
+            "face_url": class_info.get("face_url"),
             "school_name": school_info.get("name") if school_info else None,
             "address": school_info.get("address") if school_info else None,
         }
@@ -481,5 +485,111 @@ async def get_class_info(request: Request):
             cursor.close()
         if connection and connection.is_connected():
             connection.close()
+
+
+@router.post("/classes/update-avatar")
+async def update_class_avatar(request: Request):
+    """
+    单独更新班级的头像
+    1. 上传头像到阿里云OSS
+    2. 将OSS URL保存到ta_classes表的face_url字段
+    
+    请求体：
+    {
+        "class_code": "班级编号（如：000011002）",
+        "avatar": "base64编码的头像数据（支持 data:image/... 前缀）"
+    }
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"data": {"message": "无效的 JSON 请求体", "code": 400}}, status_code=400)
+
+    class_code = data.get("class_code")
+    avatar = data.get("avatar")
+
+    if not class_code:
+        app_logger.warning("UpdateClassAvatar failed: Missing class_code.")
+        return JSONResponse({"data": {"message": "班级编号必须提供", "code": 400}}, status_code=400)
+
+    if not avatar:
+        app_logger.warning("UpdateClassAvatar failed: Missing avatar.")
+        return JSONResponse({"data": {"message": "头像数据必须提供", "code": 400}}, status_code=400)
+
+    app_logger.info(f"[UpdateClassAvatar] 收到请求 - class_code={class_code}, avatar数据长度={len(avatar) if avatar else 0}")
+
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("UpdateClassAvatar failed: Database connection error.")
+        return JSONResponse({"data": {"message": "数据库连接失败", "code": 500}}, status_code=500)
+
+    try:
+        # 解码 Base64 头像（支持 data:image/... 前缀）
+        if isinstance(avatar, str) and avatar.startswith("data:image/"):
+            # 移除 data:image/xxx;base64, 前缀
+            avatar = avatar.split(",", 1)[1] if "," in avatar else avatar
+        avatar_bytes = base64.b64decode(avatar)
+    except Exception as e:
+        app_logger.error(f"Base64 decode error for class_code={class_code}: {e}")
+        return JSONResponse({"data": {"message": "头像数据解析失败", "code": 400}}, status_code=400)
+
+    # 上传头像到OSS
+    object_name = f"class-avatars/{class_code}_{int(time.time())}.png"
+    oss_url = upload_avatar_to_oss(avatar_bytes, object_name)
+    
+    if not oss_url:
+        app_logger.error(f"[UpdateClassAvatar] OSS上传失败 - class_code={class_code}")
+        return JSONResponse({"data": {"message": "头像上传到OSS失败", "code": 500}}, status_code=500)
+
+    app_logger.info(f"[UpdateClassAvatar] OSS上传成功 for {class_code} -> {oss_url}")
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+        
+        # 检查班级是否存在
+        cursor.execute("SELECT class_code, class_name, face_url FROM ta_classes WHERE class_code = %s", (class_code,))
+        class_row = cursor.fetchone()
+        
+        if not class_row:
+            app_logger.warning(f"[UpdateClassAvatar] 未找到班级 - class_code={class_code}")
+            return JSONResponse({"data": {"message": f"班级 {class_code} 不存在", "code": 404}}, status_code=404)
+        
+        app_logger.info(f"[UpdateClassAvatar] 找到班级记录: class_code={class_code}, class_name={class_row.get('class_name')}, 当前face_url={class_row.get('face_url')}")
+        
+        # 更新 face_url
+        cursor.execute(
+            "UPDATE ta_classes SET face_url = %s WHERE class_code = %s",
+            (oss_url, class_code)
+        )
+        connection.commit()
+        
+        affected_rows = cursor.rowcount
+        app_logger.info(f"[UpdateClassAvatar] 更新成功 - class_code={class_code}, face_url={oss_url}, 影响行数={affected_rows}")
+        
+        return JSONResponse({
+            "data": {
+                "message": "班级头像更新成功",
+                "code": 200,
+                "class_code": class_code,
+                "face_url": oss_url
+            }
+        })
+    except mysql.connector.Error as e:
+        if connection:
+            connection.rollback()
+        app_logger.error(f"Database error during updateClassAvatar for {class_code}: {e}")
+        return JSONResponse({"data": {"message": f"数据库操作失败: {str(e)}", "code": 500}}, status_code=500)
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        app_logger.error(f"Unexpected error during updateClassAvatar for {class_code}: {e}")
+        return JSONResponse({"data": {"message": f"操作失败: {str(e)}", "code": 500}}, status_code=500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info(f"Database connection closed after updating class avatar for {class_code}.")
 
 

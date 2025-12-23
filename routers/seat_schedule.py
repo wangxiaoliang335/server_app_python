@@ -504,7 +504,7 @@ async def api_get_school_course_schedules(
 
         # 查询该学校下的所有班级
         cursor.execute(
-            "SELECT class_code, class_name, school_stage, grade FROM ta_classes WHERE schoolid = %s",
+            "SELECT class_code, class_name, school_stage, grade, face_url FROM ta_classes WHERE schoolid = %s",
             (school_id,),
         )
         classes = cursor.fetchall()
@@ -593,6 +593,7 @@ async def api_get_school_course_schedules(
                         "class_name": class_info.get("class_name"),
                         "school_stage": class_info.get("school_stage"),
                         "grade": class_info.get("grade"),
+                        "face_url": class_info.get("face_url"),
                         "schedules": class_schedules if term_empty else class_schedules[0],
                     }
                 )

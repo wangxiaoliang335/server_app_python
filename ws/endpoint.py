@@ -268,25 +268,101 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     app_logger.info(f"[websocket] 即将接受连接 user_id={user_id}, 当前在线={current_online}")
     print(f"[websocket] 即将接受连接 user_id={user_id}, 当前在线={current_online}")
     await websocket.accept()
-    connections[user_id] = {"ws": websocket, "last_heartbeat": time.time()}
-    app_logger.info(f"[websocket] 用户 {user_id} 已连接，当前在线={len(connections)}")
-    print(f"用户 {user_id} 已连接，当前在线={len(connections)}")
-
+    
     connection = get_db_connection()
     if connection is None or not connection.is_connected():
         app_logger.error("Database connection error in /friends API.")
         print(f"[websocket][{user_id}] 数据库连接失败，立即关闭")
-        return JSONResponse({
-            'data': {
-                'message': '数据库连接失败',
-                'code': 500
-            }
-        }, status_code=500)
+        await websocket.send_text(json.dumps({
+            "type": "error",
+            "message": "数据库连接失败",
+            "code": 500
+        }, ensure_ascii=False))
+        await safe_close(websocket, 1008, "Database connection failed")
+        return
     else:
         app_logger.info(f"[websocket] 数据库连接成功，user_id={user_id}")
 
     cursor = None
     try:
+        cursor = connection.cursor(dictionary=True)
+        
+        # 先验证是否为班级端登录（通过 class_code 查询 ta_classes 表）
+        cursor.execute(
+            """
+            SELECT class_code, class_name, school_stage, grade, schoolid, remark, face_url, created_at
+            FROM ta_classes
+            WHERE class_code = %s
+            """,
+            (user_id,),
+        )
+        class_info = cursor.fetchone()
+        
+        if class_info:
+            # 班级端登录成功，发送登录成功响应
+            login_response = {
+                "type": "login_success",
+                "message": "登录成功",
+                "code": 200,
+                "data": {
+                    "class_code": class_info.get("class_code"),
+                    "class_name": class_info.get("class_name"),
+                    "school_stage": class_info.get("school_stage"),
+                    "grade": class_info.get("grade"),
+                    "schoolid": class_info.get("schoolid"),
+                    "face_url": class_info.get("face_url"),
+                }
+            }
+            await websocket.send_text(json.dumps(login_response, ensure_ascii=False, default=str))
+            app_logger.info(f"[websocket] 班级端登录成功 - class_code={user_id}, class_name={class_info.get('class_name')}")
+            print(f"[websocket] 班级端登录成功 - class_code={user_id}, class_name={class_info.get('class_name')}")
+        else:
+            # 如果不是班级端，验证是否为老师登录（通过 user_id 查询 users 表）
+            cursor.execute(
+                """
+                SELECT user_id, name, phone, id_number, avatar_url
+                FROM users
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+            user_info = cursor.fetchone()
+            
+            if user_info:
+                # 老师登录成功，发送登录成功响应
+                login_response = {
+                    "type": "login_success",
+                    "message": "登录成功",
+                    "code": 200,
+                    "data": {
+                        "user_id": user_info.get("user_id"),
+                        "name": user_info.get("name"),
+                        "phone": user_info.get("phone"),
+                        "id_number": user_info.get("id_number"),
+                        "avatar_url": user_info.get("avatar_url"),
+                    }
+                }
+                await websocket.send_text(json.dumps(login_response, ensure_ascii=False, default=str))
+                app_logger.info(f"[websocket] 老师登录成功 - user_id={user_id}, name={user_info.get('name')}")
+                print(f"[websocket] 老师登录成功 - user_id={user_id}, name={user_info.get('name')}")
+            else:
+                # 既不是班级端也不是老师，登录失败
+                error_response = {
+                    "type": "login_failed",
+                    "message": "登录失败：未找到对应的班级或用户",
+                    "code": 404
+                }
+                await websocket.send_text(json.dumps(error_response, ensure_ascii=False, default=str))
+                app_logger.warning(f"[websocket] 登录失败 - 未找到对应的班级或用户: {user_id}")
+                print(f"[websocket] 登录失败 - 未找到对应的班级或用户: {user_id}")
+                await safe_close(websocket, 1008, "Invalid user_id or class_code")
+                return
+        
+        # 将连接添加到连接列表
+        connections[user_id] = {"ws": websocket, "last_heartbeat": time.time()}
+        app_logger.info(f"[websocket] 用户 {user_id} 已连接，当前在线={len(connections)}")
+        print(f"用户 {user_id} 已连接，当前在线={len(connections)}")
+        
         # 查询条件改为：receiver_id = user_id 或 sender_id = user_id，并且 is_read = 0
         print(" xxx SELECT ta_notification")
         update_query = """
@@ -295,7 +371,6 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             WHERE (receiver_id = %s OR sender_id = %s)
             AND is_read = 0;
         """
-        cursor = connection.cursor(dictionary=True)
         cursor.execute(update_query, (user_id, user_id))
         unread_notifications = cursor.fetchall()
 

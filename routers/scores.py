@@ -3265,23 +3265,23 @@ async def api_get_group_student_attr(
     term: Optional[str] = Query(None, description="学期（可选；不传则 term IS NULL）"),
     student_id: Optional[str] = Query(None, description="学号（可选，与 student_name 二选一）"),
     student_name: Optional[str] = Query(None, description="学生姓名（可选，与 student_id 二选一）"),
-    field_name: str = Query(..., description="字段名，如：纪律/早读/语文"),
-    excel_filename: Optional[str] = Query(None, description="可选：Excel文件名，如：学生体质统计表.xlsx"),
-    table_name: Optional[str] = Query(None, description="可选：Excel表名基名，如：学生体质统计表（精确匹配到 *.xlsx）"),
+    field_name: Optional[str] = Query(None, description="字段名，如：纪律/早读/语文（可选；不传则查询全部字段）"),
+    excel_filename: Optional[str] = Query(None, description="可选：Excel文件名，如：学生体质统计表.xlsx（不传则查询所有Excel表）"),
+    table_name: Optional[str] = Query(None, description="可选：Excel表名基名，如：学生体质统计表（精确匹配到 *.xlsx；不传则查询所有Excel表）"),
 ):
-    """小组成绩：单独查询某个学生的某个属性（值 + 注释）。"""
+    """小组成绩：查询某个学生的属性（值 + 注释）。
+    - field_name 不传：查询全部字段
+    - excel_filename/table_name 都不传：查询所有Excel表
+    - 返回结构：如果查询全部，返回列表；如果查询特定字段，返回单个对象
+    """
     sid = (str(student_id).strip() if student_id is not None else "") or None
     sname = (str(student_name).strip() if student_name is not None else "") or None
     ef = (str(excel_filename).strip() if excel_filename is not None else "") or None
     tn = (str(table_name).strip() if table_name is not None else "") or None
-    fname = (str(field_name).strip() if field_name is not None else "") or ""
+    fname = (str(field_name).strip() if field_name is not None else "") or None
 
     if not (sid or sname):
         return safe_json_response({"message": "缺少必要参数 student_id 或 student_name", "code": 400}, status_code=400)
-    if not fname:
-        return safe_json_response({"message": "缺少必要参数 field_name", "code": 400}, status_code=400)
-    if not (ef or tn):
-        return safe_json_response({"message": "缺少必要参数：excel_filename 或 table_name（必须二选一传入）", "code": 400}, status_code=400)
 
     connection = get_db_connection()
     if connection is None:
@@ -3318,8 +3318,11 @@ async def api_get_group_student_attr(
             excel_filenames = []
 
         def _resolve_excel() -> Optional[str]:
+            """解析excel文件名，如果都不传返回None（表示查询所有）"""
+            # 如果传了excel_filename，直接使用
             if ef:
                 return ef
+            # 如果传了table_name，尝试匹配
             if tn:
                 base = tn[:-5] if tn.lower().endswith(".xlsx") else tn
                 base = base.strip()
@@ -3328,16 +3331,16 @@ async def api_get_group_student_attr(
                     if str(b).strip() == base:
                         return fn
                 return None
+            # 都不传，返回None表示查询所有
             return None
 
         resolved_excel = _resolve_excel()
-        if not resolved_excel:
+        # 如果指定了excel_filename或table_name但解析失败，返回错误
+        if (ef or tn) and not resolved_excel:
             return safe_json_response(
                 {"message": "无法解析 excel_filename/table_name 到具体 Excel 文件名，请检查参数", "code": 400},
                 status_code=400,
             )
-        score_key = f"{fname}_{resolved_excel}" if resolved_excel else fname
-        comment_key = score_key
 
         # record
         where = ["score_header_id = %s"]
@@ -3365,38 +3368,94 @@ async def api_get_group_student_attr(
         scores_dict = json.loads(scores_raw) if isinstance(scores_raw, str) else (scores_raw or {})
         if not isinstance(scores_dict, dict):
             scores_dict = {}
-        value = scores_dict.get(score_key)
 
-        comment_value = None
         comments_dict = {}
         if "comments_json" in cols:
             comments_raw = row.get("comments_json")
             comments_dict = json.loads(comments_raw) if isinstance(comments_raw, str) else (comments_raw or {})
             if not isinstance(comments_dict, dict):
                 comments_dict = {}
-            comment_value = comments_dict.get(comment_key)
 
-        return safe_json_response(
-            {
-                "message": "查询成功",
-                "code": 200,
-                "data": {
+        # 确定要查询的excel文件列表
+        target_excel_files: List[str] = []
+        if resolved_excel:
+            target_excel_files = [resolved_excel]
+        else:
+            target_excel_files = excel_filenames
+
+        # 构建返回数据
+        result_data: List[Dict[str, Any]] = []
+
+        for excel_file in target_excel_files:
+            if fname:
+                # 查询特定字段
+                score_key = f"{fname}_{excel_file}"
+                comment_key = score_key
+                value = scores_dict.get(score_key)
+                comment_value = comments_dict.get(comment_key) if comments_dict else None
+
+                result_data.append({
                     "score_header_id": shid,
                     "record_id": int(row["id"]),
                     "group_name": row.get("group_name"),
                     "student_id": row.get("student_id"),
                     "student_name": row.get("student_name"),
                     "field_name": fname,
-                    "excel_filename": resolved_excel,
-                    "table_name": tn,
+                    "excel_filename": excel_file,
+                    "table_name": tn if tn else (excel_file[:-5] if excel_file.lower().endswith(".xlsx") else excel_file),
                     "score_key": score_key,
                     "value": value,
                     "comment": comment_value,
                     "total_score": row.get("total_score"),
                     "group_total_score": row.get("group_total_score"),
-                },
-            }
-        )
+                })
+            else:
+                # 查询所有字段：遍历scores_dict，找出属于当前excel_file的所有字段
+                excel_base = excel_file[:-5] if excel_file.lower().endswith(".xlsx") else excel_file
+                excel_base = excel_base.strip()
+                
+                for score_key, value in scores_dict.items():
+                    # 检查score_key是否属于当前excel_file
+                    # score_key格式：字段名_Excel文件名.xlsx
+                    if score_key.endswith(f"_{excel_file}"):
+                        field_name_part = score_key[:-(len(excel_file) + 1)]  # 去掉 _Excel文件名.xlsx
+                        comment_key = score_key
+                        comment_value = comments_dict.get(comment_key) if comments_dict else None
+
+                        result_data.append({
+                            "score_header_id": shid,
+                            "record_id": int(row["id"]),
+                            "group_name": row.get("group_name"),
+                            "student_id": row.get("student_id"),
+                            "student_name": row.get("student_name"),
+                            "field_name": field_name_part,
+                            "excel_filename": excel_file,
+                            "table_name": excel_base,
+                            "score_key": score_key,
+                            "value": value,
+                            "comment": comment_value,
+                            "total_score": row.get("total_score"),
+                            "group_total_score": row.get("group_total_score"),
+                        })
+
+        # 如果只查询一个特定字段和一个特定excel，返回单个对象；否则返回列表
+        if fname and resolved_excel and len(result_data) == 1:
+            return safe_json_response(
+                {
+                    "message": "查询成功",
+                    "code": 200,
+                    "data": result_data[0],
+                }
+            )
+        else:
+            return safe_json_response(
+                {
+                    "message": "查询成功",
+                    "code": 200,
+                    "data": result_data,
+                    "count": len(result_data),
+                }
+            )
     except mysql.connector.Error as e:
         app_logger.error(f"[group-scores/get-student-attr] Database error: {e}", exc_info=True)
         return safe_json_response({"message": f"数据库错误: {str(e)}", "code": 500}, status_code=500)
@@ -3416,26 +3475,255 @@ async def api_get_group_student_attr(
             pass
 
 
+@router.get("/group-scores/student-record")
+async def api_get_group_student_record(
+    class_id: str = Query(..., description="班级ID"),
+    term: Optional[str] = Query(None, description="学期（可选；不传则 term IS NULL）"),
+    student_id: Optional[str] = Query(None, description="学号（可选，与 student_name 二选一）"),
+    student_name: Optional[str] = Query(None, description="学生姓名（可选，与 student_id 二选一）"),
+    table_name: Optional[str] = Query(None, description="可选：Excel表名/文件基名，如：学生体质统计表（可带 .xlsx；支持变体）。不传则返回所有Excel表的数据"),
+    limit: int = Query(20, ge=1, le=100, description="最多返回匹配的记录数（按 id 倒序），默认 20，最大 100"),
+):
+    """
+    查询学生在小组表中的所有属性：
+    - 如果提供 table_name：仅返回该 Excel 表的数据（精确匹配）
+    - 如果不提供 table_name：返回该学生在所有 Excel 表中的所有字段
+    
+    从 scores_json（复合键名：字段名_Excel文件名）中筛选字段
+    同时从 comments_json 中筛选对应注释（如果存在）
+    """
+    sid = str(student_id).strip() if student_id is not None else None
+    sname = str(student_name).strip() if student_name is not None else None
+    cid = str(class_id).strip() if class_id is not None else None
+    
+    if not sid and not sname:
+        return safe_json_response({"message": "缺少必要参数：student_id 或 student_name", "code": 400}, status_code=400)
+    
+    if not cid:
+        return safe_json_response({"message": "缺少必要参数：class_id", "code": 400}, status_code=400)
+    
+    table_base = None
+    if table_name:
+        table_base = _normalize_excel_table_name(table_name)
+        if not table_base:
+            return safe_json_response({"message": "table_name 格式无效", "code": 400}, status_code=400)
+    
+    connection = get_db_connection()
+    if connection is None:
+        return safe_json_response({"message": "数据库连接失败", "code": 500}, status_code=500)
+    
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+        
+        # 查询小组成绩表头
+        cursor.execute(
+            "SELECT id, class_id, term, excel_file_url FROM ta_group_score_header "
+            "WHERE class_id = %s AND ((%s IS NULL AND term IS NULL) OR term = %s) "
+            "ORDER BY created_at DESC LIMIT 1",
+            (cid, term, term),
+        )
+        header_row = cursor.fetchone()
+        if not header_row:
+            return safe_json_response({"message": "未找到小组成绩表头（请确认 class_id/term）", "code": 404}, status_code=404)
+        
+        shid = int(header_row["id"])
+        
+        # 获取所有 Excel 文件名
+        excel_filenames: List[str] = []
+        try:
+            raw = header_row.get("excel_file_url")
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(parsed, dict):
+                excel_filenames = [str(k) for k in parsed.keys() if k]
+        except Exception:
+            excel_filenames = []
+        
+        # 查询学生记录
+        where_parts = ["score_header_id = %s"]
+        params: List[Any] = [shid]
+        
+        if sid:
+            where_parts.append("student_id = %s")
+            params.append(sid)
+        else:
+            where_parts.append("student_name = %s")
+            params.append(sname)
+        
+        # 检查是否有 comments_json 字段
+        cursor.execute("SHOW COLUMNS FROM `ta_group_score_detail`")
+        cols = [r.get("Field") for r in (cursor.fetchall() or []) if isinstance(r, dict)]
+        has_comments_json = "comments_json" in cols
+        
+        select_cols = ["id", "group_name", "student_id", "student_name", "scores_json", "total_score", "group_total_score"]
+        if has_comments_json:
+            select_cols.append("comments_json")
+        
+        sql = f"SELECT {', '.join(select_cols)} FROM ta_group_score_detail WHERE {' AND '.join(where_parts)} ORDER BY id DESC LIMIT %s"
+        params.append(limit)
+        
+        cursor.execute(sql, tuple(params))
+        detail_rows = cursor.fetchall() or []
+        
+        if not detail_rows:
+            return safe_json_response(
+                {"message": "未找到学生小组成绩明细", "code": 404, "data": {"table_name": table_base if table_base else "all", "rows": []}},
+                status_code=404,
+            )
+        
+        results: List[Dict[str, Any]] = []
+        for row in detail_rows:
+            # 解析 scores_json 和 comments_json
+            scores_raw = row.get("scores_json")
+            scores_data = json.loads(scores_raw) if isinstance(scores_raw, str) else (scores_raw or {})
+            if not isinstance(scores_data, dict):
+                scores_data = {}
+            
+            comments_data = {}
+            if has_comments_json:
+                comments_raw = row.get("comments_json")
+                comments_data = json.loads(comments_raw) if isinstance(comments_raw, str) else (comments_raw or {})
+                if not isinstance(comments_data, dict):
+                    comments_data = {}
+            
+            # 如果指定了 table_name，进行过滤；否则返回所有 Excel 文件的数据
+            if table_base:
+                # 匹配 Excel 文件名
+                matched_excel_filenames = []
+                for fn in excel_filenames:
+                    if _excel_filename_matches_table_name(fn, table_base):
+                        matched_excel_filenames.append(fn)
+                
+                # 如果字段定义表里没有，尝试从 JSON key 中推断
+                if not matched_excel_filenames:
+                    for k in scores_data.keys():
+                        if not isinstance(k, str):
+                            continue
+                        if k.endswith(".xlsx") and "_" in k:
+                            maybe_excel = k.split("_")[-1]
+                            if _excel_filename_matches_table_name(maybe_excel, table_base):
+                                matched_excel_filenames.append(maybe_excel)
+                    matched_excel_filenames = sorted(list(set(matched_excel_filenames)))
+                
+                if not matched_excel_filenames:
+                    continue
+            else:
+                # 不指定 table_name，返回所有 Excel 文件的数据
+                matched_excel_filenames = excel_filenames.copy()
+                
+                # 如果字段定义表里没有，从 JSON key 中提取
+                if not matched_excel_filenames:
+                    extracted_filenames = set()
+                    for k in scores_data.keys():
+                        if not isinstance(k, str):
+                            continue
+                        if k.endswith(".xlsx") and "_" in k:
+                            maybe_excel = k.split("_")[-1]
+                            extracted_filenames.add(maybe_excel)
+                    matched_excel_filenames = sorted(list(extracted_filenames))
+                
+                if not matched_excel_filenames:
+                    continue
+            
+            # 按 Excel 文件名分组提取字段
+            scores_by_excel: Dict[str, Dict[str, Any]] = {}
+            comments_by_excel: Dict[str, Dict[str, Any]] = {}
+            
+            for fn in matched_excel_filenames:
+                suffix = f"_{fn}"
+                scores_by_excel[fn] = {}
+                comments_by_excel[fn] = {}
+                
+                for k, v in scores_data.items():
+                    if isinstance(k, str) and k.endswith(suffix):
+                        field_name = k[: -len(suffix)]
+                        scores_by_excel[fn][field_name] = v
+                
+                if has_comments_json:
+                    for k, v in comments_data.items():
+                        if isinstance(k, str) and k.endswith(suffix):
+                            field_name = k[: -len(suffix)]
+                            comments_by_excel[fn][field_name] = v
+            
+            results.append(
+                {
+                    "id": row.get("id"),
+                    "score_header_id": shid,
+                    "group_name": row.get("group_name"),
+                    "student_id": row.get("student_id"),
+                    "student_name": row.get("student_name"),
+                    "table_name": table_base if table_base else "all",
+                    "matched_excel_filenames": matched_excel_filenames,
+                    "scores": scores_by_excel,
+                    "comments": comments_by_excel if has_comments_json else {},
+                    "total_score": row.get("total_score"),
+                    "group_total_score": row.get("group_total_score"),
+                }
+            )
+        
+        if not results:
+            return safe_json_response(
+                {
+                    "message": "未找到该 table_name 对应的数据（该学生存在，但该 Excel 表名未匹配到字段）",
+                    "code": 404,
+                    "data": {"table_name": table_base if table_base else "all", "rows": []},
+                },
+                status_code=404,
+            )
+        
+        return safe_json_response({"message": "查询成功", "code": 200, "data": {"rows": results}})
+    except mysql.connector.Error as e:
+        app_logger.error(f"[group-scores/student-record] Database error: {e}", exc_info=True)
+        return safe_json_response({"message": "数据库错误", "code": 500}, status_code=500)
+    except Exception as e:
+        app_logger.error(f"[group-scores/student-record] Unexpected error: {e}", exc_info=True)
+        return safe_json_response({"message": f"未知错误: {str(e)}", "code": 500}, status_code=500)
+    finally:
+        try:
+            if cursor:
+                cursor.close()
+        except Exception:
+            pass
+        if connection and connection.is_connected():
+            connection.close()
+
+
 @router.get("/student-scores/student-record")
 async def api_get_student_record_from_excel_table(
-    table_name: str = Query(..., description="Excel表名/文件基名，如：期中成绩单（可带 .xlsx；支持期中成绩单1/2 等变体）"),
     student_id: Optional[str] = Query(None, description="学号（可选，与 student_name 二选一）"),
     student_name: Optional[str] = Query(None, description="学生姓名（可选，与 student_id 二选一）"),
     class_id: Optional[str] = Query(None, description="可选：班级ID(classid)，用于限定查询范围"),
+    table_name: Optional[str] = Query(None, description="可选：Excel表名/文件基名，如：期中成绩单（可带 .xlsx；支持期中成绩单1/2 等变体）。不传则返回所有Excel表的数据"),
+    field_name: Optional[str] = Query(None, description="可选：字段名/科目名，如：语文、数学、纪律。不传则返回所有字段"),
     score_header_id: Optional[int] = Query(None, description="可选：限定在某个成绩表(score_header_id)内查询"),
     limit: int = Query(20, ge=1, le=100, description="最多返回匹配的成绩明细行数（按 id 倒序），默认 20，最大 100"),
 ):
     """
-    按学生 + “Excel表名(table_name)” 查询该学生在 ta_student_score_detail 中属于该 Excel 的所有字段：
-    - 从 scores_json（复合键名：字段名_Excel文件名）中筛选出属于该 table_name 的字段集合
-    - 同时从 comments_json 中筛选对应注释（如果存在）
+    查询学生在成绩表中的属性：
+    - 如果提供 table_name：仅返回该 Excel 表的数据（精确匹配）
+    - 如果不提供 table_name：返回该学生在所有 Excel 表中的数据
+    - 如果提供 field_name：仅返回该字段/科目的数据（在所有匹配的Excel表中）
+    - 如果不提供 field_name：返回所有字段的数据
+    
+    从 scores_json（复合键名：字段名_Excel文件名）中筛选字段
+    同时从 comments_json 中筛选对应注释（如果存在）
 
     例：
-    - table_name=期中成绩单 -> 仅匹配 期中成绩单.xlsx（精确匹配）
+    - student_name=张三&field_name=语文 -> 查询张三的语文成绩（在所有Excel表中）
+    - student_name=张三&table_name=期中成绩单 -> 查询张三在期中成绩单中的所有字段
+    - student_name=张三 -> 查询张三的所有字段（所有Excel表）
     """
-    table_base = _normalize_excel_table_name(table_name)
-    if not table_base:
-        return safe_json_response({"message": "table_name 不能为空", "code": 400}, status_code=400)
+    table_base = None
+    if table_name:
+        table_base = _normalize_excel_table_name(table_name)
+        if not table_base:
+            return safe_json_response({"message": "table_name 格式无效", "code": 400}, status_code=400)
+
+    field_name_filter = None
+    if field_name:
+        field_name_filter = str(field_name).strip()
+        if not field_name_filter:
+            return safe_json_response({"message": "field_name 不能为空", "code": 400}, status_code=400)
 
     sid = str(student_id).strip() if student_id is not None else None
     sname = str(student_name).strip() if student_name is not None else None
@@ -3497,7 +3785,7 @@ async def api_get_student_record_from_excel_table(
         detail_rows = cursor.fetchall() or []
         if not detail_rows:
             return safe_json_response(
-                {"message": "未找到学生成绩明细", "code": 404, "data": {"table_name": table_base, "rows": []}},
+                {"message": "未找到学生成绩明细", "code": 404, "data": {"table_name": table_base if table_base else "all", "rows": []}},
                 status_code=404,
             )
 
@@ -3525,29 +3813,58 @@ async def api_get_student_record_from_excel_table(
                 excel_filenames_cache[shid_int] = [fn for fn in excel_filenames_cache[shid_int] if fn]
 
             excel_filenames = excel_filenames_cache.get(shid_int, [])
-            matched_excel_filenames = [fn for fn in excel_filenames if _excel_filename_matches_table_name(fn, table_base)]
+            
+            # 如果指定了 table_name，则进行过滤；否则返回所有 Excel 文件的数据
+            if table_base:
+                matched_excel_filenames = [fn for fn in excel_filenames if _excel_filename_matches_table_name(fn, table_base)]
 
-            # 如果字段定义表里没有 excel_filename（极端情况），尝试从 JSON key 中推断（仅作为兜底）
-            if not matched_excel_filenames:
-                try:
-                    scores_raw = row.get("scores_json")
-                    scores_data = json.loads(scores_raw) if isinstance(scores_raw, str) else (scores_raw or {})
-                    if isinstance(scores_data, dict):
-                        for k in scores_data.keys():
-                            if not isinstance(k, str):
-                                continue
-                            # 兜底假设 key 格式为 <field>_<excel>.xlsx（excel 里不含下划线）
-                            if k.endswith(".xlsx") and "_" in k:
-                                maybe_excel = k.split("_")[-1]
-                                if _excel_filename_matches_table_name(maybe_excel, table_base):
-                                    matched_excel_filenames.append(maybe_excel)
-                    matched_excel_filenames = sorted(list(set(matched_excel_filenames)))
-                except Exception:
-                    matched_excel_filenames = []
+                # 如果字段定义表里没有 excel_filename（极端情况），尝试从 JSON key 中推断（仅作为兜底）
+                if not matched_excel_filenames:
+                    try:
+                        scores_raw = row.get("scores_json")
+                        scores_data = json.loads(scores_raw) if isinstance(scores_raw, str) else (scores_raw or {})
+                        if isinstance(scores_data, dict):
+                            for k in scores_data.keys():
+                                if not isinstance(k, str):
+                                    continue
+                                # 兜底假设 key 格式为 <field>_<excel>.xlsx（excel 里不含下划线）
+                                if k.endswith(".xlsx") and "_" in k:
+                                    maybe_excel = k.split("_")[-1]
+                                    if _excel_filename_matches_table_name(maybe_excel, table_base):
+                                        matched_excel_filenames.append(maybe_excel)
+                        matched_excel_filenames = sorted(list(set(matched_excel_filenames)))
+                    except Exception:
+                        matched_excel_filenames = []
 
-            if not matched_excel_filenames:
-                # 该明细行不包含目标 table_name 的字段，跳过
-                continue
+                if not matched_excel_filenames:
+                    # 该明细行不包含目标 table_name 的字段，跳过
+                    continue
+            else:
+                # 不指定 table_name，返回所有 Excel 文件的数据
+                # 先从字段定义表获取，如果为空则从 JSON key 中提取
+                matched_excel_filenames = excel_filenames.copy()
+                
+                if not matched_excel_filenames:
+                    # 从 scores_json 中提取所有 Excel 文件名
+                    try:
+                        scores_raw = row.get("scores_json")
+                        scores_data = json.loads(scores_raw) if isinstance(scores_raw, str) else (scores_raw or {})
+                        if isinstance(scores_data, dict):
+                            extracted_filenames = set()
+                            for k in scores_data.keys():
+                                if not isinstance(k, str):
+                                    continue
+                                # key 格式为 <field>_<excel>.xlsx
+                                if k.endswith(".xlsx") and "_" in k:
+                                    maybe_excel = k.split("_")[-1]
+                                    extracted_filenames.add(maybe_excel)
+                            matched_excel_filenames = sorted(list(extracted_filenames))
+                    except Exception:
+                        matched_excel_filenames = []
+                
+                # 如果仍然为空，跳过该行
+                if not matched_excel_filenames:
+                    continue
 
             # 解析 scores_json / comments_json，并按 matched_excel_filenames 过滤
             scores_raw = row.get("scores_json")
@@ -3570,13 +3887,33 @@ async def api_get_student_record_from_excel_table(
 
                 for k, v in scores_data.items():
                     if isinstance(k, str) and k.endswith(suffix):
-                        field_name = k[: -len(suffix)]
-                        scores_by_excel[fn][field_name] = v
+                        extracted_field_name = k[: -len(suffix)]
+                        # 如果指定了 field_name，只返回匹配的字段
+                        if field_name_filter and extracted_field_name != field_name_filter:
+                            continue
+                        scores_by_excel[fn][extracted_field_name] = v
 
                 for k, v in comments_data.items():
                     if isinstance(k, str) and k.endswith(suffix):
-                        field_name = k[: -len(suffix)]
-                        comments_by_excel[fn][field_name] = v
+                        extracted_field_name = k[: -len(suffix)]
+                        # 如果指定了 field_name，只返回匹配的字段
+                        if field_name_filter and extracted_field_name != field_name_filter:
+                            continue
+                        comments_by_excel[fn][extracted_field_name] = v
+                
+                # 如果指定了 field_name 但该Excel文件中没有该字段，移除该Excel文件
+                if field_name_filter and not scores_by_excel[fn]:
+                    del scores_by_excel[fn]
+                    if fn in comments_by_excel:
+                        del comments_by_excel[fn]
+                    continue
+            
+            # 如果指定了 field_name 但没有任何匹配的数据，跳过该记录
+            if field_name_filter and not scores_by_excel:
+                continue
+            
+            # 更新 matched_excel_filenames，只包含实际有数据的Excel文件
+            actual_matched_filenames = list(scores_by_excel.keys())
 
             results.append(
                 {
@@ -3584,8 +3921,9 @@ async def api_get_student_record_from_excel_table(
                     "score_header_id": shid_int,
                     "student_id": row.get("student_id"),
                     "student_name": row.get("student_name"),
-                    "table_name": table_base,
-                    "matched_excel_filenames": matched_excel_filenames,
+                    "table_name": table_base if table_base else "all",  # 如果不指定table_name，返回"all"
+                    "field_name": field_name_filter if field_name_filter else "all",  # 如果不指定field_name，返回"all"
+                    "matched_excel_filenames": actual_matched_filenames,
                     "scores": scores_by_excel,
                     "comments": comments_by_excel,
                 }

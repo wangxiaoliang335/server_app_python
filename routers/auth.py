@@ -203,7 +203,7 @@ async def login(request: Request):
             # 根据班级唯一编号查询班级信息（使用 ta_classes 表）
             cursor.execute(
                 """
-                SELECT class_code, class_name, school_stage, grade, schoolid, remark, created_at
+                SELECT class_code, class_name, school_stage, grade, schoolid, remark, face_url, created_at
                 FROM ta_classes
                 WHERE class_code = %s
             """,
@@ -239,6 +239,7 @@ async def login(request: Request):
                         "school_stage": class_info.get("school_stage"),
                         "grade": class_info.get("grade"),
                         "schoolid": class_info.get("schoolid"),
+                        "face_url": class_info.get("face_url"),
                     }
                 },
                 status_code=200,

@@ -52,6 +52,7 @@ app.add_middleware(BaseHTTPMiddleware, dispatch=log_request_info)
 
 # ===== routers (拆分后的模块) =====
 from routers.auth import router as auth_router  # noqa: E402
+from routers.calendar import router as calendar_router  # noqa: E402
 from routers.groups import router as groups_router  # noqa: E402
 from routers.messages import router as messages_router  # noqa: E402
 from routers.misc import router as misc_router  # noqa: E402
@@ -66,6 +67,7 @@ from ws.endpoint import router as ws_router  # noqa: E402
 
 
 app.include_router(auth_router)
+app.include_router(calendar_router)
 app.include_router(misc_router)
 app.include_router(scores_router)
 app.include_router(seat_schedule_router)
