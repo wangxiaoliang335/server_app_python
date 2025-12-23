@@ -489,12 +489,12 @@ async def api_get_student_scores(
     connection = get_db_connection()
     if connection is None:
         error_response = {'message': '数据库连接失败', 'code': 500}
-        try:
-            error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
-            print(f"[student-scores] 返回的 JSON 结果（数据库连接失败）:\n{error_json}")
-            app_logger.error(f"[student-scores] 返回的 JSON 结果（数据库连接失败）: {json.dumps(error_response, ensure_ascii=False)}")
-        except Exception as json_error:
-            print(f"[student-scores] 打印 JSON 时出错: {json_error}")
+        # try:
+        #     error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+        #     print(f"[student-scores] 返回的 JSON 结果（数据库连接失败）:\n{error_json}")
+        #     app_logger.error(f"[student-scores] 返回的 JSON 结果（数据库连接失败）: {json.dumps(error_response, ensure_ascii=False)}")
+        # except Exception as json_error:
+        #     print(f"[student-scores] 打印 JSON 时出错: {json_error}")
         return safe_json_response(error_response, status_code=500)
 
     try:
@@ -720,34 +720,34 @@ async def api_get_student_scores(
         }
         
         # 打印返回的 JSON 结果
-        try:
-            response_json = json.dumps(response_data, ensure_ascii=False, indent=2)
-            print(f"[student-scores] 返回的 JSON 结果:\n{response_json}")
-            app_logger.info(f"[student-scores] 返回的 JSON 结果: {json.dumps(response_data, ensure_ascii=False)}")
-        except Exception as json_error:
-            print(f"[student-scores] 打印 JSON 时出错: {json_error}")
-            app_logger.warning(f"[student-scores] 打印 JSON 时出错: {json_error}")
+        # try:
+        #     response_json = json.dumps(response_data, ensure_ascii=False, indent=2)
+        #     print(f"[student-scores] 返回的 JSON 结果:\n{response_json}")
+        #     app_logger.info(f"[student-scores] 返回的 JSON 结果: {json.dumps(response_data, ensure_ascii=False)}")
+        # except Exception as json_error:
+        #     print(f"[student-scores] 打印 JSON 时出错: {json_error}")
+        #     app_logger.warning(f"[student-scores] 打印 JSON 时出错: {json_error}")
         
         return safe_json_response(response_data)
     except mysql.connector.Error as e:
         error_response = {'message': '数据库错误', 'code': 500}
         app_logger.error(f"Database error during api_get_student_scores: {e}")
-        try:
-            error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
-            print(f"[student-scores] 返回的 JSON 结果（数据库错误）:\n{error_json}")
-            app_logger.error(f"[student-scores] 返回的 JSON 结果（数据库错误）: {json.dumps(error_response, ensure_ascii=False)}")
-        except Exception as json_error:
-            print(f"[student-scores] 打印 JSON 时出错: {json_error}")
+        # try:
+        #     error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+        #     print(f"[student-scores] 返回的 JSON 结果（数据库错误）:\n{error_json}")
+        #     app_logger.error(f"[student-scores] 返回的 JSON 结果（数据库错误）: {json.dumps(error_response, ensure_ascii=False)}")
+        # except Exception as json_error:
+        #     print(f"[student-scores] 打印 JSON 时出错: {json_error}")
         return safe_json_response(error_response, status_code=500)
     except Exception as e:
         error_response = {'message': '未知错误', 'code': 500}
         app_logger.error(f"Unexpected error during api_get_student_scores: {e}")
-        try:
-            error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
-            print(f"[student-scores] 返回的 JSON 结果（未知错误）:\n{error_json}")
-            app_logger.error(f"[student-scores] 返回的 JSON 结果（未知错误）: {json.dumps(error_response, ensure_ascii=False)}")
-        except Exception as json_error:
-            print(f"[student-scores] 打印 JSON 时出错: {json_error}")
+        # try:
+        #     error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+        #     print(f"[student-scores] 返回的 JSON 结果（未知错误）:\n{error_json}")
+        #     app_logger.error(f"[student-scores] 返回的 JSON 结果（未知错误）: {json.dumps(error_response, ensure_ascii=False)}")
+        # except Exception as json_error:
+        #     print(f"[student-scores] 打印 JSON 时出错: {json_error}")
         return safe_json_response(error_response, status_code=500)
     finally:
         if connection and connection.is_connected():
@@ -2194,12 +2194,12 @@ async def api_get_group_scores(
     connection = get_db_connection()
     if connection is None:
         error_response = {'message': '数据库连接失败', 'code': 500}
-        try:
-            error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
-            print(f"[group-scores] 返回的 JSON 结果（数据库连接失败）:\n{error_json}")
-            app_logger.error(f"[group-scores] 返回的 JSON 结果（数据库连接失败）: {json.dumps(error_response, ensure_ascii=False)}")
-        except Exception as json_error:
-            print(f"[group-scores] 打印 JSON 时出错: {json_error}")
+        # try:
+        #     error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+        #     print(f"[group-scores] 返回的 JSON 结果（数据库连接失败）:\n{error_json}")
+        #     app_logger.error(f"[group-scores] 返回的 JSON 结果（数据库连接失败）: {json.dumps(error_response, ensure_ascii=False)}")
+        # except Exception as json_error:
+        #     print(f"[group-scores] 打印 JSON 时出错: {json_error}")
         return safe_json_response(error_response, status_code=500)
 
     try:
@@ -2218,12 +2218,12 @@ async def api_get_group_scores(
         header = cursor.fetchone()
         if not header:
             error_response = {'message': '未找到小组成绩表', 'code': 404}
-            try:
-                error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
-                print(f"[group-scores] 返回的 JSON 结果（未找到数据）:\n{error_json}")
-                app_logger.info(f"[group-scores] 返回的 JSON 结果（未找到数据）: {json.dumps(error_response, ensure_ascii=False)}")
-            except Exception as json_error:
-                print(f"[group-scores] 打印 JSON 时出错: {json_error}")
+            # try:
+            #     error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+            #     print(f"[group-scores] 返回的 JSON 结果（未找到数据）:\n{error_json}")
+            #     app_logger.info(f"[group-scores] 返回的 JSON 结果（未找到数据）: {json.dumps(error_response, ensure_ascii=False)}")
+            # except Exception as json_error:
+            #     print(f"[group-scores] 打印 JSON 时出错: {json_error}")
             return safe_json_response(error_response, status_code=404)
 
         score_header_id = header['id']
@@ -2411,24 +2411,24 @@ async def api_get_group_scores(
         }
         
         # 打印返回的 JSON 结果
-        try:
-            response_json = json.dumps(response_data, ensure_ascii=False, indent=2)
-            print(f"[group-scores] 返回的 JSON 结果:\n{response_json}")
-            app_logger.info(f"[group-scores] 返回的 JSON 结果: {json.dumps(response_data, ensure_ascii=False)}")
-        except Exception as json_error:
-            print(f"[group-scores] 打印 JSON 时出错: {json_error}")
-            app_logger.warning(f"[group-scores] 打印 JSON 时出错: {json_error}")
+        # try:
+        #     response_json = json.dumps(response_data, ensure_ascii=False, indent=2)
+        #     print(f"[group-scores] 返回的 JSON 结果:\n{response_json}")
+        #     app_logger.info(f"[group-scores] 返回的 JSON 结果: {json.dumps(response_data, ensure_ascii=False)}")
+        # except Exception as json_error:
+        #     print(f"[group-scores] 打印 JSON 时出错: {json_error}")
+        #     app_logger.warning(f"[group-scores] 打印 JSON 时出错: {json_error}")
         
         return safe_json_response(response_data)
     except mysql.connector.Error as e:
         error_response = {'message': '数据库错误', 'code': 500}
         app_logger.error(f"Database error during api_get_group_scores: {e}")
-        try:
-            error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
-            print(f"[group-scores] 返回的 JSON 结果（数据库错误）:\n{error_json}")
-            app_logger.error(f"[group-scores] 返回的 JSON 结果（数据库错误）: {json.dumps(error_response, ensure_ascii=False)}")
-        except Exception as json_error:
-            print(f"[group-scores] 打印 JSON 时出错: {json_error}")
+        # try:
+        #     error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+        #     print(f"[group-scores] 返回的 JSON 结果（数据库错误）:\n{error_json}")
+        #     app_logger.error(f"[group-scores] 返回的 JSON 结果（数据库错误）: {json.dumps(error_response, ensure_ascii=False)}")
+        # except Exception as json_error:
+        #     print(f"[group-scores] 打印 JSON 时出错: {json_error}")
         return safe_json_response(error_response, status_code=500)
     except Exception as e:
         error_response = {'message': f'未知错误: {str(e)}', 'code': 500}
@@ -2436,12 +2436,12 @@ async def api_get_group_scores(
         import traceback
         traceback_str = traceback.format_exc()
         app_logger.error(f"错误堆栈:\n{traceback_str}")
-        try:
-            error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
-            print(f"[group-scores] 返回的 JSON 结果（未知错误）:\n{error_json}")
-            app_logger.error(f"[group-scores] 返回的 JSON 结果（未知错误）: {json.dumps(error_response, ensure_ascii=False)}")
-        except Exception as json_error:
-            print(f"[group-scores] 打印 JSON 时出错: {json_error}")
+        # try:
+        #     error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+        #     print(f"[group-scores] 返回的 JSON 结果（未知错误）:\n{error_json}")
+        #     app_logger.error(f"[group-scores] 返回的 JSON 结果（未知错误）: {json.dumps(error_response, ensure_ascii=False)}")
+        # except Exception as json_error:
+        #     print(f"[group-scores] 打印 JSON 时出错: {json_error}")
         return safe_json_response(error_response, status_code=500)
     finally:
         if connection and connection.is_connected():
@@ -3261,7 +3261,8 @@ async def api_set_group_score_comment(request: Request):
 
 @router.get("/group-scores/get-student-attr")
 async def api_get_group_student_attr(
-    class_id: str = Query(..., description="班级ID"),
+    class_id: Optional[str] = Query(None, description="班级ID（与 group_id 二选一；也可两者都传）"),
+    group_id: Optional[str] = Query(None, description="班级群ID（与 class_id 二选一；也可两者都传）"),
     term: Optional[str] = Query(None, description="学期（可选；不传则 term IS NULL）"),
     student_id: Optional[str] = Query(None, description="学号（可选，与 student_name 二选一）"),
     student_name: Optional[str] = Query(None, description="学生姓名（可选，与 student_id 二选一）"),
@@ -3283,6 +3284,10 @@ async def api_get_group_student_attr(
     if not (sid or sname):
         return safe_json_response({"message": "缺少必要参数 student_id 或 student_name", "code": 400}, status_code=400)
 
+    # 兼容：class_id / group_id 二选一；也可两者都传
+    if not class_id and not group_id:
+        return safe_json_response({"message": "缺少必要参数：class_id 或 group_id", "code": 400}, status_code=400)
+
     connection = get_db_connection()
     if connection is None:
         return safe_json_response({"message": "数据库连接失败", "code": 500}, status_code=500)
@@ -3291,12 +3296,51 @@ async def api_get_group_student_attr(
     try:
         cursor = connection.cursor(dictionary=True)
 
+        # 如果传了 group_id，优先尝试从 groups 表解析出对应的 classid
+        resolved_class_id = class_id
+        if group_id:
+            try:
+                cursor.execute("SELECT classid FROM `groups` WHERE group_id = %s LIMIT 1", (group_id,))
+                group_row = cursor.fetchone()
+                if group_row and group_row.get("classid"):
+                    resolved_class_id_from_group = group_row.get("classid")
+                    # 如果同时传了 class_id，验证一致性
+                    if class_id:
+                        if resolved_class_id_from_group != class_id:
+                            return safe_json_response(
+                                {"message": "参数不一致：class_id 与 group_id 对应的 classid 不一致", "code": 400},
+                                status_code=400,
+                            )
+                    resolved_class_id = resolved_class_id_from_group
+                else:
+                    # 如果从 group_id 解析失败，且没有传 class_id，返回错误
+                    if not class_id:
+                        return safe_json_response(
+                            {"message": "无法从 group_id 解析班级ID(classid)，请只传 class_id，或先在 groups 表补齐 classid", "code": 400},
+                            status_code=400,
+                        )
+                    # 如果解析失败但有 class_id，使用 class_id
+                    resolved_class_id = resolved_class_id or group_id
+            except Exception as e:
+                app_logger.error(f"[group-scores/get-student-attr] 解析 group_id 失败: {e}", exc_info=True)
+                if not class_id:
+                    return safe_json_response(
+                        {"message": "无法从 group_id 解析班级ID(classid)，请只传 class_id", "code": 400},
+                        status_code=400,
+                    )
+                resolved_class_id = resolved_class_id or group_id
+
+        # 使用解析后的 class_id
+        final_class_id = resolved_class_id or class_id
+        if not final_class_id:
+            return safe_json_response({"message": "无法确定班级ID，请提供 class_id 或有效的 group_id", "code": 400}, status_code=400)
+
         # header：class_id + term
         cursor.execute(
             "SELECT id, class_id, term, excel_file_url FROM ta_group_score_header "
             "WHERE class_id = %s AND ((%s IS NULL AND term IS NULL) OR term = %s) "
             "ORDER BY created_at DESC LIMIT 1",
-            (class_id, term, term),
+            (final_class_id, term, term),
         )
         header_row = cursor.fetchone()
         if not header_row:

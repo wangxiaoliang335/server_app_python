@@ -66,6 +66,14 @@ async def handle_homework_publish(
     - 给在线成员推送并标记已读
     - 给发送者回执
     """
+    app_logger.info(
+        f"[homework] ========== handle_homework_publish 被调用 ========== "
+        f"user_id={user_id}, group_id={group_id}, "
+        f"msg_data={json.dumps(msg_data, ensure_ascii=False)[:500]}"
+    )
+    print(f"[homework] ========== handle_homework_publish 被调用 ========== "
+          f"user_id={user_id}, group_id={group_id}")
+    
     group_id = (str(group_id).strip() if group_id is not None else "") or None
     if not group_id:
         error_msg = "缺少 group_id（作业消息无法路由到群组）"
@@ -124,6 +132,19 @@ async def handle_homework_publish(
         members = cursor.fetchall()
         total_members = len(members)
         app_logger.info(f"[homework] 获取群组成员 - group_id={group_id}, 总成员数={total_members}（排除发送者）")
+        
+        # 如果提供了 class_id，也添加班级端（class_code）作为接收者
+        # 注意：作业消息中的 class_id 实际上就是 class_code
+        class_code_receiver = None
+        if class_id:
+            # class_id 就是 class_code，直接使用
+            class_code_receiver = str(class_id).strip()
+            app_logger.info(f"[homework] 添加班级端到接收者列表 - class_code={class_code_receiver}")
+            # 将班级端添加到成员列表（如果不在群组成员中）
+            if class_code_receiver and class_code_receiver not in [m["user_id"] for m in members]:
+                members.append({"user_id": class_code_receiver})
+                total_members += 1
+                app_logger.info(f"[homework] 班级端已添加到接收者列表 - class_code={class_code_receiver}, 总接收者数={total_members}")
 
         # 解析日期
         try:
@@ -262,6 +283,262 @@ async def handle_homework_publish(
         except Exception:
             pass
 
+async def handle_notification_publish(
+    *,
+    websocket: WebSocket,
+    user_id: str,
+    connection: mysql.connector.MySQLConnection,
+    group_id: Optional[str],
+    msg_data: Dict[str, Any],
+) -> None:
+    """
+    处理通知消息发布（多对一：多个教师发给一个班级）：
+    - 接收者必须是班级（class_id/class_code）
+    - 保存到 ta_notification 表
+    - 给班级端推送并标记已读
+    - 给发送者回执
+    """
+    app_logger.info(
+        f"[notification] ========== handle_notification_publish 被调用 ========== "
+        f"user_id={user_id}, group_id={group_id}, "
+        f"msg_data={json.dumps(msg_data, ensure_ascii=False)[:500]}"
+    )
+    print(f"[notification] ========== handle_notification_publish 被调用 ========== "
+          f"user_id={user_id}, group_id={group_id}")
+    
+    # 获取消息字段
+    class_id = msg_data.get("class_id")  # 班级ID（class_code），这是接收者
+    group_id = (str(group_id).strip() if group_id is not None else "") or msg_data.get("group_id") or None
+    sender_id = msg_data.get("sender_id") or user_id
+    sender_name = msg_data.get("sender_name", "") or ""
+    content = msg_data.get("content", "") or ""
+    # content_text：约定通知类型固定使用 11，避免字符串写入整数型列
+    content_text_raw = msg_data.get("content_text", "") or msg_data.get("type", "notification")
+    push_content_text = 11  # 推送给客户端的值（与入库一致）
+    content_text = 11       # 入库固定写 11，防止字符串导致 1366 错误
+    unique_group_id = msg_data.get("unique_group_id") or group_id
+    group_name = msg_data.get("group_name", "") or ""
+
+    app_logger.info(
+        f"[notification] 收到通知消息 - user_id={user_id}, sender_id={sender_id}, "
+        f"class_id={class_id}, group_id={group_id}, content_length={len(content)}"
+    )
+    print(f"[notification] 收到通知消息 user_id={user_id}, sender_id={sender_id}, class_id={class_id}, group_id={group_id}")
+
+    cursor = connection.cursor(dictionary=True)
+    try:
+        # 通知是多对一：教师发给班级，必须指定 class_id（因为教师可能在多个班级中）
+        if not class_id:
+            error_msg = "缺少必要参数 class_id（通知必须指定接收班级）"
+            app_logger.warning(f"[notification] {error_msg}, user_id={user_id}")
+            await websocket.send_text(json.dumps({"type": "error", "message": error_msg}, ensure_ascii=False))
+            return
+
+        class_code_receiver = str(class_id).strip()
+        app_logger.info(f"[notification] 收到 class_id={class_code_receiver}, 开始验证教师是否在该班级中")
+
+        # 验证：该教师是否在指定的班级群中
+        # 查询该班级对应的班级群（classid = class_code_receiver 且 is_class_group=1）
+        cursor.execute(
+            """
+            SELECT g.group_id, g.group_name, g.classid, g.schoolid
+            FROM `groups` g
+            INNER JOIN `group_members` gm ON g.group_id = gm.group_id
+            WHERE g.classid = %s AND g.is_class_group = 1 AND gm.user_id = %s
+            LIMIT 1
+            """,
+            (class_code_receiver, sender_id),
+        )
+        class_group_info = cursor.fetchone()
+        
+        if not class_group_info:
+            error_msg = f"教师 {sender_id} 不在班级 {class_code_receiver} 的班级群中，无法发送通知"
+            app_logger.warning(f"[notification] {error_msg}, user_id={user_id}")
+            await websocket.send_text(json.dumps({"type": "error", "message": error_msg}, ensure_ascii=False))
+            return
+
+        # 获取班级群信息
+        class_group_id = class_group_info.get("group_id")
+        
+        # 使用查询到的班级群信息
+        if not group_id:
+            group_id = class_group_id
+        if not unique_group_id:
+            unique_group_id = class_group_id
+        if not group_name:
+            group_name = class_group_info.get("group_name", "") or ""
+        
+        app_logger.info(
+            f"[notification] 验证通过 - 教师={sender_id}, 班级ID（class_code）={class_code_receiver}, "
+            f"班级群={class_group_id}, group_name={group_name}"
+        )
+        print(f"[notification] 验证通过 - 教师={sender_id}, 班级ID={class_code_receiver}, 班级群={class_group_id}")
+
+        # 如果提供了 group_id，验证群组并获取群组信息（用于补充信息）
+        if group_id and group_id != class_group_id:
+            cursor.execute(
+                """
+                SELECT group_id, group_name, owner_identifier
+                FROM `groups`
+                WHERE group_id = %s
+                """,
+                (group_id,),
+            )
+            group_info = cursor.fetchone()
+            if group_info:
+                if not group_name:
+                    group_name = group_info.get("group_name", "") or ""
+                app_logger.info(f"[notification] 补充群组信息 - group_id={group_id}, group_name={group_name}")
+
+        # 构建推送消息
+        notification_message = json.dumps(
+            {
+                "type": "notification",
+                "sender_id": sender_id,
+                "sender_name": sender_name,
+                "content": content,
+                "content_text": push_content_text,
+                "class_id": class_code_receiver,
+                "group_id": unique_group_id,
+                "group_name": group_name,
+            },
+            ensure_ascii=False,
+        )
+
+        # 先保存到数据库（不管是否在线）
+        app_logger.info(f"[notification] 开始保存通知数据到数据库 - class_code={class_code_receiver}")
+        print(f"[notification] 开始入库 class_code={class_code_receiver}")
+
+        notification_id: Optional[int] = None
+        try:
+            # 通知是多对一：教师发给班级端
+            # receiver_id 设置为班级ID（class_code），班级端登录时会通过 receiver_id 查询未读通知
+            app_logger.info(
+                f"[notification] 准备插入数据库 - sender_id={sender_id}, receiver_id={class_code_receiver} (type={type(class_code_receiver).__name__}), "
+                f"unique_group_id={unique_group_id}, group_name={group_name}, content_length={len(content)}, content_text={content_text}"
+            )
+            print(f"[notification] 准备插入数据库 - receiver_id={class_code_receiver} (type={type(class_code_receiver).__name__}), sender_id={sender_id}")
+            
+            # 确保 receiver_id 是字符串类型，避免被转换为整数（防止 000011002 变成 11002）
+            receiver_id_str = str(class_code_receiver).strip()
+            app_logger.info(f"[notification] receiver_id 字符串化后: {receiver_id_str} (len={len(receiver_id_str)})")
+            
+            # 注意：如果 receiver_id 字段是整数类型，需要先执行迁移脚本 migrate_notification_receiver_id_to_varchar.sql
+            # 将 receiver_id 字段改为 VARCHAR 类型，否则 000011002 会被转换为 11002（丢失前导零）
+            cursor.execute(
+                """
+                INSERT INTO ta_notification (
+                    sender_id, sender_name, receiver_id, unique_group_id, group_name, content, content_text, is_read, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, 0, NOW())
+                """,
+                (sender_id, sender_name, receiver_id_str, unique_group_id, group_name, content, content_text),
+            )
+            notification_id = cursor.lastrowid
+            connection.commit()
+            
+            # 验证插入的数据：查询刚插入的记录，确认 receiver_id 是否正确
+            cursor.execute(
+                "SELECT receiver_id, sender_id, content FROM ta_notification WHERE id = %s",
+                (notification_id,)
+            )
+            inserted_record = cursor.fetchone()
+            if inserted_record:
+                actual_receiver_id = inserted_record.get("receiver_id")
+                app_logger.info(
+                    f"[notification] 入库成功并验证 - notification_id={notification_id}, "
+                    f"期望 receiver_id={class_code_receiver}, 实际 receiver_id={actual_receiver_id}, "
+                    f"sender_id={sender_id}, content_text={content_text}"
+                )
+                print(f"[notification] 入库成功 notification_id={notification_id}, 期望 receiver_id={class_code_receiver}, 实际 receiver_id={actual_receiver_id}")
+                if str(actual_receiver_id) != str(class_code_receiver):
+                    app_logger.error(
+                        f"[notification] ⚠️ receiver_id 不匹配！期望={class_code_receiver}, 实际={actual_receiver_id}"
+                    )
+                    print(f"[notification] ⚠️ receiver_id 不匹配！期望={class_code_receiver}, 实际={actual_receiver_id}")
+            else:
+                app_logger.warning(f"[notification] 无法验证插入的数据 - notification_id={notification_id}")
+                print(f"[notification] 无法验证插入的数据 - notification_id={notification_id}")
+        except Exception as e:
+            connection.rollback()
+            app_logger.error(
+                f"[notification] 入库失败 - sender_id={sender_id}, receiver={class_code_receiver}, error={e}",
+                exc_info=True,
+            )
+            print(f"[notification] 入库失败: {e}")
+            await websocket.send_text(json.dumps({"type": "error", "message": "通知保存失败"}, ensure_ascii=False))
+            return
+
+        # 推送给班级端（如果在线）
+        target_conn = connections.get(class_code_receiver)
+        is_online = False
+
+        if target_conn:
+            app_logger.info(f"[notification] 班级端 {class_code_receiver} 在线，推送消息并标记为已读")
+            print(f"[notification] push online -> {class_code_receiver}")
+            is_online = True
+            try:
+                await target_conn["ws"].send_text(notification_message)
+                # 标记为已读
+                if notification_id:
+                    cursor.execute(
+                        """
+                        UPDATE ta_notification
+                        SET is_read = 1, read_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (notification_id,),
+                    )
+                else:
+                    # 如果没有 notification_id，使用其他条件
+                    cursor.execute(
+                        """
+                        UPDATE ta_notification
+                        SET is_read = 1, read_at = NOW()
+                        WHERE sender_id = %s AND receiver_id = %s AND content = %s AND is_read = 0
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        (sender_id, class_code_receiver, content),
+                    )
+                connection.commit()
+                app_logger.info(f"[notification] 已推送并标记为已读 - notification_id={notification_id}, receiver={class_code_receiver}")
+            except Exception as e:
+                connection.rollback()
+                app_logger.error(
+                    f"[notification] 推送/标记已读失败 - sender_id={sender_id}, receiver={class_code_receiver}, error={e}",
+                    exc_info=True,
+                )
+        else:
+            app_logger.info(f"[notification] 班级端 {class_code_receiver} 不在线，已保存到数据库，等待登录时获取")
+            print(f"[notification] 班级端不在线 -> {class_code_receiver}")
+
+        # 给发送者返回结果
+        status_text = "在线" if is_online else "离线"
+        result_message = f"通知已发送到班级 {class_code_receiver}（{status_text}）"
+        app_logger.info(
+            f"[notification] 完成 - sender_id={sender_id}, class_id={class_code_receiver}, group_id={group_id}, "
+            f"is_online={is_online}, notification_id={notification_id}"
+        )
+        print(f"[notification] 完成 class_code={class_code_receiver}, is_online={is_online}")
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "notification",
+                    "status": "success",
+                    "message": result_message,
+                    "class_id": class_code_receiver,
+                    "is_online": is_online,
+                    "notification_id": notification_id,
+                },
+                ensure_ascii=False,
+            )
+        )
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+
 @router.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
     current_online = len(connections)
@@ -317,34 +594,44 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             app_logger.info(f"[websocket] 班级端登录成功 - class_code={user_id}, class_name={class_info.get('class_name')}")
             print(f"[websocket] 班级端登录成功 - class_code={user_id}, class_name={class_info.get('class_name')}")
         else:
-            # 如果不是班级端，验证是否为老师登录（通过 user_id 查询 users 表）
+            # 如果不是班级端，验证是否为老师登录
+            # user_id 是教师唯一ID，对应 ta_teacher 表的 teacher_unique_id 字段
             cursor.execute(
                 """
-                SELECT user_id, name, phone, id_number, avatar_url
-                FROM users
-                WHERE user_id = %s
+                SELECT t.id, t.teacher_unique_id, t.name, t.phone, t.id_card, t.icon,
+                       u.name AS detail_name, u.phone AS detail_phone, u.id_number, u.avatar
+                FROM ta_teacher AS t
+                LEFT JOIN ta_user_details AS u ON t.id_card = u.id_number
+                WHERE t.teacher_unique_id = %s
+                LIMIT 1
                 """,
                 (user_id,),
             )
-            user_info = cursor.fetchone()
+            teacher_info = cursor.fetchone()
             
-            if user_info:
+            if teacher_info:
                 # 老师登录成功，发送登录成功响应
+                # 优先使用 ta_user_details 的信息，如果没有则使用 ta_teacher 的信息
+                name = teacher_info.get("detail_name") or teacher_info.get("name") or ""
+                phone = teacher_info.get("detail_phone") or teacher_info.get("phone") or ""
+                id_number = teacher_info.get("id_number") or teacher_info.get("id_card") or ""
+                avatar_url = teacher_info.get("avatar") or teacher_info.get("icon") or ""
+                
                 login_response = {
                     "type": "login_success",
                     "message": "登录成功",
                     "code": 200,
                     "data": {
-                        "user_id": user_info.get("user_id"),
-                        "name": user_info.get("name"),
-                        "phone": user_info.get("phone"),
-                        "id_number": user_info.get("id_number"),
-                        "avatar_url": user_info.get("avatar_url"),
+                        "user_id": teacher_info.get("teacher_unique_id"),  # 使用 teacher_unique_id 作为 user_id
+                        "name": name,
+                        "phone": phone,
+                        "id_number": id_number,
+                        "avatar_url": avatar_url,
                     }
                 }
                 await websocket.send_text(json.dumps(login_response, ensure_ascii=False, default=str))
-                app_logger.info(f"[websocket] 老师登录成功 - user_id={user_id}, name={user_info.get('name')}")
-                print(f"[websocket] 老师登录成功 - user_id={user_id}, name={user_info.get('name')}")
+                app_logger.info(f"[websocket] 老师登录成功 - user_id={user_id}, name={name}")
+                print(f"[websocket] 老师登录成功 - user_id={user_id}, name={name}")
             else:
                 # 既不是班级端也不是老师，登录失败
                 error_response = {
@@ -363,7 +650,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
         app_logger.info(f"[websocket] 用户 {user_id} 已连接，当前在线={len(connections)}")
         print(f"用户 {user_id} 已连接，当前在线={len(connections)}")
         
-        # 查询条件改为：receiver_id = user_id 或 sender_id = user_id，并且 is_read = 0
+        # 判断是否为班级端
+        is_class_client = class_info is not None
+        app_logger.info(f"[websocket] 登录类型判断 - user_id={user_id}, is_class_client={is_class_client}")
+        print(f"[websocket] 登录类型判断 - user_id={user_id}, is_class_client={is_class_client}")
+        
+        # 查询未读通知
+        # 对于班级端：user_id 就是 class_code，查询 receiver_id = class_code 的通知（教师发给班级的通知）
+        # 对于教师端：查询 receiver_id = user_id 或 sender_id = user_id 的通知
+        # 查询未读通知
+        # 对于班级端：user_id = class_code（班级ID），receiver_id = class_code，通知都是发给班级端的
+        # 对于教师端：user_id = teacher_unique_id，可能作为 receiver_id 或 sender_id
         print(" xxx SELECT ta_notification")
         update_query = """
             SELECT *
@@ -373,15 +670,23 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
         """
         cursor.execute(update_query, (user_id, user_id))
         unread_notifications = cursor.fetchall()
+        app_logger.info(f"[websocket] 查询未读通知 - user_id={user_id}, 数量={len(unread_notifications)}")
+        print(f"[websocket] 查询未读通知 - user_id={user_id}, 数量={len(unread_notifications)}")
 
         if unread_notifications:
+            app_logger.info(f"[websocket] 推送未读通知 - user_id={user_id}, 数量={len(unread_notifications)}")
+            print(f"[websocket] 推送未读通知 - user_id={user_id}, 数量={len(unread_notifications)}")
             await websocket.send_text(json.dumps({
                 "type": "unread_notifications",
                 "data": unread_notifications
             }, default=convert_datetime, ensure_ascii=False))
         
         # 查询所有课前准备（包含已读与未读）
-        cursor.execute("""
+        # 对于班级端，user_id 就是 class_code，需要查询该班级的课前准备
+        app_logger.info(f"[prepare_class] ========== 开始查询课前准备 ========== user_id={user_id}, is_class_client={is_class_client}")
+        print(f"[prepare_class] ========== 开始查询课前准备 ========== user_id={user_id}, is_class_client={is_class_client}")
+        
+        prepare_sql = """
             SELECT 
                 cp.prepare_id, cp.group_id, cp.class_id, cp.school_id, cp.subject, cp.content, cp.date, cp.time,
                 cp.sender_id, cp.sender_name, cp.created_at, g.group_name, cpr.is_read
@@ -390,8 +695,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             LEFT JOIN `groups` g ON cp.group_id = g.group_id
             WHERE cpr.receiver_id = %s
             ORDER BY cp.created_at DESC
-        """, (user_id,))
+        """
+        prepare_params = (user_id,)
+        app_logger.info(f"[prepare_class] SQL语句: {prepare_sql.strip()}")
+        app_logger.info(f"[prepare_class] SQL参数: receiver_id={user_id}")
+        print(f"[prepare_class] SQL语句: {prepare_sql.strip()}")
+        print(f"[prepare_class] SQL参数: receiver_id={user_id}")
+        
+        cursor.execute(prepare_sql, prepare_params)
         preparation_rows = cursor.fetchall()
+        app_logger.info(f"[prepare_class] 查询完成 - user_id={user_id}, 查询到 {len(preparation_rows)} 条课前准备记录（包含已读和未读）")
+        print(f"[prepare_class] 查询完成 - user_id={user_id}, 查询到 {len(preparation_rows)} 条课前准备记录")
 
         if preparation_rows:
             preparation_payload: Dict[str, Any] = {
@@ -400,6 +714,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 "data": []
             }
             unread_updates: List[int] = []
+            read_count = 0
+            unread_count = 0
 
             for prep in preparation_rows:
                 message = {
@@ -421,14 +737,21 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
                 if not prep.get("is_read"):
                     unread_updates.append(prep.get("prepare_id"))
+                    unread_count += 1
+                else:
+                    read_count += 1
 
+            app_logger.info(f"[prepare_class] 课前准备统计 - user_id={user_id}, 总数={len(preparation_rows)}, 未读={unread_count}, 已读={read_count}")
+            print(f"[prepare_class] 课前准备统计 - user_id={user_id}, 总数={len(preparation_rows)}, 未读={unread_count}, 已读={read_count}")
+            
             payload_str = json.dumps(preparation_payload, ensure_ascii=False)
-            app_logger.info(f"[prepare_class] 用户 {user_id} 登录，推送课前准备数据: {payload_str}")
-            print(f"[prepare_class] 登录推送课前准备数据: {payload_str}")
+            app_logger.info(f"[prepare_class] ========== 推送课前准备数据 ========== user_id={user_id}, 总数={len(preparation_rows)}")
+            print(f"[prepare_class] ========== 推送课前准备数据 ========== user_id={user_id}, 总数={len(preparation_rows)}")
             await websocket.send_text(payload_str)
 
             if unread_updates:
-                app_logger.info(f"[prepare_class] 标记 {len(unread_updates)} 条课前准备为已读，user_id={user_id}")
+                app_logger.info(f"[prepare_class] ========== 标记课前准备为已读 ========== user_id={user_id}, 数量={len(unread_updates)}")
+                print(f"[prepare_class] ========== 标记课前准备为已读 ========== user_id={user_id}, 数量={len(unread_updates)}")
                 for prep_id in unread_updates:
                     cursor.execute("""
                         UPDATE class_preparation_receiver
@@ -436,36 +759,107 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         WHERE prepare_id = %s AND receiver_id = %s
                     """, (prep_id, user_id))
                 connection.commit()
+                app_logger.info(f"[prepare_class] 已标记 {len(unread_updates)} 条课前准备为已读 - user_id={user_id}")
+                print(f"[prepare_class] 已标记 {len(unread_updates)} 条课前准备为已读 - user_id={user_id}")
+        else:
+            app_logger.info(f"[prepare_class] 未查询到课前准备记录 - user_id={user_id}")
+            print(f"[prepare_class] 未查询到课前准备记录 - user_id={user_id}")
         
         # 查询所有未读作业消息，逐个推送（格式与在线用户收到的格式一致）
-        # 注意：线上库存在 utf8mb4_0900_ai_ci / utf8mb4_unicode_ci 混用，容易触发 “Illegal mix of collations”
+        # 注意：线上库存在 utf8mb4_0900_ai_ci / utf8mb4_unicode_ci 混用，容易触发 "Illegal mix of collations"
         # 这里对字符串比较显式指定 COLLATE，避免 WS 登录阶段直接异常断开
+        # 对于班级端，user_id 就是 class_code，需要查询该班级的未读作业
         homework_rows = []
         try:
-            cursor.execute(
+            app_logger.info(f"[homework] ========== 开始查询未读作业 ========== user_id={user_id}, is_class_client={is_class_client}")
+            print(f"[homework] ========== 开始查询未读作业 ========== user_id={user_id}, is_class_client={is_class_client}")
+            
+            # 先调试查询：查看数据库中所有相关的 receiver_id 记录
+            debug_sql = """
+                SELECT DISTINCT hr.receiver_id, hr.is_read, COUNT(*) as count
+                FROM homework_receivers hr
+                WHERE hr.receiver_id LIKE %s OR hr.receiver_id = %s
+                GROUP BY hr.receiver_id, hr.is_read
+            """
+            debug_params = (f"%{user_id}%", user_id)
+            cursor.execute(debug_sql, debug_params)
+            debug_rows = cursor.fetchall()
+            app_logger.info(f"[homework] 调试查询 - 查找包含 {user_id} 的 receiver_id 记录: {debug_rows}")
+            print(f"[homework] 调试查询 - 查找包含 {user_id} 的 receiver_id 记录: {debug_rows}")
+            
+            # 查询所有 homework_receivers 表中的 receiver_id（用于调试）
+            debug_all_sql = """
+                SELECT DISTINCT receiver_id, is_read, COUNT(*) as count
+                FROM homework_receivers
+                GROUP BY receiver_id, is_read
+                LIMIT 20
+            """
+            cursor.execute(debug_all_sql)
+            debug_all_rows = cursor.fetchall()
+            app_logger.info(f"[homework] 调试查询 - homework_receivers 表中的所有 receiver_id 示例（前20条）: {debug_all_rows}")
+            print(f"[homework] 调试查询 - homework_receivers 表中的所有 receiver_id 示例（前20条）: {debug_all_rows}")
+            
+            # 对于班级端，查询所有作业（包括已读和未读），类似课前准备的逻辑
+            # 对于老师端，只查询未读作业
+            if is_class_client:
+                # 班级端：查询所有作业（包含已读和未读）
+                homework_sql = """
+                    SELECT
+                        hm.homework_id, hm.group_id, hm.class_id, hm.school_id, hm.subject, hm.content, hm.date,
+                        hm.sender_id, hm.sender_name, hm.created_at, g.group_name, hr.is_read, hr.receiver_id
+                    FROM homework_messages hm
+                    INNER JOIN homework_receivers hr ON hm.homework_id = hr.homework_id
+                    LEFT JOIN `groups` g
+                        ON (hm.group_id COLLATE utf8mb4_unicode_ci) = (g.group_id COLLATE utf8mb4_unicode_ci)
+                    WHERE (hr.receiver_id COLLATE utf8mb4_unicode_ci) = %s
+                    ORDER BY hm.created_at DESC
                 """
-                SELECT
-                    hm.homework_id, hm.group_id, hm.class_id, hm.school_id, hm.subject, hm.content, hm.date,
-                    hm.sender_id, hm.sender_name, hm.created_at, g.group_name, hr.is_read
-                FROM homework_messages hm
-                INNER JOIN homework_receivers hr ON hm.homework_id = hr.homework_id
-                LEFT JOIN `groups` g
-                    ON (hm.group_id COLLATE utf8mb4_unicode_ci) = (g.group_id COLLATE utf8mb4_unicode_ci)
-                WHERE (hr.receiver_id COLLATE utf8mb4_unicode_ci) = %s AND hr.is_read = 0
-                ORDER BY hm.created_at DESC
-                """,
-                (user_id,),
-            )
+                app_logger.info(f"[homework] 班级端查询模式：查询所有作业（包含已读和未读）")
+                print(f"[homework] 班级端查询模式：查询所有作业（包含已读和未读）")
+            else:
+                # 老师端：只查询未读作业
+                homework_sql = """
+                    SELECT
+                        hm.homework_id, hm.group_id, hm.class_id, hm.school_id, hm.subject, hm.content, hm.date,
+                        hm.sender_id, hm.sender_name, hm.created_at, g.group_name, hr.is_read, hr.receiver_id
+                    FROM homework_messages hm
+                    INNER JOIN homework_receivers hr ON hm.homework_id = hr.homework_id
+                    LEFT JOIN `groups` g
+                        ON (hm.group_id COLLATE utf8mb4_unicode_ci) = (g.group_id COLLATE utf8mb4_unicode_ci)
+                    WHERE (hr.receiver_id COLLATE utf8mb4_unicode_ci) = %s AND hr.is_read = 0
+                    ORDER BY hm.created_at DESC
+                """
+                app_logger.info(f"[homework] 老师端查询模式：只查询未读作业")
+                print(f"[homework] 老师端查询模式：只查询未读作业")
+            homework_params = (user_id,)
+            app_logger.info(f"[homework] SQL语句: {homework_sql.strip()}")
+            app_logger.info(f"[homework] SQL参数: receiver_id={user_id}, 参数类型={type(user_id)}, 参数长度={len(str(user_id))}")
+            print(f"[homework] SQL语句: {homework_sql.strip()}")
+            print(f"[homework] SQL参数: receiver_id={user_id}, 参数类型={type(user_id)}, 参数长度={len(str(user_id))}")
+            
+            cursor.execute(homework_sql, homework_params)
             homework_rows = cursor.fetchall()
+            app_logger.info(f"[homework] 查询完成 - user_id={user_id}, 查询到 {len(homework_rows)} 条作业（is_class_client={is_class_client}）")
+            print(f"[homework] 查询完成 - user_id={user_id}, 查询到 {len(homework_rows)} 条作业（is_class_client={is_class_client}）")
         except Exception as e:
             app_logger.error(f"[homework] 登录查询离线作业失败: user_id={user_id}, error={e}", exc_info=True)
             print(f"[homework] 登录查询离线作业失败: {e}")
 
         if homework_rows:
+            app_logger.info(f"[homework] ========== 开始推送作业 ========== user_id={user_id}, 数量={len(homework_rows)}, is_class_client={is_class_client}")
+            print(f"[homework] ========== 开始推送作业 ========== user_id={user_id}, 数量={len(homework_rows)}, is_class_client={is_class_client}")
             unread_homework_updates: List[int] = []
+            read_count = 0
+            unread_count = 0
             
             # 逐个推送，格式与在线用户收到的格式完全一致
-            for hw in homework_rows:
+            for idx, hw in enumerate(homework_rows, 1):
+                is_read = hw.get("is_read", 0)
+                if is_read == 0:
+                    unread_count += 1
+                else:
+                    read_count += 1
+                
                 homework_message = {
                     "type": "homework",
                     "class_id": hw.get("class_id"),
@@ -480,17 +874,21 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 }
                 
                 payload_str = json.dumps(homework_message, ensure_ascii=False)
-                app_logger.info(f"[homework] 用户 {user_id} 登录，推送离线作业: {payload_str}")
-                print(f"[homework] 登录推送离线作业: {payload_str}")
+                app_logger.info(f"[homework] 推送第 {idx}/{len(homework_rows)} 条作业 - user_id={user_id}, homework_id={hw.get('homework_id')}, subject={hw.get('subject')}, is_read={is_read}")
+                print(f"[homework] 推送第 {idx}/{len(homework_rows)} 条作业 - user_id={user_id}, homework_id={hw.get('homework_id')}, subject={hw.get('subject')}, is_read={is_read}")
                 await websocket.send_text(payload_str)
                 
-                # 标记为已读
+                # 只标记未读的作业为已读
                 hw_id = hw.get("homework_id")
-                if hw_id:
+                if hw_id and is_read == 0:
                     unread_homework_updates.append(hw_id)
 
+            app_logger.info(f"[homework] 作业统计 - user_id={user_id}, 总数={len(homework_rows)}, 未读={unread_count}, 已读={read_count}")
+            print(f"[homework] 作业统计 - user_id={user_id}, 总数={len(homework_rows)}, 未读={unread_count}, 已读={read_count}")
+
             if unread_homework_updates:
-                app_logger.info(f"[homework] 标记 {len(unread_homework_updates)} 条作业为已读，user_id={user_id}")
+                app_logger.info(f"[homework] ========== 标记作业为已读 ========== user_id={user_id}, 数量={len(unread_homework_updates)}")
+                print(f"[homework] ========== 标记作业为已读 ========== user_id={user_id}, 数量={len(unread_homework_updates)}")
                 for hw_id in unread_homework_updates:
                     cursor.execute("""
                         UPDATE homework_receivers
@@ -498,6 +896,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         WHERE homework_id = %s AND receiver_id = %s
                     """, (hw_id, user_id))
                 connection.commit()
+                app_logger.info(f"[homework] 已标记 {len(unread_homework_updates)} 条作业为已读 - user_id={user_id}")
+                print(f"[homework] 已标记 {len(unread_homework_updates)} 条作业为已读 - user_id={user_id}")
+        else:
+            app_logger.info(f"[homework] 未查询到未读作业 - user_id={user_id}")
+            print(f"[homework] 未查询到未读作业 - user_id={user_id}")
 
         async def handle_temp_room_creation(msg_data1: Dict[str, Any]):
             print(f"[temp_room] 创建请求 payload={msg_data1}")
@@ -2220,7 +2623,31 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             continue
                         # 作业消息: 发送给群组所有成员
                         elif msg_data1['type'] == "homework":
+                            app_logger.info(
+                                f"[homework] 收到作业消息（to:格式） - user_id={user_id}, target_id={target_id}, "
+                                f"class_id={msg_data1.get('class_id')}, subject={msg_data1.get('subject')}, "
+                                f"raw={json.dumps(msg_data1, ensure_ascii=False)[:500]}"
+                            )
+                            print(f"[homework] 收到作业消息（to:格式） - user_id={user_id}, target_id={target_id}, "
+                                  f"class_id={msg_data1.get('class_id')}, subject={msg_data1.get('subject')}")
                             await handle_homework_publish(
+                                websocket=websocket,
+                                user_id=user_id,
+                                connection=connection,
+                                group_id=target_id,
+                                msg_data=msg_data1,
+                            )
+                            continue
+                        # 通知消息: 发送给指定接收者或群组所有成员
+                        elif msg_data1['type'] == "notification":
+                            app_logger.info(
+                                f"[notification] 收到通知消息（to:格式） - user_id={user_id}, target_id={target_id}, "
+                                f"receiver_id={msg_data1.get('receiver_id')}, receiver_ids={msg_data1.get('receiver_ids')}, "
+                                f"raw={json.dumps(msg_data1, ensure_ascii=False)[:500]}"
+                            )
+                            print(f"[notification] 收到通知消息（to:格式） - user_id={user_id}, target_id={target_id}, "
+                                  f"receiver_id={msg_data1.get('receiver_id')}, receiver_ids={msg_data1.get('receiver_ids')}")
+                            await handle_notification_publish(
                                 websocket=websocket,
                                 user_id=user_id,
                                 connection=connection,
@@ -2254,8 +2681,19 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     msg_data_raw = None
                     try:
                         msg_data_raw = json.loads(data)
+                        # 记录所有收到的消息类型
+                        if isinstance(msg_data_raw, dict):
+                            msg_type = msg_data_raw.get("type")
+                            app_logger.info(
+                                f"[websocket] 收到消息 - user_id={user_id}, type={msg_type}, "
+                                f"raw={data[:300]}"
+                            )
+                            print(f"[websocket] 收到消息 - user_id={user_id}, type={msg_type}")
                     except Exception:
                         msg_data_raw = None
+                        app_logger.warning(
+                            f"[websocket] 解析消息失败 - user_id={user_id}, raw={data[:300]}"
+                        )
 
                     if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") == "6":
                         await handle_temp_room_creation(msg_data_raw)
@@ -2271,10 +2709,39 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             or msg_data_raw.get("to")
                         )
                         app_logger.info(
-                            f"[homework] 收到纯JSON作业消息 - user_id={user_id}, group_id={group_id_from_msg}, raw={data[:300]}"
+                            f"[homework] ========== 收到纯JSON作业消息 ========== "
+                            f"user_id={user_id}, group_id={group_id_from_msg}, "
+                            f"class_id={msg_data_raw.get('class_id')}, subject={msg_data_raw.get('subject')}, "
+                            f"raw={data[:500]}"
                         )
-                        print(f"[homework] 收到纯JSON作业消息 group_id={group_id_from_msg}")
+                        print(f"[homework] ========== 收到纯JSON作业消息 ========== "
+                              f"user_id={user_id}, group_id={group_id_from_msg}, "
+                              f"class_id={msg_data_raw.get('class_id')}, subject={msg_data_raw.get('subject')}")
                         await handle_homework_publish(
+                            websocket=websocket,
+                            user_id=user_id,
+                            connection=connection,
+                            group_id=group_id_from_msg,
+                            msg_data=msg_data_raw,
+                        )
+                        continue
+                    # 兼容纯 JSON 格式的通知发布（不带 to: 前缀）
+                    if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") == "notification":
+                        group_id_from_msg = (
+                            msg_data_raw.get("group_id")
+                            or msg_data_raw.get("target_id")
+                            or msg_data_raw.get("to")
+                        )
+                        app_logger.info(
+                            f"[notification] ========== 收到纯JSON通知消息 ========== "
+                            f"user_id={user_id}, group_id={group_id_from_msg}, "
+                            f"receiver_id={msg_data_raw.get('receiver_id')}, receiver_ids={msg_data_raw.get('receiver_ids')}, "
+                            f"raw={data[:500]}"
+                        )
+                        print(f"[notification] ========== 收到纯JSON通知消息 ========== "
+                              f"user_id={user_id}, group_id={group_id_from_msg}, "
+                              f"receiver_id={msg_data_raw.get('receiver_id')}, receiver_ids={msg_data_raw.get('receiver_ids')}")
+                        await handle_notification_publish(
                             websocket=websocket,
                             user_id=user_id,
                             connection=connection,
