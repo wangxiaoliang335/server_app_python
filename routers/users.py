@@ -100,7 +100,7 @@ async def updateUserInfo(request: Request):
         cursor.execute("UPDATE ta_user_details SET avatar = %s WHERE id_number = %s", (avatar_url, id_number))
         if cursor.rowcount == 0:
             connection.rollback()
-            return JSONResponse({"data": {"message": "未找到对应的用户信息", "code": 404}}, status_code=404)
+            return JSONResponse({"data": {"message": "没有找到数据：未找到对应的用户信息", "code": 200}}, status_code=200)
         connection.commit()
 
         cursor.execute("SELECT name, phone, id_number, avatar FROM ta_user_details WHERE id_number = %s", (id_number,))
@@ -173,7 +173,7 @@ async def update_user_name(request: Request):
                 effective_id_number = row.get("id_number")
 
         if cursor.rowcount == 0:
-            return JSONResponse({"data": {"message": "未找到对应的用户信息", "code": 404}}, status_code=404)
+            return JSONResponse({"data": {"message": "没有找到数据：未找到对应的用户信息", "code": 200}}, status_code=200)
 
         if effective_id_number:
             cursor.execute("UPDATE ta_teacher SET name = %s WHERE id_card = %s", (name, effective_id_number))
@@ -229,7 +229,7 @@ async def _update_user_field(
 
         if cursor.rowcount == 0:
             connection.commit()
-            return JSONResponse({"data": {"message": "未找到对应的用户信息", "code": 404}}, status_code=404)
+            return JSONResponse({"data": {"message": "没有找到数据：未找到对应的用户信息", "code": 200}}, status_code=200)
 
         connection.commit()
         return JSONResponse({"data": {"message": f"{field_label}更新成功", "code": 200}})
@@ -287,7 +287,7 @@ async def update_user_teachings(request: Request):
             cursor.execute("SELECT phone FROM ta_user WHERE id = %s", (userid,))
             row = cursor.fetchone()
             if not row or not row.get("phone"):
-                return JSONResponse({"data": {"message": "未找到该用户", "code": 404}}, status_code=404)
+                return JSONResponse({"data": {"message": "没有找到数据：未找到该用户", "code": 200}}, status_code=200)
             phone = str(row["phone"]).strip()
 
         if not phone:
@@ -384,7 +384,7 @@ async def list_userInfo(request: Request):
             cursor.execute("SELECT phone FROM ta_user WHERE id = %s", (user_id_filter,))
             user_row = cursor.fetchone()
             if not user_row:
-                return JSONResponse({"data": {"message": "未找到该用户", "code": 404, "userinfo": []}}, status_code=404)
+                return JSONResponse({"data": {"message": "没有找到数据：未找到该用户", "code": 200, "userinfo": []}}, status_code=200)
             phone_filter = user_row["phone"]
             cursor.close()
             cursor = None

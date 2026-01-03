@@ -1,11 +1,12 @@
 import base64
+import datetime
 import json
 import time
 
 import mysql.connector
 from mysql.connector import Error
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
 from common import app_logger, safe_json_response
@@ -325,13 +326,13 @@ async def delete_classes(request: Request):
                 return JSONResponse(
                     {
                         "data": {
-                            "message": "未找到要删除的班级",
-                            "code": 404,
+                            "message": "没有找到数据：未找到要删除的班级",
+                            "code": 200,
                             "deleted_count": 0,
                             "not_found_codes": not_found_codes,
                         }
                     },
-                    status_code=404,
+                    status_code=200,
                 )
 
             delete_sql = f"DELETE FROM ta_classes WHERE class_code IN ({placeholders})"
@@ -450,7 +451,7 @@ async def get_class_info(request: Request):
         )
         class_info = cursor.fetchone()
         if not class_info:
-            return JSONResponse({"data": {"message": "班级不存在", "code": 404}}, status_code=404)
+            return JSONResponse({"data": {"message": "没有找到数据：班级不存在", "code": 200}}, status_code=200)
 
         schoolid = class_info.get("schoolid")
         school_info = None
@@ -553,7 +554,7 @@ async def update_class_avatar(request: Request):
         
         if not class_row:
             app_logger.warning(f"[UpdateClassAvatar] 未找到班级 - class_code={class_code}")
-            return JSONResponse({"data": {"message": f"班级 {class_code} 不存在", "code": 404}}, status_code=404)
+            return JSONResponse({"data": {"message": f"没有找到数据：班级 {class_code} 不存在", "code": 200}}, status_code=200)
         
         app_logger.info(f"[UpdateClassAvatar] 找到班级记录: class_code={class_code}, class_name={class_row.get('class_name')}, 当前face_url={class_row.get('face_url')}")
         
@@ -591,5 +592,268 @@ async def update_class_avatar(request: Request):
         if connection and connection.is_connected():
             connection.close()
             app_logger.info(f"Database connection closed after updating class avatar for {class_code}.")
+
+
+@router.post("/classes/subjects")
+async def update_class_subjects(request: Request):
+    """
+    上传/更新班级科目
+    请求体 JSON:
+    {
+        "class_code": "班级唯一编号（如：000011003）",
+        "subjects": ["语文", "数学", "英语", "生物", "地理"]  // 科目名称数组
+    }
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"data": {"message": "无效的 JSON 请求体", "code": 400}}, status_code=400)
+
+    class_code = data.get("class_code")
+    subjects = data.get("subjects")
+
+    if not class_code:
+        app_logger.warning("[UpdateClassSubjects] 缺少 class_code")
+        return JSONResponse({"data": {"message": "班级编号必须提供", "code": 400}}, status_code=400)
+
+    if not isinstance(subjects, list):
+        app_logger.warning(f"[UpdateClassSubjects] subjects 必须是数组 - class_code={class_code}")
+        return JSONResponse({"data": {"message": "subjects 必须是数组", "code": 400}}, status_code=400)
+
+    app_logger.info(f"[UpdateClassSubjects] 收到请求 - class_code={class_code}, subjects数量={len(subjects) if subjects else 0}")
+
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("[UpdateClassSubjects] 数据库连接失败")
+        return JSONResponse({"data": {"message": "数据库连接失败", "code": 500}}, status_code=500)
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+
+        # 检查班级是否存在
+        cursor.execute("SELECT class_code, class_name FROM ta_classes WHERE class_code = %s", (class_code,))
+        class_row = cursor.fetchone()
+
+        if not class_row:
+            app_logger.warning(f"[UpdateClassSubjects] 未找到班级 - class_code={class_code}")
+            return JSONResponse({"data": {"message": f"没有找到数据：班级 {class_code} 不存在", "code": 200}}, status_code=200)
+
+        app_logger.info(f"[UpdateClassSubjects] 找到班级记录: class_code={class_code}, class_name={class_row.get('class_name')}")
+
+        # 先删除该班级的所有科目
+        cursor.execute("DELETE FROM ta_class_subjects WHERE class_code = %s", (class_code,))
+        deleted_count = cursor.rowcount
+        app_logger.info(f"[UpdateClassSubjects] 删除旧的科目记录: {deleted_count} 条")
+
+        # 如果科目列表不为空，插入新的科目
+        if subjects and len(subjects) > 0:
+            insert_sql = """
+                INSERT INTO ta_class_subjects (class_code, subject_name, sort_order)
+                VALUES (%s, %s, %s)
+            """
+            insert_values = []
+            for index, subject_name in enumerate(subjects):
+                if subject_name and str(subject_name).strip():  # 确保科目名称不为空
+                    insert_values.append((class_code, str(subject_name).strip(), index))
+
+            if insert_values:
+                cursor.executemany(insert_sql, insert_values)
+                inserted_count = len(insert_values)
+                app_logger.info(f"[UpdateClassSubjects] 插入新的科目记录: {inserted_count} 条")
+            else:
+                inserted_count = 0
+        else:
+            inserted_count = 0
+
+        connection.commit()
+
+        return JSONResponse({
+            "data": {
+                "message": "班级科目更新成功",
+                "code": 200,
+                "class_code": class_code,
+                "subjects_count": inserted_count,
+                "subjects": subjects if subjects else []
+            }
+        })
+    except mysql.connector.Error as e:
+        if connection:
+            connection.rollback()
+        app_logger.error(f"[UpdateClassSubjects] 数据库错误 - class_code={class_code}, error={e}")
+        return JSONResponse({"data": {"message": f"数据库操作失败: {str(e)}", "code": 500}}, status_code=500)
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        app_logger.error(f"[UpdateClassSubjects] 未知错误 - class_code={class_code}, error={e}", exc_info=True)
+        return JSONResponse({"data": {"message": f"操作失败: {str(e)}", "code": 500}}, status_code=500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info(f"[UpdateClassSubjects] 数据库连接已关闭 - class_code={class_code}")
+
+
+@router.get("/classes/subjects")
+async def get_class_subjects(class_code: str = Query(..., description="班级唯一编号")):
+    """
+    下载/获取班级科目列表
+    查询参数:
+        class_code: 班级唯一编号（如：000011003）
+    """
+    if not class_code:
+        app_logger.warning("[GetClassSubjects] 缺少 class_code")
+        return JSONResponse({"data": {"message": "班级编号必须提供", "code": 400}}, status_code=400)
+
+    app_logger.info(f"[GetClassSubjects] 收到请求 - class_code={class_code}")
+
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("[GetClassSubjects] 数据库连接失败")
+        return JSONResponse({"data": {"message": "数据库连接失败", "code": 500}}, status_code=500)
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+
+        # 查询班级科目列表，按 sort_order 排序
+        cursor.execute(
+            """
+            SELECT subject_name, sort_order, created_at, updated_at
+            FROM ta_class_subjects
+            WHERE class_code = %s
+            ORDER BY sort_order ASC, id ASC
+            """,
+            (class_code,)
+        )
+        subjects_rows = cursor.fetchall()
+
+        # 提取科目名称列表
+        subjects = [row["subject_name"] for row in subjects_rows]
+
+        app_logger.info(f"[GetClassSubjects] 查询成功 - class_code={class_code}, subjects数量={len(subjects)}")
+
+        return JSONResponse({
+            "data": {
+                "message": "获取班级科目列表成功",
+                "code": 200,
+                "class_code": class_code,
+                "subjects_count": len(subjects),
+                "subjects": subjects
+            }
+        })
+    except mysql.connector.Error as e:
+        app_logger.error(f"[GetClassSubjects] 数据库错误 - class_code={class_code}, error={e}")
+        return JSONResponse({"data": {"message": f"数据库操作失败: {str(e)}", "code": 500}}, status_code=500)
+    except Exception as e:
+        app_logger.error(f"[GetClassSubjects] 未知错误 - class_code={class_code}, error={e}", exc_info=True)
+        return JSONResponse({"data": {"message": f"操作失败: {str(e)}", "code": 500}}, status_code=500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info(f"[GetClassSubjects] 数据库连接已关闭 - class_code={class_code}")
+
+
+@router.get("/classes/search")
+def search_classes(
+    class_code: str = Query(..., description="班级编号（class_code）"),
+    schoolid: str = Query(None, description="学校ID，可选参数"),
+):
+    """
+    搜索班级接口
+    根据班级编号（class_code）模糊搜索班级信息
+    
+    参数:
+    - class_code: 班级编号（必填，支持模糊搜索）
+    - schoolid: 学校ID（可选，如果提供则同时按学校ID筛选）
+    """
+    connection = get_db_connection()
+    if connection is None or not connection.is_connected():
+        return JSONResponse({"data": {"message": "数据库连接失败", "code": 500}}, status_code=500)
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+
+        if schoolid:
+            sql = """
+                SELECT class_code, class_name, school_stage, grade, schoolid, remark, face_url, created_at
+                FROM ta_classes
+                WHERE class_code LIKE %s AND schoolid = %s
+            """
+            params = (f"%{class_code}%", schoolid)
+        else:
+            sql = """
+                SELECT class_code, class_name, school_stage, grade, schoolid, remark, face_url, created_at
+                FROM ta_classes
+                WHERE class_code LIKE %s
+            """
+            params = (f"%{class_code}%",)
+
+        cursor.execute(sql, params)
+        classes = cursor.fetchall()
+
+        # 格式化日期字段
+        for cls in classes:
+            if isinstance(cls.get("created_at"), datetime.datetime):
+                cls["created_at"] = cls["created_at"].strftime("%Y-%m-%d %H:%M:%S")
+
+        # 如果找到班级，也查询学校信息
+        result_classes = []
+        for cls in classes:
+            class_data = {
+                "class_code": cls.get("class_code"),
+                "class_name": cls.get("class_name"),
+                "school_stage": cls.get("school_stage"),
+                "grade": cls.get("grade"),
+                "schoolid": cls.get("schoolid"),
+                "remark": cls.get("remark"),
+                "face_url": cls.get("face_url"),
+                "created_at": cls.get("created_at"),
+            }
+
+            # 查询学校信息
+            class_schoolid = cls.get("schoolid")
+            if class_schoolid:
+                cursor.execute(
+                    """
+                    SELECT id, name, address
+                    FROM ta_school
+                    WHERE id = %s
+                    """,
+                    (class_schoolid,),
+                )
+                school_info = cursor.fetchone()
+                if school_info:
+                    class_data["school_name"] = school_info.get("name")
+                    class_data["school_address"] = school_info.get("address")
+
+            result_classes.append(class_data)
+
+        return JSONResponse(
+            {
+                "data": {
+                    "message": "查询成功",
+                    "code": 200,
+                    "class_code": class_code,
+                    "schoolid": schoolid,
+                    "classes": result_classes,
+                    "count": len(result_classes),
+                }
+            },
+            status_code=200,
+        )
+    except mysql.connector.Error as e:
+        return JSONResponse({"data": {"message": f"查询失败: {str(e)}", "code": 500}}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"data": {"message": f"查询失败: {str(e)}", "code": 500}}, status_code=500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
 
 

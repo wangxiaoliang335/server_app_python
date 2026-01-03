@@ -213,7 +213,7 @@ async def login(request: Request):
 
             if not class_info:
                 app_logger.warning(f"[login] 班级端登录失败：班级 {class_number} 不存在")
-                return JSONResponse({"data": {"message": "班级不存在", "code": 404}}, status_code=404)
+                return JSONResponse({"data": {"message": "没有找到数据：班级不存在", "code": 200}}, status_code=200)
 
             # 使用班级编号作为 user_id（班级端登录）
             user_id = class_number
@@ -275,7 +275,7 @@ async def login(request: Request):
         user = cursor.fetchone()
 
         if not user:
-            return JSONResponse({"data": {"message": "用户不存在", "code": 404}}, status_code=404)
+            return JSONResponse({"data": {"message": "没有找到数据：用户不存在", "code": 200}}, status_code=200)
         if not user["is_verified"]:
             return JSONResponse({"data": {"message": "账户未验证", "code": 403}}, status_code=403)
 

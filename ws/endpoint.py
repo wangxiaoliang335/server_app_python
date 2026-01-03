@@ -109,9 +109,9 @@ async def handle_homework_publish(
         )
         group_info = cursor.fetchone()
         if not group_info:
-            error_msg = f"群组 {group_id} 不存在"
+            error_msg = f"没有找到数据：群组 {group_id} 不存在"
             app_logger.warning(f"[homework] {error_msg}, user_id={user_id}")
-            await websocket.send_text(json.dumps({"type": "error", "message": error_msg}, ensure_ascii=False))
+            await websocket.send_text(json.dumps({"type": "error", "message": error_msg, "code": 200}, ensure_ascii=False))
             return
 
         group_name = group_info.get("group_name", "") or ""
@@ -157,6 +157,8 @@ async def handle_homework_publish(
             app_logger.warning(f"[homework] 日期格式错误，使用今天: {date_str}")
 
         # 构建推送消息（字符串，避免重复 dumps）
+        # 获取当前时间作为 created_at
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         homework_message = json.dumps(
             {
                 "type": "homework",
@@ -169,6 +171,7 @@ async def handle_homework_publish(
                 "sender_name": sender_name,
                 "group_id": group_id,
                 "group_name": group_name,
+                "created_at": current_time,
             },
             ensure_ascii=False,
         )
@@ -352,9 +355,9 @@ async def handle_notification_publish(
         class_group_info = cursor.fetchone()
         
         if not class_group_info:
-            error_msg = f"教师 {sender_id} 不在班级 {class_code_receiver} 的班级群中，无法发送通知"
+            error_msg = f"没有找到数据：教师 {sender_id} 不在班级 {class_code_receiver} 的班级群中，无法发送通知"
             app_logger.warning(f"[notification] {error_msg}, user_id={user_id}")
-            await websocket.send_text(json.dumps({"type": "error", "message": error_msg}, ensure_ascii=False))
+            await websocket.send_text(json.dumps({"type": "error", "message": error_msg, "code": 200}, ensure_ascii=False))
             return
 
         # 获取班级群信息
@@ -636,8 +639,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 # 既不是班级端也不是老师，登录失败
                 error_response = {
                     "type": "login_failed",
-                    "message": "登录失败：未找到对应的班级或用户",
-                    "code": 404
+                    "message": "没有找到数据：未找到对应的班级或用户",
+                    "code": 200
                 }
                 await websocket.send_text(json.dumps(error_response, ensure_ascii=False, default=str))
                 app_logger.warning(f"[websocket] 登录失败 - 未找到对应的班级或用户: {user_id}")
@@ -693,7 +696,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             FROM class_preparation cp
             INNER JOIN class_preparation_receiver cpr ON cp.prepare_id = cpr.prepare_id
             LEFT JOIN `groups` g ON cp.group_id = g.group_id
-            WHERE cpr.receiver_id = %s
+            WHERE cpr.receiver_id = %s AND cp.date = CURDATE()
             ORDER BY cp.created_at DESC
         """
         prepare_params = (user_id,)
@@ -704,8 +707,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
         
         cursor.execute(prepare_sql, prepare_params)
         preparation_rows = cursor.fetchall()
-        app_logger.info(f"[prepare_class] 查询完成 - user_id={user_id}, 查询到 {len(preparation_rows)} 条课前准备记录（包含已读和未读）")
-        print(f"[prepare_class] 查询完成 - user_id={user_id}, 查询到 {len(preparation_rows)} 条课前准备记录")
+        app_logger.info(f"[prepare_class] 查询完成 - user_id={user_id}, 查询到 {len(preparation_rows)} 条当天课前准备记录（包含已读和未读）")
+        print(f"[prepare_class] 查询完成 - user_id={user_id}, 查询到 {len(preparation_rows)} 条当天课前准备记录")
 
         if preparation_rows:
             preparation_payload: Dict[str, Any] = {
@@ -860,6 +863,16 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 else:
                     read_count += 1
                 
+                # 格式化 created_at 时间
+                created_at = hw.get("created_at")
+                if created_at:
+                    if isinstance(created_at, datetime.datetime):
+                        created_at_str = created_at.strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        created_at_str = str(created_at)
+                else:
+                    created_at_str = None
+                
                 homework_message = {
                     "type": "homework",
                     "class_id": hw.get("class_id"),
@@ -870,7 +883,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     "sender_id": hw.get("sender_id"),
                     "sender_name": hw.get("sender_name"),
                     "group_id": hw.get("group_id"),
-                    "group_name": hw.get("group_name") or ""
+                    "group_name": hw.get("group_name") or "",
+                    "created_at": created_at_str
                 }
                 
                 payload_str = json.dumps(homework_message, ensure_ascii=False)
@@ -1151,9 +1165,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 if not room_info:
                     not_found_response = {
                         "type": "6",
-                        "status": "not_found",
+                        "status": "success",
                         "group_id": group_key,
-                        "message": "未找到该班级的临时房间"
+                        "message": "没有找到数据：未找到该班级的临时房间",
+                        "code": 200
                     }
                     not_found_response_json = json.dumps(not_found_response, ensure_ascii=False)
                     app_logger.warning(f"[temp_room] 用户 {user_id} 尝试加入不存在的房间 group_id={group_key}, 消息内容: {not_found_response_json}")
@@ -1259,9 +1274,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             if not room_info:
                 error_response = {
                     "type": "temp_room_owner_leave",
-                    "status": "not_found",
+                    "status": "success",
                     "group_id": group_key,
-                    "message": "未找到临时房间或已解散"
+                    "message": "没有找到数据：未找到临时房间或已解散",
+                    "code": 200
                 }
                 await websocket.send_text(json.dumps(error_response, ensure_ascii=False))
                 return
@@ -1456,6 +1472,14 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 app_logger.info(f"[srs_webrtc] {action_type} 成功 - user_id={user_id}, stream_name={stream_name}")
                 print(f"[srs_webrtc] {action_type} 成功 - user_id={user_id}")
                 
+                # 如果是推流成功，自动通知房间内其他用户该用户开始说话
+                if action_type == "publish" and group_id:
+                    try:
+                        await broadcast_voice_speaking(user_id, group_id, is_speaking=True)
+                    except Exception as broadcast_error:
+                        app_logger.error(f"[srs_webrtc] 广播推流开始消息失败 - user_id={user_id}, group_id={group_id}, error={broadcast_error}")
+                        # 广播失败不影响推流流程，只记录错误
+                
                 answer_response = {
                     "type": "srs_answer",
                     "action": action_type,
@@ -1470,18 +1494,143 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 await websocket.send_text(answer_response_json)
                 
             except Exception as e:
+                # 区分不同类型的错误，提供更友好的错误消息
+                import urllib.error
+                
+                error_code = None
+                user_friendly_msg = None
+                is_retryable = False
+                
+                # 处理 HTTP 错误
+                if isinstance(e, urllib.error.HTTPError):
+                    error_code = e.code
+                    is_retryable = error_code in [502, 503, 504]
+                    if error_code == 502:
+                        user_friendly_msg = "SRS 服务器暂时不可用，请稍后重试。如果问题持续，请联系管理员。"
+                        app_logger.error(f"[srs_webrtc] SRS 服务器返回 502 Bad Gateway - API_URL={api_url}, 可能原因：SRS 服务未运行、Nginx 代理配置错误或网络问题")
+                    elif error_code == 503:
+                        user_friendly_msg = "SRS 服务器过载，请稍后重试。"
+                    elif error_code == 504:
+                        user_friendly_msg = "SRS 服务器响应超时，请稍后重试。"
+                    elif error_code == 404:
+                        user_friendly_msg = "SRS API 端点不存在，请检查配置。"
+                    else:
+                        user_friendly_msg = f"SRS 服务器返回错误 (HTTP {error_code})，请稍后重试。"
+                elif isinstance(e, urllib.error.URLError):
+                    is_retryable = True
+                    user_friendly_msg = "无法连接到 SRS 服务器，请检查网络连接或联系管理员。"
+                    app_logger.error(f"[srs_webrtc] 网络连接错误 - API_URL={api_url}, 错误: {str(e)}")
+                elif HAS_HTTPX:
+                    if isinstance(e, httpx.HTTPStatusError):
+                        error_code = e.response.status_code
+                        is_retryable = error_code in [502, 503, 504]
+                        if error_code == 502:
+                            user_friendly_msg = "SRS 服务器暂时不可用，请稍后重试。如果问题持续，请联系管理员。"
+                        else:
+                            user_friendly_msg = f"SRS 服务器返回错误 (HTTP {error_code})，请稍后重试。"
+                    elif isinstance(e, httpx.RequestError):
+                        is_retryable = True
+                        user_friendly_msg = "无法连接到 SRS 服务器，请检查网络连接或联系管理员。"
+                elif isinstance(e, TimeoutError) or "timeout" in str(e).lower():
+                    is_retryable = True
+                    user_friendly_msg = "请求 SRS 服务器超时，请稍后重试。"
+                else:
+                    user_friendly_msg = f"处理 {action_type} 请求时发生未知错误，请稍后重试。"
+                
+                # 构建错误响应
                 error_msg = f"处理 SRS {action_type} offer 时出错: {str(e)}"
                 app_logger.error(f"[srs_webrtc] {error_msg}", exc_info=True)
                 print(f"[srs_webrtc] 错误: {error_msg}")
+                
                 error_response = {
                     "type": "srs_error",
                     "action": action_type,
-                    "message": error_msg
+                    "message": user_friendly_msg,  # 用户友好的错误消息
+                    "error_code": error_code,  # HTTP 错误代码（如果有）
+                    "technical_message": error_msg,  # 技术细节（用于调试）
+                    "retryable": is_retryable  # 是否可重试
                 }
                 error_response_json = json.dumps(error_response, ensure_ascii=False)
                 app_logger.error(f"[srs_webrtc] 返回 {action_type} 错误消息给用户 {user_id}, 消息内容: {error_response_json}")
                 print(f"[srs_webrtc] 返回 {action_type} 错误消息给用户 {user_id}: {error_response_json}")
                 await websocket.send_text(error_response_json)
+
+        async def broadcast_voice_speaking(speaker_user_id: str, group_id: str, is_speaking: bool, user_name: str = None):
+            """
+            广播语音说话状态给房间内其他用户
+            speaker_user_id: 说话的用户ID
+            group_id: 房间群组ID
+            is_speaking: true=开始说话, false=停止说话
+            user_name: 用户名称（可选，如果不提供则从连接信息中获取）
+            """
+            try:
+                if not group_id:
+                    app_logger.warning(f"[voice_speaking] 缺少 group_id - user_id={speaker_user_id}")
+                    return
+                
+                # 获取房间信息
+                room_info = active_temp_rooms.get(group_id)
+                if not room_info:
+                    app_logger.warning(f"[voice_speaking] 房间不存在 - group_id={group_id}, user_id={speaker_user_id}")
+                    return
+                
+                # 获取房间成员列表
+                members = room_info.get("members", [])
+                if speaker_user_id not in members:
+                    app_logger.warning(f"[voice_speaking] 用户不在房间成员列表中 - user_id={speaker_user_id}, group_id={group_id}")
+                    return
+                
+                # 获取用户信息（从连接信息中）
+                user_info = connections.get(speaker_user_id, {})
+                if not user_name:
+                    user_name = user_info.get("user_name", f"用户{speaker_user_id}")
+                
+                # 构建广播消息
+                broadcast_message = {
+                    "type": "voice_speaking",
+                    "user_id": speaker_user_id,
+                    "user_name": user_name,
+                    "group_id": group_id,
+                    "is_speaking": is_speaking,
+                    "timestamp": time.time()
+                }
+                broadcast_json = json.dumps(broadcast_message, ensure_ascii=False)
+                
+                # 广播给房间内其他用户（不包括发送者）
+                broadcast_count = 0
+                for member_id in members:
+                    if member_id != speaker_user_id:  # 不发送给自己
+                        member_conn = connections.get(member_id)
+                        if member_conn:
+                            try:
+                                await member_conn["ws"].send_text(broadcast_json)
+                                broadcast_count += 1
+                            except Exception as send_error:
+                                app_logger.error(f"[voice_speaking] 发送消息失败 - to={member_id}, error={send_error}")
+                
+                app_logger.info(f"[voice_speaking] 广播说话状态 - user_id={speaker_user_id}, user_name={user_name}, group_id={group_id}, is_speaking={is_speaking}, 广播给 {broadcast_count} 个用户")
+                print(f"[voice_speaking] 用户 {speaker_user_id}({user_name}) {'开始说话' if is_speaking else '停止说话'} - 房间 {group_id}, 广播给 {broadcast_count} 个用户")
+                
+            except Exception as e:
+                app_logger.error(f"[voice_speaking] 广播说话状态失败 - user_id={speaker_user_id}, error={e}", exc_info=True)
+                print(f"[voice_speaking] 错误: {e}")
+
+        async def handle_voice_speaking(msg_data: Dict[str, Any]):
+            """
+            处理语音说话状态消息
+            客户端检测到音频活动时发送此消息，服务器广播给房间内其他用户
+            """
+            try:
+                group_id = msg_data.get('group_id')
+                is_speaking = msg_data.get('is_speaking', False)  # true=开始说话, false=停止说话
+                user_name = msg_data.get('user_name', '')  # 可选：用户名称
+                
+                # 调用广播函数
+                await broadcast_voice_speaking(user_id, group_id, is_speaking, user_name)
+                
+            except Exception as e:
+                app_logger.error(f"[voice_speaking] 处理说话状态消息失败 - user_id={user_id}, error={e}", exc_info=True)
+                print(f"[voice_speaking] 错误: {e}")
 
         async def handle_webrtc_signal(msg_data: Dict[str, Any], signal_type: str):
             """处理 WebRTC 信令消息（offer/answer/ice_candidate）"""
@@ -1576,10 +1725,15 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             except WebSocketDisconnect as exc:
                 # 正常断开
                 print(f"用户 {user_id} 断开（WebSocketDisconnect），详情: {exc}")
-                # 清理用户从所有临时房间的成员列表中移除
+                # 清理用户从所有临时房间的成员列表中移除，并通知其他用户该用户停止说话
                 for group_id, room_info in list(active_temp_rooms.items()):
                     members = room_info.get("members", [])
                     if user_id in members:
+                        # 通知其他用户该用户停止说话（断开连接意味着停止推流）
+                        try:
+                            await broadcast_voice_speaking(user_id, group_id, is_speaking=False)
+                        except Exception as broadcast_error:
+                            app_logger.error(f"[webrtc] 广播停止说话消息失败 - user_id={user_id}, group_id={group_id}, error={broadcast_error}")
                         members.remove(user_id)
                         app_logger.info(f"[webrtc] 用户 {user_id} 离开房间 {group_id}（WebSocketDisconnect），当前成员数={len(members)}")
                         print(f"[webrtc] 用户 {user_id} 离开房间 {group_id}（WebSocketDisconnect），当前成员数={len(members)}")
@@ -1587,10 +1741,15 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             except RuntimeError as e:
                 # 已收到 disconnect 后再次 receive 会到这里
                 print(f"用户 {user_id} receive RuntimeError: {e}")
-                # 清理用户从所有临时房间的成员列表中移除
+                # 清理用户从所有临时房间的成员列表中移除，并通知其他用户该用户停止说话
                 for group_id, room_info in list(active_temp_rooms.items()):
                     members = room_info.get("members", [])
                     if user_id in members:
+                        # 通知其他用户该用户停止说话（断开连接意味着停止推流）
+                        try:
+                            await broadcast_voice_speaking(user_id, group_id, is_speaking=False)
+                        except Exception as broadcast_error:
+                            app_logger.error(f"[webrtc] 广播停止说话消息失败 - user_id={user_id}, group_id={group_id}, error={broadcast_error}")
                         members.remove(user_id)
                         app_logger.info(f"[webrtc] 用户 {user_id} 离开房间 {group_id}（RuntimeError），当前成员数={len(members)}")
                         print(f"[webrtc] 用户 {user_id} 离开房间 {group_id}（RuntimeError），当前成员数={len(members)}")
@@ -1599,10 +1758,15 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             # starlette 会在断开时 raise WebSocketDisconnect，保险起见也判断 type
             if message.get("type") == "websocket.disconnect":
                 print(f"用户 {user_id} 断开（disconnect event）")
-                # 清理用户从所有临时房间的成员列表中移除
+                # 清理用户从所有临时房间的成员列表中移除，并通知其他用户该用户停止说话
                 for group_id, room_info in list(active_temp_rooms.items()):
                     members = room_info.get("members", [])
                     if user_id in members:
+                        # 通知其他用户该用户停止说话（断开连接意味着停止推流）
+                        try:
+                            await broadcast_voice_speaking(user_id, group_id, is_speaking=False)
+                        except Exception as broadcast_error:
+                            app_logger.error(f"[webrtc] 广播停止说话消息失败 - user_id={user_id}, group_id={group_id}, error={broadcast_error}")
                         members.remove(user_id)
                         app_logger.info(f"[webrtc] 用户 {user_id} 离开房间 {group_id}（disconnect event），当前成员数={len(members)}")
                         print(f"[webrtc] 用户 {user_id} 离开房间 {group_id}（disconnect event），当前成员数={len(members)}")
@@ -1645,27 +1809,111 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         print(msg_type)
                         if msg_data1['type'] == "1":
                             print(" 加好友消息")
-                            target_conn = connections.get(target_id)
-                            if target_conn:
-                                print(target_id, " 在线", ", 来自:", user_id)
-                                print(data)
-                                await target_conn["ws"].send_text(f"[私信来自 {user_id}] {msg}")
-                            else:
-                                print(target_id, " 不在线", ", 来自:", user_id)
-                                print(data)
-                                await websocket.send_text(f"用户 {target_id} 不在线")
-
-                                # 解析 JSON
-                                msg_data = json.loads(msg)
-                                #print(msg_data['type'])
+                            app_logger.info(f"[websocket][加好友] 收到加好友请求 - user_id={user_id}, target_id={target_id}")
+                            
+                            # 解析 JSON
+                            msg_data = json.loads(msg)
+                            friend_teacher_unique_id = msg_data.get('teacher_unique_id')
+                            
+                            if not friend_teacher_unique_id:
+                                error_msg = "缺少 teacher_unique_id 参数"
+                                print(f"[websocket][加好友] ❌ 错误: {error_msg}")
+                                app_logger.error(f"[websocket][加好友] {error_msg} - user_id={user_id}")
+                                await websocket.send_text(json.dumps({"type": "error", "message": error_msg}, ensure_ascii=False))
+                                continue
+                            
+                            # 检查是否是自己
+                            if user_id == friend_teacher_unique_id:
+                                error_msg = "不能添加自己为好友"
+                                print(f"[websocket][加好友] ❌ 错误: {error_msg}")
+                                app_logger.warning(f"[websocket][加好友] {error_msg} - user_id={user_id}")
+                                await websocket.send_text(json.dumps({"type": "error", "message": error_msg}, ensure_ascii=False))
+                                continue
+                            
+                            cursor = None
+                            try:
                                 cursor = connection.cursor(dictionary=True)
-
-                                update_query = """
-                                            INSERT INTO ta_notification (sender_id, receiver_id, content, content_text)
-                                            VALUES (%s, %s, %s, %s)
-                                        """
-                                cursor.execute(update_query, (user_id, msg_data['teacher_unique_id'], msg_data['text'], msg_data['type']))
-                                connection.commit()
+                                
+                                # 检查是否已经是好友
+                                check_query = """
+                                    SELECT teacher_unique_id FROM ta_friend 
+                                    WHERE teacher_unique_id = %s AND friendcode = %s
+                                    LIMIT 1
+                                """
+                                cursor.execute(check_query, (user_id, friend_teacher_unique_id))
+                                existing_friend = cursor.fetchone()
+                                
+                                if existing_friend:
+                                    print(f"[websocket][加好友] ⚠️  已经是好友 - user_id={user_id}, friend_id={friend_teacher_unique_id}")
+                                    app_logger.info(f"[websocket][加好友] 已经是好友 - user_id={user_id}, friend_id={friend_teacher_unique_id}")
+                                else:
+                                    # 插入好友关系
+                                    insert_query = """
+                                        INSERT INTO ta_friend (teacher_unique_id, friendcode)
+                                        VALUES (%s, %s)
+                                    """
+                                    cursor.execute(insert_query, (user_id, friend_teacher_unique_id))
+                                    connection.commit()
+                                    print(f"[websocket][加好友] ✅ 添加好友成功 - user_id={user_id}, friend_id={friend_teacher_unique_id}")
+                                    app_logger.info(f"[websocket][加好友] 添加好友成功 - user_id={user_id}, friend_id={friend_teacher_unique_id}")
+                                
+                                # 发送通知
+                                target_conn = connections.get(target_id)
+                                if target_conn:
+                                    print(f"[websocket][加好友] {target_id} 在线, 来自: {user_id}")
+                                    await target_conn["ws"].send_text(f"[私信来自 {user_id}] {msg}")
+                                    # 给添加者返回成功消息
+                                    success_response = {
+                                        "type": "add_friend_success",
+                                        "message": "添加好友成功",
+                                        "friend_teacher_unique_id": friend_teacher_unique_id,
+                                        "target_online": True
+                                    }
+                                    await websocket.send_text(json.dumps(success_response, ensure_ascii=False))
+                                    print(f"[websocket][加好友] ✅ 已通知添加者 - user_id={user_id}, friend_id={friend_teacher_unique_id}")
+                                    app_logger.info(f"[websocket][加好友] 已通知添加者 - user_id={user_id}, friend_id={friend_teacher_unique_id}")
+                                else:
+                                    print(f"[websocket][加好友] {target_id} 不在线, 来自: {user_id}")
+                                    
+                                    # 插入通知
+                                    notification_query = """
+                                        INSERT INTO ta_notification (sender_id, receiver_id, content, content_text)
+                                        VALUES (%s, %s, %s, %s)
+                                    """
+                                    cursor.execute(notification_query, (user_id, friend_teacher_unique_id, msg_data.get('text', ''), msg_data.get('type', '1')))
+                                    connection.commit()
+                                    print(f"[websocket][加好友] ✅ 通知已保存 - user_id={user_id}, friend_id={friend_teacher_unique_id}")
+                                    app_logger.info(f"[websocket][加好友] 通知已保存 - user_id={user_id}, friend_id={friend_teacher_unique_id}")
+                                    
+                                    # 给添加者返回成功消息
+                                    success_response = {
+                                        "type": "add_friend_success",
+                                        "message": "添加好友成功，对方不在线，已发送通知",
+                                        "friend_teacher_unique_id": friend_teacher_unique_id,
+                                        "target_online": False
+                                    }
+                                    await websocket.send_text(json.dumps(success_response, ensure_ascii=False))
+                                    print(f"[websocket][加好友] ✅ 已通知添加者 - user_id={user_id}, friend_id={friend_teacher_unique_id}")
+                                    app_logger.info(f"[websocket][加好友] 已通知添加者 - user_id={user_id}, friend_id={friend_teacher_unique_id}")
+                                
+                            except mysql.connector.Error as e:
+                                if connection:
+                                    connection.rollback()
+                                error_msg = f"数据库错误: {e}"
+                                print(f"[websocket][加好友] ❌ {error_msg}")
+                                app_logger.error(f"[websocket][加好友] {error_msg} - user_id={user_id}, friend_id={friend_teacher_unique_id}")
+                                await websocket.send_text(json.dumps({"type": "error", "message": "添加好友失败，请稍后重试"}, ensure_ascii=False))
+                            except Exception as e:
+                                if connection:
+                                    connection.rollback()
+                                error_msg = f"未知错误: {e}"
+                                print(f"[websocket][加好友] ❌ {error_msg}")
+                                traceback_str = traceback.format_exc()
+                                app_logger.error(f"[websocket][加好友] {error_msg}\n{traceback_str} - user_id={user_id}, friend_id={friend_teacher_unique_id}")
+                                await websocket.send_text(json.dumps({"type": "error", "message": "添加好友失败，请稍后重试"}, ensure_ascii=False))
+                            finally:
+                                if cursor:
+                                    cursor.close()
                         elif msg_data1['type'] == "3": 
                             print(" 创建群")   
                             app_logger.info(f"[创建群] 开始处理创建群组请求 - user_id={user_id}")
@@ -1983,13 +2231,58 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                 print(f"[创建群] 成员列表处理完成 - group_id={unique_group_id}, 已处理成员数={len(processed_member_ids)}")
                                 app_logger.info(f"[创建群] 成员列表处理完成 - group_id={unique_group_id}, 已处理成员数={len(processed_member_ids)}, 成员列表={list(processed_member_ids)}")
                                 
+                                # 如果群组有 classid，将班级作为成员也插入到群组成员列表中
+                                if classid and str(classid).strip():
+                                    class_id_str = str(classid).strip()
+                                    if class_id_str not in processed_member_ids:
+                                        print(f"[创建群] 将班级 {class_id_str} 作为成员添加到群组 {unique_group_id}")
+                                        app_logger.info(f"[创建群] 将班级 {class_id_str} 作为成员添加到群组 {unique_group_id}")
+                                        cursor.execute(
+                                            "SELECT group_id FROM `group_members` WHERE group_id = %s AND user_id = %s", 
+                                            (unique_group_id, class_id_str)
+                                        )
+                                        class_member_exists = cursor.fetchone()
+                                        
+                                        if class_member_exists:
+                                            print(f"[创建群] 班级成员已存在，跳过插入: group_id={unique_group_id}, class_id={class_id_str}")
+                                            app_logger.info(f"[创建群] 班级成员已存在，跳过插入: group_id={unique_group_id}, class_id={class_id_str}")
+                                        else:
+                                            insert_class_member_sql = """
+                                                INSERT INTO `group_members` (
+                                                    group_id, user_id, user_name, self_role, join_time, msg_flag,
+                                                    self_msg_flag, readed_seq, unread_num
+                                                ) VALUES (
+                                                    %s, %s, %s, %s, NOW(), %s, %s, %s, %s
+                                                )
+                                            """
+                                            class_insert_params = (
+                                                unique_group_id,
+                                                class_id_str,
+                                                "班级",  # user_name 设为"班级"
+                                                200,     # self_role 设为普通成员
+                                                0,       # msg_flag
+                                                0,       # self_msg_flag
+                                                0,       # readed_seq
+                                                0,       # unread_num
+                                            )
+                                            cursor.execute(insert_class_member_sql, class_insert_params)
+                                            print(f"[创建群] 成功将班级 {class_id_str} 添加为群组 {unique_group_id} 的成员")
+                                            app_logger.info(f"[创建群] 成功将班级 {class_id_str} 添加为群组 {unique_group_id} 的成员")
+                                            processed_member_ids.add(class_id_str)
+                                    else:
+                                        print(f"[创建群] 班级 {class_id_str} 已在成员列表中，跳过")
+                                        app_logger.info(f"[创建群] 班级 {class_id_str} 已在成员列表中，跳过")
+                                else:
+                                    print(f"[创建群] 群组 {unique_group_id} 没有 classid，跳过添加班级成员")
+                                    app_logger.info(f"[创建群] 群组 {unique_group_id} 没有 classid，跳过添加班级成员")
+                                
                                 print(f"[创建群] 准备提交事务 - group_id={unique_group_id}")
                                 app_logger.info(f"[创建群] 准备提交事务 - group_id={unique_group_id}")
                                 connection.commit()
                                 print(f"[创建群] 事务提交成功 - group_id={unique_group_id}")
                                 app_logger.info(f"[创建群] 事务提交成功 - group_id={unique_group_id}, group_name={group_name}")
                                 
-                                # 同步到腾讯IM（异步执行，不阻塞响应）
+                                # 同步到腾讯IM（同步等待结果，确保成员被正确添加）
                                 try:
                                     # 构建腾讯IM需要的群组数据格式
                                     tencent_group_data = {
@@ -2078,39 +2371,259 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                             added_member_accounts.add(member_user_id)
                                             print(f"[创建群] 腾讯IM数据：添加成员 - user_id={member_user_id}, Role={role_str}")
                                     
+                                    # 如果群组有 classid，将班级也添加到腾讯IM成员列表中
+                                    if classid and str(classid).strip():
+                                        class_id_str = str(classid).strip()
+                                        if class_id_str not in added_member_accounts:
+                                            member_list.append({
+                                                "Member_Account": class_id_str,
+                                                "user_id": class_id_str,
+                                                "Role": "Member",  # 班级作为普通成员
+                                                "self_role": 200
+                                            })
+                                            added_member_accounts.add(class_id_str)
+                                            print(f"[创建群] 腾讯IM数据：添加班级成员 - class_id={class_id_str}, Role=Member")
+                                            app_logger.info(f"[创建群] 腾讯IM数据：添加班级成员 - class_id={class_id_str}, Role=Member")
+                                    
                                     tencent_group_data["MemberList"] = member_list
                                     print(f"[创建群] 腾讯IM数据构建完成 - group_id={unique_group_id}, 成员数={len(member_list)}")
                                     app_logger.info(f"[创建群] 腾讯IM数据构建完成 - group_id={unique_group_id}, 成员数={len(member_list)}, 成员列表={member_list}")
                                     
-                                    # 异步调用同步函数（不阻塞当前流程）
+                                    # 同步调用腾讯IM接口（等待结果）
                                     print(f"[创建群] 准备同步到腾讯IM - group_id={unique_group_id}")
                                     app_logger.info(f"[创建群] 准备同步到腾讯IM - group_id={unique_group_id}, group_name={group_name}")
                                     
-                                    # 使用 asyncio.create_task 异步执行，不等待结果
-                                    print(f"[创建群] 创建异步任务同步到腾讯IM - group_id={unique_group_id}")
-                                    async def sync_to_tencent():
-                                        try:
-                                            print(f"[创建群] 异步任务开始 - group_id={unique_group_id}")
-                                            # 调用同步函数（需要传入列表格式）
-                                            result = await notify_tencent_group_sync(owner_identifier, [tencent_group_data])
-                                            print(f"[创建群] 异步任务完成 - group_id={unique_group_id}, result_status={result.get('status')}")
-                                            if result.get("status") == "success":
-                                                print(f"[创建群] 腾讯IM同步成功 - group_id={unique_group_id}")
-                                                app_logger.info(f"[创建群] 腾讯IM同步成功 - group_id={unique_group_id}")
-                                            else:
-                                                print(f"[创建群] 腾讯IM同步失败 - group_id={unique_group_id}, error={result.get('error')}")
-                                                app_logger.warning(f"[创建群] 腾讯IM同步失败 - group_id={unique_group_id}, error={result.get('error')}")
-                                        except Exception as sync_error:
-                                            print(f"[创建群] 腾讯IM同步异常 - group_id={unique_group_id}, error={sync_error}")
-                                            app_logger.error(f"[创建群] 腾讯IM同步异常 - group_id={unique_group_id}, error={sync_error}", exc_info=True)
+                                    # 调用同步函数（同步等待结果）
+                                    result = await notify_tencent_group_sync(owner_identifier, [tencent_group_data])
+                                    print(f"[创建群] 腾讯IM同步完成 - group_id={unique_group_id}, result_status={result.get('status')}")
+                                    app_logger.info(f"[创建群] 腾讯IM同步结果 - group_id={unique_group_id}, result={result}")
                                     
-                                    # 创建异步任务，不等待完成
-                                    asyncio.create_task(sync_to_tencent())
+                                    # 检查结果，无论成功与否，都需要单独添加成员
+                                    # 因为 import_group API 可能不会自动添加 MemberList 中的成员
+                                    error_info = result.get("error", "")
+                                    error_code = result.get("error_code")
+                                    need_add_members = False
+                                    
+                                    if result.get("status") != "success":
+                                        # 如果是因为群组已存在（ErrorCode 10021），需要单独添加成员
+                                        if error_code == 10021:
+                                            need_add_members = True
+                                            print(f"[创建群] 群组已存在（ErrorCode 10021），需要单独添加成员 - group_id={unique_group_id}")
+                                            app_logger.info(f"[创建群] 群组已存在，需要单独添加成员 - group_id={unique_group_id}")
+                                    else:
+                                        # 即使 import_group 成功，也需要单独添加成员
+                                        # 因为腾讯IM的 import_group API 可能不会自动添加 MemberList 中的成员
+                                        need_add_members = True
+                                        print(f"[创建群] import_group 成功，但需要单独添加成员以确保成员被正确添加 - group_id={unique_group_id}")
+                                        app_logger.info(f"[创建群] import_group 成功，需要单独添加成员 - group_id={unique_group_id}")
+                                    
+                                    # 如果需要添加成员，调用 add_group_member API
+                                    if need_add_members and member_list:
+                                        print(f"[创建群] 需要单独添加成员 - group_id={unique_group_id}, 成员数={len(member_list)}")
+                                        app_logger.info(f"[创建群] 需要单独添加成员 - group_id={unique_group_id}, 成员数={len(member_list)}")
+                                        
+                                        # 调用 add_group_member API 添加成员
+                                        from services.tencent_api import build_tencent_request_url
+                                        from services.tencent_sig import generate_tencent_user_sig
+                                        import os
+                                        
+                                        TENCENT_API_IDENTIFIER = os.getenv("TENCENT_API_IDENTIFIER")
+                                        TENCENT_API_USER_SIG = os.getenv("TENCENT_API_USER_SIG")
+                                        TENCENT_API_SECRET_KEY = os.getenv("TENCENT_API_SECRET_KEY")
+                                        TENCENT_API_TIMEOUT = float(os.getenv("TENCENT_API_TIMEOUT", "10"))
+                                        
+                                        identifier_to_use = TENCENT_API_IDENTIFIER
+                                        usersig_to_use = None
+                                        
+                                        if TENCENT_API_SECRET_KEY and identifier_to_use:
+                                            try:
+                                                usersig_to_use = generate_tencent_user_sig(identifier_to_use)
+                                            except Exception as e:
+                                                print(f"[创建群] UserSig 生成失败: {e}")
+                                                usersig_to_use = TENCENT_API_USER_SIG
+                                        else:
+                                            usersig_to_use = TENCENT_API_USER_SIG
+                                        
+                                        if identifier_to_use and usersig_to_use:
+                                            add_member_url = build_tencent_request_url(
+                                                identifier=identifier_to_use,
+                                                usersig=usersig_to_use,
+                                                path_override="v4/group_open_http_svc/add_group_member"
+                                            )
+                                            
+                                            if add_member_url:
+                                                # 构建添加成员的 payload（排除群主，因为群主已经在群组中）
+                                                add_member_list = [
+                                                    {"Member_Account": m["Member_Account"], "Role": m["Role"]}
+                                                    for m in member_list
+                                                    if m.get("Role") != "Owner"  # 排除群主
+                                                ]
+                                                
+                                                # 在添加成员之前，先检查并注册班级账号（如果存在）
+                                                if classid and str(classid).strip():
+                                                    class_id_str = str(classid).strip()
+                                                    # 检查班级是否在要添加的成员列表中
+                                                    class_in_member_list = any(
+                                                        m.get("Member_Account") == class_id_str 
+                                                        for m in add_member_list
+                                                    )
+                                                    
+                                                    if class_in_member_list:
+                                                        print(f"[创建群] 检测到班级成员，先注册班级账号到腾讯IM - class_id={class_id_str}")
+                                                        app_logger.info(f"[创建群] 检测到班级成员，先注册班级账号到腾讯IM - class_id={class_id_str}")
+                                                        
+                                                        # 从数据库获取班级名称和头像
+                                                        class_nick = f"班级{class_id_str}"  # 默认昵称
+                                                        class_face_url = ""  # 默认头像
+                                                        try:
+                                                            cursor.execute(
+                                                                "SELECT class_name, face_url FROM ta_classes WHERE class_code = %s",
+                                                                (class_id_str,)
+                                                            )
+                                                            class_info = cursor.fetchone()
+                                                            if class_info:
+                                                                class_nick = class_info.get("class_name", class_nick)
+                                                                class_face_url = class_info.get("face_url", class_face_url) or ""
+                                                                print(f"[创建群] 从数据库获取班级信息 - class_id={class_id_str}, class_name={class_nick}, face_url={class_face_url}")
+                                                                app_logger.info(f"[创建群] 从数据库获取班级信息 - class_id={class_id_str}, class_name={class_nick}")
+                                                        except Exception as db_error:
+                                                            print(f"[创建群] 查询班级信息失败，使用默认值 - class_id={class_id_str}, error={db_error}")
+                                                            app_logger.warning(f"[创建群] 查询班级信息失败 - class_id={class_id_str}, error={db_error}")
+                                                        
+                                                        # 调用 account_import API 注册班级账号
+                                                        account_import_url = build_tencent_request_url(
+                                                            identifier=identifier_to_use,
+                                                            usersig=usersig_to_use,
+                                                            path_override="v4/im_open_login_svc/account_import"
+                                                        )
+                                                        
+                                                        if account_import_url:
+                                                            account_import_payload = {
+                                                                "Identifier": class_id_str,
+                                                                "Nick": class_nick,  # 使用从数据库获取的班级名称
+                                                                "FaceUrl": class_face_url  # 使用从数据库获取的班级头像
+                                                            }
+                                                            
+                                                            def _import_account() -> Dict[str, Any]:
+                                                                headers = {"Content-Type": "application/json; charset=utf-8"}
+                                                                encoded_payload = json.dumps(account_import_payload, ensure_ascii=False).encode("utf-8")
+                                                                request_obj = urllib.request.Request(
+                                                                    url=account_import_url, data=encoded_payload, headers=headers, method="POST"
+                                                                )
+                                                                try:
+                                                                    with urllib.request.urlopen(request_obj, timeout=TENCENT_API_TIMEOUT) as response:
+                                                                        raw_body = response.read()
+                                                                        text_body = raw_body.decode("utf-8", errors="replace")
+                                                                        try:
+                                                                            parsed_body = json.loads(text_body)
+                                                                        except json.JSONDecodeError:
+                                                                            parsed_body = None
+                                                                        return {"status": "success", "http_status": response.status, "response": parsed_body or text_body}
+                                                                except urllib.error.HTTPError as e:
+                                                                    body = e.read().decode("utf-8", errors="replace")
+                                                                    return {"status": "error", "http_status": e.code, "error": body}
+                                                                except Exception as e:
+                                                                    return {"status": "error", "http_status": None, "error": str(e)}
+                                                            
+                                                            import_result = await asyncio.to_thread(_import_account)
+                                                            
+                                                            if import_result.get("status") == "success":
+                                                                response_data = import_result.get("response")
+                                                                if isinstance(response_data, dict):
+                                                                    action_status = response_data.get("ActionStatus")
+                                                                    error_code = response_data.get("ErrorCode")
+                                                                    error_info = response_data.get("ErrorInfo", "")
+                                                                    if action_status == "OK" and error_code == 0:
+                                                                        print(f"[创建群] ✅ 班级账号注册成功 - class_id={class_id_str}")
+                                                                        app_logger.info(f"[创建群] 班级账号注册成功 - class_id={class_id_str}")
+                                                                    else:
+                                                                        # ErrorCode 70169 表示账号已存在，这是正常的
+                                                                        if error_code == 70169:
+                                                                            print(f"[创建群] ℹ️  班级账号已存在（ErrorCode 70169）- class_id={class_id_str}")
+                                                                            app_logger.info(f"[创建群] 班级账号已存在 - class_id={class_id_str}")
+                                                                        else:
+                                                                            print(f"[创建群] ⚠️  班级账号注册失败 - class_id={class_id_str}, ErrorCode={error_code}, ErrorInfo={error_info}")
+                                                                            app_logger.warning(f"[创建群] 班级账号注册失败 - class_id={class_id_str}, ErrorCode={error_code}, ErrorInfo={error_info}")
+                                                                else:
+                                                                    print(f"[创建群] ⚠️  班级账号注册响应格式异常 - class_id={class_id_str}, response={response_data}")
+                                                                    app_logger.warning(f"[创建群] 班级账号注册响应格式异常 - class_id={class_id_str}, response={response_data}")
+                                                            else:
+                                                                print(f"[创建群] ⚠️  班级账号注册请求失败 - class_id={class_id_str}, error={import_result.get('error')}")
+                                                                app_logger.warning(f"[创建群] 班级账号注册请求失败 - class_id={class_id_str}, error={import_result.get('error')}")
+                                                        else:
+                                                            print(f"[创建群] ⚠️  无法构建 account_import URL - class_id={class_id_str}")
+                                                            app_logger.warning(f"[创建群] 无法构建 account_import URL - class_id={class_id_str}")
+                                                
+                                                if add_member_list:
+                                                    print(f"[创建群] 准备添加成员到腾讯IM - group_id={unique_group_id}, 成员列表={add_member_list}")
+                                                    app_logger.info(f"[创建群] 准备添加成员到腾讯IM - group_id={unique_group_id}, 成员列表={add_member_list}")
+                                                    
+                                                    add_member_payload = {
+                                                        "GroupId": unique_group_id,
+                                                        "MemberList": add_member_list,
+                                                        "Silence": 0
+                                                    }
+                                                    
+                                                    print(f"[创建群] 添加成员 payload: {json.dumps(add_member_payload, ensure_ascii=False, indent=2)}")
+                                                    app_logger.info(f"[创建群] 添加成员 payload: {json.dumps(add_member_payload, ensure_ascii=False, indent=2)}")
+                                                    
+                                                    def _add_tencent_members() -> Dict[str, Any]:
+                                                        headers = {"Content-Type": "application/json; charset=utf-8"}
+                                                        encoded_payload = json.dumps(add_member_payload, ensure_ascii=False).encode("utf-8")
+                                                        request_obj = urllib.request.Request(
+                                                            url=add_member_url, data=encoded_payload, headers=headers, method="POST"
+                                                        )
+                                                        try:
+                                                            with urllib.request.urlopen(request_obj, timeout=TENCENT_API_TIMEOUT) as response:
+                                                                raw_body = response.read()
+                                                                text_body = raw_body.decode("utf-8", errors="replace")
+                                                                try:
+                                                                    parsed_body = json.loads(text_body)
+                                                                except json.JSONDecodeError:
+                                                                    parsed_body = None
+                                                                return {"status": "success", "http_status": response.status, "response": parsed_body or text_body}
+                                                        except urllib.error.HTTPError as e:
+                                                            body = e.read().decode("utf-8", errors="replace")
+                                                            return {"status": "error", "http_status": e.code, "error": body}
+                                                        except Exception as e:
+                                                            return {"status": "error", "http_status": None, "error": str(e)}
+                                                    
+                                                    add_member_result = await asyncio.to_thread(_add_tencent_members)
+                                                    
+                                                    print(f"[创建群] 添加成员结果 - group_id={unique_group_id}, result={add_member_result}")
+                                                    app_logger.info(f"[创建群] 添加成员结果 - group_id={unique_group_id}, result={add_member_result}")
+                                                    
+                                                    if add_member_result.get("status") == "success":
+                                                        response_data = add_member_result.get("response")
+                                                        if isinstance(response_data, dict):
+                                                            action_status = response_data.get("ActionStatus")
+                                                            error_code = response_data.get("ErrorCode")
+                                                            error_info = response_data.get("ErrorInfo", "")
+                                                            if action_status == "OK" and error_code == 0:
+                                                                print(f"[创建群] ✅ 成员添加成功 - group_id={unique_group_id}, 成员数={len(add_member_list)}, 成员列表={[m.get('Member_Account') for m in add_member_list]}")
+                                                                app_logger.info(f"[创建群] 成员添加成功 - group_id={unique_group_id}, 成员数={len(add_member_list)}, 成员列表={[m.get('Member_Account') for m in add_member_list]}")
+                                                            else:
+                                                                print(f"[创建群] ⚠️  成员添加失败 - group_id={unique_group_id}, ErrorCode={error_code}, ErrorInfo={error_info}, 尝试添加的成员={[m.get('Member_Account') for m in add_member_list]}")
+                                                                app_logger.warning(f"[创建群] 成员添加失败 - group_id={unique_group_id}, ErrorCode={error_code}, ErrorInfo={error_info}, 尝试添加的成员={[m.get('Member_Account') for m in add_member_list]}")
+                                                                
+                                                                # ErrorCode 10019 表示所有标识符都无效，可能是成员未在腾讯IM中注册
+                                                                if error_code == 10019:
+                                                                    print(f"[创建群] ⚠️  错误码 10019: 成员标识符无效，可能需要在腾讯IM中先注册这些成员 - 成员列表={[m.get('Member_Account') for m in add_member_list]}")
+                                                                    app_logger.warning(f"[创建群] 错误码 10019: 成员标识符无效，可能需要在腾讯IM中先注册这些成员 - 成员列表={[m.get('Member_Account') for m in add_member_list]}")
+                                                    else:
+                                                        print(f"[创建群] ⚠️  成员添加请求失败 - group_id={unique_group_id}, error={add_member_result.get('error')}")
+                                                        app_logger.warning(f"[创建群] 成员添加请求失败 - group_id={unique_group_id}, error={add_member_result.get('error')}")
+                                                else:
+                                                    print(f"[创建群] 没有需要添加的成员（只有群主） - group_id={unique_group_id}")
+                                            else:
+                                                print(f"[创建群] ⚠️  无法构建 add_group_member URL - group_id={unique_group_id}")
+                                        else:
+                                            print(f"[创建群] ⚠️  缺少腾讯IM配置，无法添加成员 - group_id={unique_group_id}")
                                     
                                 except Exception as tencent_sync_error:
-                                    # 同步失败不影响群组创建
-                                    print(f"[创建群] 准备腾讯IM同步时出错 - group_id={unique_group_id}, error={tencent_sync_error}")
-                                    app_logger.error(f"[创建群] 准备腾讯IM同步时出错 - group_id={unique_group_id}, error={tencent_sync_error}", exc_info=True)
+                                    # 同步失败不影响群组创建，但记录错误
+                                    print(f"[创建群] ⚠️  腾讯IM同步异常 - group_id={unique_group_id}, error={tencent_sync_error}")
+                                    app_logger.error(f"[创建群] 腾讯IM同步异常 - group_id={unique_group_id}, error={tencent_sync_error}", exc_info=True)
                                 
                                 # 如果是班级群（有 classid 或 class_id），自动创建临时语音群
                                 temp_room_info = None
@@ -2344,7 +2857,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             """, (unique_group_id,))
                             row = cursor.fetchone()
                             if not row:
-                                await websocket.send_text(f"群 {unique_group_id} 不存在")
+                                await websocket.send_text(json.dumps({
+                                    "type": "error",
+                                    "message": f"没有找到数据：群 {unique_group_id} 不存在",
+                                    "code": 200
+                                }, ensure_ascii=False))
                                 return
 
                             group_admin_id = row['group_admin_id']
@@ -2365,7 +2882,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                 members = cursor.fetchall()
 
                                 if not members:
-                                    await websocket.send_text("群没有其他成员")
+                                    await websocket.send_text(json.dumps({
+                                        "type": "error",
+                                        "message": "没有找到数据：群没有其他成员",
+                                        "code": 200
+                                    }, ensure_ascii=False))
                                     return
 
                                 for m in members:
@@ -2417,7 +2938,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                 receivers = list(set(receivers))
 
                                 if not receivers:
-                                    await websocket.send_text("群没有其他成员可以接收此消息")
+                                    await websocket.send_text(json.dumps({
+                                        "type": "error",
+                                        "message": "没有找到数据：群没有其他成员可以接收此消息",
+                                        "code": 200
+                                    }, ensure_ascii=False))
                                     return
 
                                 # 给这些接收者发消息 / 存通知
@@ -2484,11 +3009,12 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             group_info = cursor.fetchone()
                             
                             if not group_info:
-                                error_msg = f"群组 {group_id} 不存在"
+                                error_msg = f"没有找到数据：群组 {group_id} 不存在"
                                 app_logger.warning(f"[prepare_class] {error_msg}, user_id={user_id}")
                                 await websocket.send_text(json.dumps({
                                     "type": "error",
-                                    "message": error_msg
+                                    "message": error_msg,
+                                    "code": 200
                                 }, ensure_ascii=False))
                                 continue
                             
@@ -2496,15 +3022,28 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             owner_identifier = group_info.get('owner_identifier', '')
                             app_logger.info(f"[prepare_class] 群组验证成功 - group_id={group_id}, group_name={group_name}, owner_identifier={owner_identifier}")
                             
-                            # 获取群组所有成员（使用 group_members 表）
+                            # 获取群组所有成员（排除发送者自己）
                             cursor.execute("""
                                 SELECT user_id 
                                 FROM `group_members`
-                                WHERE group_id = %s
-                            """, (group_id,))
+                                WHERE group_id = %s AND user_id != %s
+                            """, (group_id, sender_id))
                             members = cursor.fetchall()
                             total_members = len(members)
-                            app_logger.info(f"[prepare_class] 获取群组成员 - group_id={group_id}, 总成员数={total_members}")
+                            app_logger.info(f"[prepare_class] 获取群组成员 - group_id={group_id}, 总成员数={total_members}（排除发送者）")
+                            
+                            # 如果提供了 class_id，也添加班级端（class_code）作为接收者
+                            # 注意：课前准备消息中的 class_id 实际上就是 class_code
+                            class_code_receiver = None
+                            if class_id:
+                                # class_id 就是 class_code，直接使用
+                                class_code_receiver = str(class_id).strip()
+                                app_logger.info(f"[prepare_class] 添加班级端到接收者列表 - class_code={class_code_receiver}")
+                                # 将班级端添加到成员列表（如果不在群组成员中）
+                                if class_code_receiver and class_code_receiver not in [m["user_id"] for m in members]:
+                                    members.append({"user_id": class_code_receiver})
+                                    total_members += 1
+                                    app_logger.info(f"[prepare_class] 班级端已添加到接收者列表 - class_code={class_code_receiver}, 总接收者数={total_members}")
                             
                             # 构建消息内容
                             prepare_message = json.dumps({
@@ -2571,10 +3110,19 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                     INSERT INTO class_preparation_receiver (
                                         prepare_id, receiver_id, is_read, created_at
                                     ) VALUES (%s, %s, 0, NOW())
+                                    ON DUPLICATE KEY UPDATE is_read = 0, created_at = NOW()
                                 """, (prepare_id, member_id))
                             
+                            # 也为发送者自己插入接收记录（标记为已读，因为是发送者自己发送的）
+                            cursor.execute("""
+                                INSERT INTO class_preparation_receiver (
+                                    prepare_id, receiver_id, is_read, read_at, created_at
+                                ) VALUES (%s, %s, 1, NOW(), NOW())
+                                ON DUPLICATE KEY UPDATE is_read = 1, read_at = NOW(), created_at = NOW()
+                            """, (prepare_id, sender_id))
+                            
                             connection.commit()
-                            app_logger.info(f"[prepare_class] 已为所有 {total_members} 个成员保存课前准备数据")
+                            app_logger.info(f"[prepare_class] 已为所有 {total_members} 个成员和发送者 {sender_id} 保存课前准备数据")
                             
                             online_count = 0
                             offline_count = 0
@@ -2673,6 +3221,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         elif msg_data1['type'] == "srs_play_offer":
                             await handle_srs_webrtc_offer(msg_data1, "play")
                             continue
+                        # 处理语音说话状态消息
+                        elif msg_data1['type'] == "voice_speaking":
+                            await handle_voice_speaking(msg_data1)
+                            continue
         
                     else:
                         print(" 格式错误")
@@ -2766,6 +3318,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     # 处理通过服务器转发到 SRS 的 offer（拉流）
                     if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") == "srs_play_offer":
                         await handle_srs_webrtc_offer(msg_data_raw, "play")
+                        continue
+                    # 处理语音说话状态消息（纯 JSON 格式）
+                    if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") == "voice_speaking":
+                        await handle_voice_speaking(msg_data_raw)
                         continue
                     # 处理加入临时房间请求
                     if isinstance(msg_data_raw, dict) and msg_data_raw.get("type") in ("join_temp_room", "temp_room_join"):

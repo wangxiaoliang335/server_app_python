@@ -876,10 +876,10 @@ async def api_get_student_score(
             print(f"[student-scores/get] 未找到成绩表 - class_id: {class_id}, exam_name: {exam_name}, term: {term}")
             app_logger.warning(f"[student-scores/get] 未找到成绩表 - class_id: {class_id}, exam_name: {exam_name}, term: {term}")
             return safe_json_response({
-                'message': '未找到成绩表',
-                'code': 404,
+                'message': '没有找到数据：未找到成绩表',
+                'code': 200,
                 'data': None
-            }, status_code=404)
+            }, status_code=200)
         
         print(f"[student-scores/get] 找到成绩表头 - id: {header['id']}, created_at: {header.get('created_at')}")
         app_logger.info(f"[student-scores/get] 找到成绩表头 - id: {header['id']}, class_id: {class_id}, exam_name: {exam_name}, term: {term}, created_at: {header.get('created_at')}")
@@ -1161,7 +1161,7 @@ async def api_set_student_score_comment(request: Request):
             )
             header_row = cursor.fetchone()
             if not header_row:
-                return safe_json_response({'message': '未找到学生成绩表头（请确认 class_id/term）', 'code': 404}, status_code=404)
+                return safe_json_response({'message': '没有找到数据：未找到学生成绩表头（请确认 class_id/term）', 'code': 200}, status_code=200)
             score_header_id = header_row.get("id")
         
         # 如果没有提供 excel_filename，尝试从字段定义中查找
@@ -1200,9 +1200,9 @@ async def api_set_student_score_comment(request: Request):
         
         if not record:
             return safe_json_response({
-                'message': f'未找到学生成绩记录: {student_name}',
-                'code': 404
-            }, status_code=404)
+                'message': f'没有找到数据：未找到学生成绩记录: {student_name}',
+                'code': 200
+            }, status_code=200)
         
         record_id = record['id']
         existing_comments_json = record.get('comments_json')
@@ -1532,7 +1532,7 @@ async def api_set_student_score_value(request: Request):
             )
             header_row = cursor.fetchone()
             if not header_row:
-                return safe_json_response({'message': '未找到学生成绩表头（请确认 class_id/term）', 'code': 404}, status_code=404)
+                return safe_json_response({'message': '没有找到数据：未找到学生成绩表头（请确认 class_id/term）', 'code': 200}, status_code=200)
             score_header_id = header_row.get("id")
 
         # 如果没有提供 excel_filename，尝试从字段定义中查找
@@ -1570,7 +1570,7 @@ async def api_set_student_score_value(request: Request):
 
         record = cursor.fetchone()
         if not record:
-            return safe_json_response({'message': f'未找到学生成绩记录: {student_name}', 'code': 404}, status_code=404)
+            return safe_json_response({'message': f'没有找到数据：未找到学生成绩记录: {student_name}', 'code': 200}, status_code=200)
 
         record_id = record['id']
         existing_scores_json = record.get('scores_json')
@@ -2217,14 +2217,14 @@ async def api_get_group_scores(
         
         header = cursor.fetchone()
         if not header:
-            error_response = {'message': '未找到小组成绩表', 'code': 404}
+            error_response = {'message': '没有找到数据：未找到小组成绩表', 'code': 200}
             # try:
             #     error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
             #     print(f"[group-scores] 返回的 JSON 结果（未找到数据）:\n{error_json}")
             #     app_logger.info(f"[group-scores] 返回的 JSON 结果（未找到数据）: {json.dumps(error_response, ensure_ascii=False)}")
             # except Exception as json_error:
             #     print(f"[group-scores] 打印 JSON 时出错: {json_error}")
-            return safe_json_response(error_response, status_code=404)
+            return safe_json_response(error_response, status_code=200)
 
         score_header_id = header['id']
         
@@ -2715,7 +2715,7 @@ async def api_set_group_score_value(request: Request):
         )
         header_row = cursor.fetchone()
         if not header_row:
-            return _return_with_log({"message": "未找到小组成绩表头（请确认 class_id/term）", "code": 404}, status_code=404)
+            return _return_with_log({"message": "没有找到数据：未找到小组成绩表头（请确认 class_id/term）", "code": 200}, status_code=200)
 
         shid = int(header_row["id"])
 
@@ -2769,7 +2769,7 @@ async def api_set_group_score_value(request: Request):
         )
         record = cursor.fetchone()
         if not record:
-            return _return_with_log({"message": "未找到该学生的小组成绩明细", "code": 404}, status_code=404)
+            return _return_with_log({"message": "没有找到数据：未找到该学生的小组成绩明细", "code": 200}, status_code=200)
 
         record_id = int(record["id"])
         record_group_name = (record.get("group_name") or "").strip() or ""
@@ -3079,7 +3079,7 @@ async def api_set_group_score_comment(request: Request):
         )
         header_row = cursor.fetchone()
         if not header_row:
-            return _return_with_log({"message": "未找到小组成绩表头（请确认 class_id/term）", "code": 404}, status_code=404)
+            return _return_with_log({"message": "没有找到数据：未找到小组成绩表头（请确认 class_id/term）", "code": 200}, status_code=200)
 
         shid = int(header_row["id"])
 
@@ -3113,7 +3113,7 @@ async def api_set_group_score_comment(request: Request):
         )
         record = cursor.fetchone()
         if not record:
-            return _return_with_log({"message": "未找到该学生的小组成绩明细", "code": 404}, status_code=404)
+            return _return_with_log({"message": "没有找到数据：未找到该学生的小组成绩明细", "code": 200}, status_code=200)
 
         def _resolve_excel_filename_from_context() -> Optional[str]:
             if excel_filename:
@@ -3344,7 +3344,7 @@ async def api_get_group_student_attr(
         )
         header_row = cursor.fetchone()
         if not header_row:
-            return safe_json_response({"message": "未找到小组成绩表头（请确认 class_id/term）", "code": 404}, status_code=404)
+            return safe_json_response({"message": "没有找到数据：未找到小组成绩表头（请确认 class_id/term）", "code": 200}, status_code=200)
 
         shid = int(header_row["id"])
 
@@ -3406,7 +3406,7 @@ async def api_get_group_student_attr(
         )
         row = cursor.fetchone()
         if not row:
-            return safe_json_response({"message": "未找到该学生的小组成绩明细", "code": 404}, status_code=404)
+            return safe_json_response({"message": "没有找到数据：未找到该学生的小组成绩明细", "code": 200}, status_code=200)
 
         scores_raw = row.get("scores_json")
         scores_dict = json.loads(scores_raw) if isinstance(scores_raw, str) else (scores_raw or {})
@@ -3569,7 +3569,7 @@ async def api_get_group_student_record(
         )
         header_row = cursor.fetchone()
         if not header_row:
-            return safe_json_response({"message": "未找到小组成绩表头（请确认 class_id/term）", "code": 404}, status_code=404)
+            return safe_json_response({"message": "没有找到数据：未找到小组成绩表头（请确认 class_id/term）", "code": 200}, status_code=200)
         
         shid = int(header_row["id"])
         
@@ -3611,8 +3611,8 @@ async def api_get_group_student_record(
         
         if not detail_rows:
             return safe_json_response(
-                {"message": "未找到学生小组成绩明细", "code": 404, "data": {"table_name": table_base if table_base else "all", "rows": []}},
-                status_code=404,
+                {"message": "没有找到数据：未找到学生小组成绩明细", "code": 200, "data": {"table_name": table_base if table_base else "all", "rows": []}},
+                status_code=200,
             )
         
         results: List[Dict[str, Any]] = []
@@ -3708,11 +3708,11 @@ async def api_get_group_student_record(
         if not results:
             return safe_json_response(
                 {
-                    "message": "未找到该 table_name 对应的数据（该学生存在，但该 Excel 表名未匹配到字段）",
-                    "code": 404,
+                    "message": "没有找到数据：未找到该 table_name 对应的数据（该学生存在，但该 Excel 表名未匹配到字段）",
+                    "code": 200,
                     "data": {"table_name": table_base if table_base else "all", "rows": []},
                 },
-                status_code=404,
+                status_code=200,
             )
         
         return safe_json_response({"message": "查询成功", "code": 200, "data": {"rows": results}})
@@ -3829,8 +3829,8 @@ async def api_get_student_record_from_excel_table(
         detail_rows = cursor.fetchall() or []
         if not detail_rows:
             return safe_json_response(
-                {"message": "未找到学生成绩明细", "code": 404, "data": {"table_name": table_base if table_base else "all", "rows": []}},
-                status_code=404,
+                {"message": "没有找到数据：未找到学生成绩明细", "code": 200, "data": {"table_name": table_base if table_base else "all", "rows": []}},
+                status_code=200,
             )
 
         # 缓存每个 score_header_id 的 excel_filename 列表（来自字段定义表）
@@ -3980,11 +3980,11 @@ async def api_get_student_record_from_excel_table(
                 available_by_header[str(shid)] = fns
             return safe_json_response(
                 {
-                    "message": "未找到该 table_name 对应的数据（该学生存在，但该 Excel 表名未匹配到字段）",
-                    "code": 404,
+                    "message": "没有找到数据：未找到该 table_name 对应的数据（该学生存在，但该 Excel 表名未匹配到字段）",
+                    "code": 200,
                     "data": {"table_name": table_base, "available_excel_filenames_by_score_header_id": available_by_header},
                 },
-                status_code=404,
+                status_code=200,
             )
 
         return safe_json_response({"message": "查询成功", "code": 200, "data": {"rows": results}})

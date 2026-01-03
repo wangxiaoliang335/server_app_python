@@ -317,7 +317,7 @@ async def api_get_seat_arrangement(request: Request, class_id: str = Query(..., 
         arrangement = cursor.fetchone()
 
         if not arrangement:
-            return safe_json_response({"message": "未找到座位信息", "code": 404}, status_code=404)
+            return safe_json_response({"message": "没有找到数据：未找到座位信息", "code": 200}, status_code=200)
 
         arrangement_id = arrangement["id"]
 
@@ -380,7 +380,7 @@ async def api_get_course_schedule(
             headers = cursor.fetchall()
 
             if not headers:
-                return safe_json_response({"message": "未找到课表", "code": 404}, status_code=404)
+                return safe_json_response({"message": "没有找到数据：未找到课表", "code": 200}, status_code=200)
 
             all_schedules = []
             for header in headers:
@@ -433,7 +433,7 @@ async def api_get_course_schedule(
         )
         header = cursor.fetchone()
         if not header:
-            return safe_json_response({"message": "未找到课表", "code": 404}, status_code=404)
+            return safe_json_response({"message": "没有找到数据：未找到课表", "code": 200}, status_code=200)
 
         schedule_id = header["id"]
         try:
@@ -511,7 +511,7 @@ async def api_get_school_course_schedules(
 
         if not classes:
             return safe_json_response(
-                {"message": f"未找到学校 {school_id} 下的班级", "code": 404, "data": []}, status_code=404
+                {"message": f"没有找到数据：未找到学校 {school_id} 下的班级", "code": 200, "data": []}, status_code=200
             )
 
         term_empty = not term or (isinstance(term, str) and term.strip() == "")
@@ -600,7 +600,7 @@ async def api_get_school_course_schedules(
 
         if not all_class_schedules:
             return safe_json_response(
-                {"message": f"学校 {school_id} 下没有找到课程表数据", "code": 404, "data": []}, status_code=404
+                {"message": f"没有找到数据：学校 {school_id} 下没有找到课程表数据", "code": 200, "data": []}, status_code=200
             )
 
         return safe_json_response({"message": "查询成功", "code": 200, "data": all_class_schedules})

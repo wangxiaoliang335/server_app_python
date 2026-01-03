@@ -51,15 +51,14 @@ async def get_recent_messages(request: Request):
         sender_info_map: Dict[str, Dict[str, Any]] = {}
         if sender_ids:
             placeholders = ",".join(["%s"] * len(sender_ids))
-            info_query = f"SELECT id, name, icon FROM ta_teacher WHERE id IN ({placeholders})"
+            info_query = f"SELECT id, name FROM ta_teacher WHERE id IN ({placeholders})"
             cursor.execute(info_query, tuple(sender_ids))
             teacher_infos = cursor.fetchall()
-            sender_info_map = {t["id"]: {"sender_name": t["name"], "sender_icon": t["icon"]} for t in teacher_infos}
+            sender_info_map = {t["id"]: {"sender_name": t["name"]} for t in teacher_infos}
 
         for msg in messages:
             info = sender_info_map.get(msg["sender_id"], {})
             msg["sender_name"] = info.get("sender_name", "未知老师")
-            msg["sender_icon"] = info.get("sender_icon")
             for f in ["sent_at", "created_at", "updated_at"]:
                 if isinstance(msg.get(f), datetime.datetime):
                     msg[f] = msg[f].strftime("%Y-%m-%d %H:%M:%S")
@@ -233,7 +232,7 @@ async def get_audio(message_id: int = Path(..., description="音频消息ID")):
         result = cursor.fetchone()
 
         if not result or not result[0]:
-            return JSONResponse({"message": "Audio not found"}, status_code=404)
+            return JSONResponse({"message": "没有找到数据：Audio not found", "code": 200}, status_code=200)
 
         audio_data = result[0]
         return Response(content=audio_data, media_type="audio/mpeg")
@@ -270,7 +269,7 @@ async def send_notification_to_class(request: Request):
         notification_id = cursor.lastrowid
 
         select_query = """
-            SELECT n.*, t.name AS sender_name, t.icon AS sender_icon
+            SELECT n.*, t.name AS sender_name
             FROM ta_notification n
             JOIN ta_teacher t ON n.sender_id = t.id
             WHERE n.id = %s
@@ -324,7 +323,7 @@ async def get_notifications_for_class(class_id: int = Path(..., description="班
         cursor = connection.cursor(dictionary=True)
 
         select_query = """
-            SELECT n.*, t.name AS sender_name, t.icon AS sender_icon
+            SELECT n.*, t.name AS sender_name
             FROM ta_notification n
             JOIN ta_teacher t ON n.sender_id = t.id
             WHERE n.receiver_id = %s AND n.is_read = 0

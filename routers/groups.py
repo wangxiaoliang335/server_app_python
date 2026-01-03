@@ -289,7 +289,7 @@ async def remove_member(request: Request):
                 print(f"[groups/remove-member] 错误: 群组 {group_id} 不存在")
                 if connection and connection.is_connected():
                     connection.rollback()
-                return JSONResponse({"code": 404, "message": "群组不存在"}, status_code=404)
+                return JSONResponse({"code": 200, "message": "没有找到数据：群组不存在"}, status_code=200)
 
             print(f"[groups/remove-member] 群组信息: {group_info}")
 
@@ -652,7 +652,7 @@ async def dismiss_group(request: Request):
 
             if not group_info:
                 print(f"[groups/dismiss] 错误: 群组 {group_id} 不存在")
-                return JSONResponse({"code": 404, "message": "群组不存在"}, status_code=404)
+                return JSONResponse({"code": 200, "message": "没有找到数据：群组不存在"}, status_code=200)
 
             print(f"[groups/dismiss] 群组信息: {group_info}")
             group_name = group_info.get("group_name", "")
@@ -987,7 +987,7 @@ async def set_admin_role(request: Request):
 
             if not group_info:
                 print(f"[groups/set_admin_role] 错误: 群组 {group_id} 不存在")
-                return JSONResponse({"code": 404, "message": "群组不存在"}, status_code=404)
+                return JSONResponse({"code": 200, "message": "没有找到数据：群组不存在"}, status_code=200)
 
             print(f"[groups/set_admin_role] 群组信息: {group_info}")
 
@@ -1001,7 +1001,7 @@ async def set_admin_role(request: Request):
 
             if not member_info:
                 print(f"[groups/set_admin_role] 错误: 用户 {user_id} 不在群组 {group_id} 中")
-                return JSONResponse({"code": 404, "message": "该用户不是群组成员"}, status_code=404)
+                return JSONResponse({"code": 200, "message": "没有找到数据：该用户不是群组成员"}, status_code=200)
 
             print(f"[groups/set_admin_role] 成员信息: {member_info}")
             current_role = member_info.get("self_role", 200)
@@ -1187,7 +1187,7 @@ async def transfer_owner(request: Request):
 
             if not group_info:
                 print(f"[groups/transfer_owner] 错误: 群组 {group_id} 不存在")
-                return JSONResponse({"code": 404, "message": "群组不存在"}, status_code=404)
+                return JSONResponse({"code": 200, "message": "没有找到数据：群组不存在"}, status_code=200)
 
             print(f"[groups/transfer_owner] 群组信息: {group_info}")
             group_name = group_info.get("group_name", "")
@@ -1205,7 +1205,7 @@ async def transfer_owner(request: Request):
 
             if not old_owner_info:
                 print(f"[groups/transfer_owner] 错误: 用户 {old_owner_id} 不在群组 {group_id} 中")
-                return JSONResponse({"code": 404, "message": "原群主不是该群组的成员"}, status_code=404)
+                return JSONResponse({"code": 200, "message": "没有找到数据：原群主不是该群组的成员"}, status_code=200)
 
             old_owner_role = old_owner_info.get("self_role", 200)
             if old_owner_role != 400:
@@ -1223,7 +1223,7 @@ async def transfer_owner(request: Request):
 
             if not new_owner_info:
                 print(f"[groups/transfer_owner] 错误: 用户 {new_owner_id} 不在群组 {group_id} 中")
-                return JSONResponse({"code": 404, "message": "新群主不是该群组的成员"}, status_code=404)
+                return JSONResponse({"code": 200, "message": "没有找到数据：新群主不是该群组的成员"}, status_code=200)
 
             print(f"[groups/transfer_owner] 新群主信息: {new_owner_info}")
             new_owner_name = new_owner_info.get("user_name", "")
@@ -1431,6 +1431,12 @@ def get_group_members_by_group_id(group_id: str = Query(..., description="群组
         print(f"[groups/members] 成员角色统计: {role_stats}")
         app_logger.info(f"[groups/members] 成员角色统计: group_id={group_id}, stats={role_stats}")
 
+        # 查询群组信息（包括头像和 classid，用于判断哪些成员是班级）
+        group_info_sql = "SELECT group_id, group_name, group_type, face_url, detail_face_url, is_class_group, classid, receive_notification, link_today_schedule, enable_intercom, link_homework, link_pre_class_preparation, link_duty_roster FROM `groups` WHERE group_id = %s"
+        cursor.execute(group_info_sql, (group_id,))
+        group_info = cursor.fetchone()
+        group_classid = group_info.get("classid") if group_info else None
+
         for idx, member in enumerate(members):
             user_id = member.get("user_id")
             user_name = member.get("user_name")
@@ -1438,6 +1444,24 @@ def get_group_members_by_group_id(group_id: str = Query(..., description="群组
             role_name = {200: "普通成员", 300: "管理员", 400: "群主"}.get(self_role, f"未知({self_role})")
 
             print(f"[groups/members] 处理第 {idx+1}/{len(members)} 个成员: user_id={user_id}, user_name={user_name}, role={role_name}")
+
+            # 判断成员是否为班级（通过 user_id 是否等于 classid）
+            is_class_member = False
+            if group_classid and str(user_id) == str(group_classid):
+                is_class_member = True
+            
+            # 如果是班级成员，查询班级头像
+            if is_class_member:
+                class_code = str(user_id)
+                class_avatar_sql = "SELECT face_url FROM ta_classes WHERE class_code = %s"
+                cursor.execute(class_avatar_sql, (class_code,))
+                class_row = cursor.fetchone()
+                if class_row:
+                    member["face_url"] = class_row.get("face_url")  # 添加班级头像字段
+                    print(f"[groups/members]   班级成员，添加头像: class_code={class_code}, face_url={member.get('face_url')}")
+                else:
+                    member["face_url"] = None
+                    print(f"[groups/members]   班级成员，但未找到班级记录: class_code={class_code}")
 
             if has_teach_subjects:
                 member["teach_subjects"] = _normalize_teach_subjects(member.get("teach_subjects"))
@@ -1448,6 +1472,29 @@ def get_group_members_by_group_id(group_id: str = Query(..., description="群组
                     member[key] = value.strftime("%Y-%m-%d %H:%M:%S")
                     print(f"[groups/members]   转换时间字段 {key}: {old_value} -> {member[key]}")
 
+        # 构建群组信息（已在上面查询过）
+        group_data = None
+        if group_info:
+            is_class_group = group_info.get("is_class_group")
+            classid = group_info.get("classid")
+            
+            group_data = {
+                "group_id": group_info.get("group_id"),
+                "group_name": group_info.get("group_name"),
+                "group_type": group_info.get("group_type"),
+                "face_url": group_info.get("face_url"),  # 群组头像
+                "detail_face_url": group_info.get("detail_face_url"),
+                "is_class_group": is_class_group,  # 是否为班级群
+                "classid": classid,  # 班级ID
+                "receive_notification": group_info.get("receive_notification", 0),
+                "link_today_schedule": group_info.get("link_today_schedule", 0),
+                "enable_intercom": group_info.get("enable_intercom", 0),
+                "link_homework": group_info.get("link_homework", 0),
+                "link_pre_class_preparation": group_info.get("link_pre_class_preparation", 0),
+                "link_duty_roster": group_info.get("link_duty_roster", 0),
+            }
+            print(f"[groups/members] 群组信息: group_name={group_data.get('group_name')}, face_url={group_data.get('face_url')}, is_class_group={group_data.get('is_class_group')}, classid={classid}")
+
         total_time = time.time() - start_time
         print(f"[groups/members] 数据处理完成，总耗时: {total_time:.3f}秒")
 
@@ -1456,6 +1503,7 @@ def get_group_members_by_group_id(group_id: str = Query(..., description="群组
                 "message": "查询成功",
                 "code": 200,
                 "group_id": group_id,
+                "group_info": group_data,  # 添加群组信息（包括头像）
                 "members": members,
                 "member_count": len(members),
                 "role_stats": role_stats,
@@ -1589,7 +1637,7 @@ async def update_group_member_teach_subjects(request: Request):
         connection.commit()
 
         if cursor.rowcount <= 0:
-            return JSONResponse({"data": {"message": "未找到该群成员记录", "code": 404}}, status_code=404)
+            return JSONResponse({"data": {"message": "没有找到数据：未找到该群成员记录", "code": 200}}, status_code=200)
 
         return JSONResponse(
             {"data": {"message": "更新成功", "code": 200, "group_id": group_id, "user_id": user_id, "teach_subjects": deduped}},
@@ -1635,7 +1683,7 @@ def get_group_members(unique_group_id: str = Query(..., description="群唯一ID
         group_info = cursor.fetchone()
 
         if not group_info:
-            return JSONResponse({"data": {"message": "群不存在", "code": 404}}, status_code=404)
+            return JSONResponse({"data": {"message": "没有找到数据：群不存在", "code": 200}}, status_code=200)
 
         group_admin_id = group_info.get("group_admin_id")
 
@@ -1805,7 +1853,7 @@ async def update_group_avatar(request: Request):
             app_logger.warning(f"[UpdateGroupAvatar] groups 表中未找到 group_id={group_id}")
             print(f"[UpdateGroupAvatar] groups 表中未找到 group_id={group_id}")
             connection.rollback()
-            return JSONResponse({"data": {"message": "未找到指定的群组", "code": 404}}, status_code=404)
+            return JSONResponse({"data": {"message": "没有找到数据：未找到指定的群组", "code": 200}}, status_code=200)
         
         app_logger.info(f"[UpdateGroupAvatar] 找到群组记录: group_id={group_row.get('group_id')}, group_name={group_row.get('group_name')}, 当前face_url={group_row.get('face_url')}")
         print(f"[UpdateGroupAvatar] 找到群组记录: group_id={group_row.get('group_id')}, group_name={group_row.get('group_name')}")
@@ -1913,7 +1961,7 @@ async def update_group_nickname(request: Request):
             app_logger.warning(f"[UpdateGroupNickname] groups 表中未找到 group_id={group_id}")
             print(f"[UpdateGroupNickname] groups 表中未找到 group_id={group_id}")
             connection.rollback()
-            return JSONResponse({"data": {"message": "未找到指定的群组", "code": 404}}, status_code=404)
+            return JSONResponse({"data": {"message": "没有找到数据：未找到指定的群组", "code": 200}}, status_code=200)
         
         app_logger.info(f"[UpdateGroupNickname] 找到群组记录: {group_row}")
         print(f"[UpdateGroupNickname] 找到群组记录: group_id={group_row.get('group_id')}, group_name={group_row.get('group_name')}")
@@ -1976,6 +2024,221 @@ async def update_group_nickname(request: Request):
         if connection and connection.is_connected():
             connection.close()
             app_logger.info(f"Database connection closed after updating group nickname for {unique_group_id}.")
+
+
+@router.post("/groups/update-settings")
+async def update_group_settings(request: Request):
+    """
+    更新群组设置信息
+    请求体 JSON:
+    {
+        "group_id": "群组ID",
+        "receive_notification": 1,  // 接收通知（0=关闭，1=开启）
+        "link_today_schedule": 1,   // 关联今日课表（0=关闭，1=开启）
+        "enable_intercom": 1,       // 开启对讲（0=关闭，1=开启）
+        "link_homework": 0,         // 关联家庭作业（0=关闭，1=开启）
+        "link_pre_class_preparation": 0,  // 关联课前准备（0=关闭，1=开启）
+        "link_duty_roster": 0       // 关联值日表（0=关闭，1=开启）
+    }
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"data": {"message": "无效的 JSON 请求体", "code": 400}}, status_code=400)
+
+    group_id = data.get("group_id")
+    
+    if not group_id:
+        app_logger.warning("[UpdateGroupSettings] 缺少 group_id")
+        return JSONResponse({"data": {"message": "群组ID必须提供", "code": 400}}, status_code=400)
+
+    # 获取设置字段（可选，如果不传则保持原值）
+    receive_notification = data.get("receive_notification")
+    link_today_schedule = data.get("link_today_schedule")
+    enable_intercom = data.get("enable_intercom")
+    link_homework = data.get("link_homework")
+    link_pre_class_preparation = data.get("link_pre_class_preparation")
+    link_duty_roster = data.get("link_duty_roster")
+
+    app_logger.info(f"[UpdateGroupSettings] 收到请求 - group_id={group_id}, receive_notification={receive_notification}, link_today_schedule={link_today_schedule}, enable_intercom={enable_intercom}, link_homework={link_homework}, link_pre_class_preparation={link_pre_class_preparation}, link_duty_roster={link_duty_roster}")
+
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("[UpdateGroupSettings] 数据库连接失败")
+        return JSONResponse({"data": {"message": "数据库连接失败", "code": 500}}, status_code=500)
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+
+        # 检查群组是否存在
+        cursor.execute("SELECT group_id, group_name FROM `groups` WHERE group_id = %s", (group_id,))
+        group_row = cursor.fetchone()
+
+        if not group_row:
+            app_logger.warning(f"[UpdateGroupSettings] 未找到群组 - group_id={group_id}")
+            return JSONResponse({"data": {"message": f"没有找到数据：群组 {group_id} 不存在", "code": 200}}, status_code=200)
+
+        # 构建更新语句（只更新提供的字段）
+        update_fields = []
+        update_params = []
+
+        if receive_notification is not None:
+            update_fields.append("receive_notification = %s")
+            update_params.append(1 if receive_notification else 0)
+        
+        if link_today_schedule is not None:
+            update_fields.append("link_today_schedule = %s")
+            update_params.append(1 if link_today_schedule else 0)
+        
+        if enable_intercom is not None:
+            update_fields.append("enable_intercom = %s")
+            update_params.append(1 if enable_intercom else 0)
+        
+        if link_homework is not None:
+            update_fields.append("link_homework = %s")
+            update_params.append(1 if link_homework else 0)
+        
+        if link_pre_class_preparation is not None:
+            update_fields.append("link_pre_class_preparation = %s")
+            update_params.append(1 if link_pre_class_preparation else 0)
+        
+        if link_duty_roster is not None:
+            update_fields.append("link_duty_roster = %s")
+            update_params.append(1 if link_duty_roster else 0)
+
+        if not update_fields:
+            app_logger.warning(f"[UpdateGroupSettings] 没有提供任何需要更新的字段 - group_id={group_id}")
+            return JSONResponse({"data": {"message": "没有提供需要更新的字段", "code": 400}}, status_code=400)
+
+        # 添加 group_id 作为 WHERE 条件
+        update_params.append(group_id)
+
+        update_sql = f"""
+            UPDATE `groups`
+            SET {', '.join(update_fields)}
+            WHERE group_id = %s
+        """
+        
+        cursor.execute(update_sql, tuple(update_params))
+        connection.commit()
+
+        affected_rows = cursor.rowcount
+        app_logger.info(f"[UpdateGroupSettings] 更新成功 - group_id={group_id}, 影响行数={affected_rows}")
+
+        # 返回更新后的群组设置信息
+        cursor.execute(
+            """
+            SELECT group_id, group_name, receive_notification, link_today_schedule, 
+                   enable_intercom, link_homework, link_pre_class_preparation, link_duty_roster
+            FROM `groups`
+            WHERE group_id = %s
+            """,
+            (group_id,)
+        )
+        updated_group = cursor.fetchone()
+
+        return JSONResponse({
+            "data": {
+                "message": "群组设置更新成功",
+                "code": 200,
+                "group_id": group_id,
+                "settings": {
+                    "receive_notification": updated_group.get("receive_notification", 0),
+                    "link_today_schedule": updated_group.get("link_today_schedule", 0),
+                    "enable_intercom": updated_group.get("enable_intercom", 0),
+                    "link_homework": updated_group.get("link_homework", 0),
+                    "link_pre_class_preparation": updated_group.get("link_pre_class_preparation", 0),
+                    "link_duty_roster": updated_group.get("link_duty_roster", 0),
+                }
+            }
+        })
+    except mysql.connector.Error as e:
+        if connection:
+            connection.rollback()
+        app_logger.error(f"[UpdateGroupSettings] 数据库错误 - group_id={group_id}, error={e}")
+        return JSONResponse({"data": {"message": f"数据库操作失败: {str(e)}", "code": 500}}, status_code=500)
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        app_logger.error(f"[UpdateGroupSettings] 未知错误 - group_id={group_id}, error={e}", exc_info=True)
+        return JSONResponse({"data": {"message": f"操作失败: {str(e)}", "code": 500}}, status_code=500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info(f"[UpdateGroupSettings] 数据库连接已关闭 - group_id={group_id}")
+
+
+@router.get("/groups/settings")
+async def get_group_settings(group_id: str = Query(..., description="群组ID")):
+    """
+    获取群组设置信息
+    查询参数:
+        group_id: 群组ID
+    """
+    if not group_id:
+        app_logger.warning("[GetGroupSettings] 缺少 group_id")
+        return JSONResponse({"data": {"message": "群组ID必须提供", "code": 400}}, status_code=400)
+
+    app_logger.info(f"[GetGroupSettings] 收到请求 - group_id={group_id}")
+
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("[GetGroupSettings] 数据库连接失败")
+        return JSONResponse({"data": {"message": "数据库连接失败", "code": 500}}, status_code=500)
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+
+        # 查询群组信息和设置
+        cursor.execute(
+            """
+            SELECT group_id, group_name, receive_notification, link_today_schedule, 
+                   enable_intercom, link_homework, link_pre_class_preparation, link_duty_roster
+            FROM `groups`
+            WHERE group_id = %s
+            """,
+            (group_id,)
+        )
+        group_row = cursor.fetchone()
+
+        if not group_row:
+            app_logger.warning(f"[GetGroupSettings] 未找到群组 - group_id={group_id}")
+            return JSONResponse({"data": {"message": f"没有找到数据：群组 {group_id} 不存在", "code": 200}}, status_code=200)
+
+        app_logger.info(f"[GetGroupSettings] 查询成功 - group_id={group_id}")
+
+        return JSONResponse({
+            "data": {
+                "message": "获取群组设置成功",
+                "code": 200,
+                "group_id": group_id,
+                "group_name": group_row.get("group_name"),
+                "settings": {
+                    "receive_notification": group_row.get("receive_notification", 0),
+                    "link_today_schedule": group_row.get("link_today_schedule", 0),
+                    "enable_intercom": group_row.get("enable_intercom", 0),
+                    "link_homework": group_row.get("link_homework", 0),
+                    "link_pre_class_preparation": group_row.get("link_pre_class_preparation", 0),
+                    "link_duty_roster": group_row.get("link_duty_roster", 0),
+                }
+            }
+        })
+    except mysql.connector.Error as e:
+        app_logger.error(f"[GetGroupSettings] 数据库错误 - group_id={group_id}, error={e}")
+        return JSONResponse({"data": {"message": f"数据库操作失败: {str(e)}", "code": 500}}, status_code=500)
+    except Exception as e:
+        app_logger.error(f"[GetGroupSettings] 未知错误 - group_id={group_id}, error={e}", exc_info=True)
+        return JSONResponse({"data": {"message": f"操作失败: {str(e)}", "code": 500}}, status_code=500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info(f"[GetGroupSettings] 数据库连接已关闭 - group_id={group_id}")
 
 
 @router.post("/groups/sync")
@@ -2418,6 +2681,51 @@ async def sync_groups(request: Request):
 
                             processed_member_ids.add(member_user_id)
 
+                    # 如果群组有 classid，将班级作为成员也插入到群组成员列表中
+                    final_classid = group.get("classid") or classid
+                    if final_classid and str(final_classid).strip():
+                        class_id_str = str(final_classid).strip()
+                        if class_id_str not in processed_member_ids:
+                            print(f"[groups/sync] 将班级 {class_id_str} 作为成员添加到群组 {group_id}")
+                            cursor.execute(
+                                "SELECT group_id FROM `group_members` WHERE group_id = %s AND user_id = %s", 
+                                (group_id, class_id_str)
+                            )
+                            class_member_exists = cursor.fetchone()
+                            
+                            if class_member_exists:
+                                print(f"[groups/sync] 班级成员已存在，跳过插入: group_id={group_id}, class_id={class_id_str}")
+                            else:
+                                insert_class_member_sql = """
+                                    INSERT INTO `group_members` (
+                                        group_id, user_id, user_name, self_role, join_time, msg_flag,
+                                        self_msg_flag, readed_seq, unread_num
+                                    ) VALUES (
+                                        %s, %s, %s, %s, %s, %s, %s, %s, %s
+                                    )
+                                """
+                                class_join_time = timestamp_to_datetime(group.get("create_time"))
+                                if not class_join_time:
+                                    class_join_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                
+                                class_insert_params = (
+                                    group_id,
+                                    class_id_str,
+                                    "班级",  # user_name 设为"班级"
+                                    200,     # self_role 设为普通成员
+                                    class_join_time,
+                                    0,       # msg_flag
+                                    0,       # self_msg_flag
+                                    0,       # readed_seq
+                                    0,       # unread_num
+                                )
+                                cursor.execute(insert_class_member_sql, class_insert_params)
+                                print(f"[groups/sync] 成功将班级 {class_id_str} 添加为群组 {group_id} 的成员")
+                        else:
+                            print(f"[groups/sync] 班级 {class_id_str} 已在成员列表中，跳过")
+                    else:
+                        print(f"[groups/sync] 群组 {group_id} 没有 classid，跳过添加班级成员")
+
                     success_count += 1
                     print(f"[groups/sync] 群组 {group_id} 处理成功")
                 except Exception as e:
@@ -2544,6 +2852,19 @@ def get_groups_by_admin(
             for key in row:
                 if isinstance(row[key], datetime.datetime):
                     row[key] = row[key].strftime("%Y-%m-%d %H:%M:%S")
+            # 确保新字段存在，如果不存在则使用默认值 0
+            if "receive_notification" not in row:
+                row["receive_notification"] = 0
+            if "link_today_schedule" not in row:
+                row["link_today_schedule"] = 0
+            if "enable_intercom" not in row:
+                row["enable_intercom"] = 0
+            if "link_homework" not in row:
+                row["link_homework"] = 0
+            if "link_pre_class_preparation" not in row:
+                row["link_pre_class_preparation"] = 0
+            if "link_duty_roster" not in row:
+                row["link_duty_roster"] = 0
 
         return JSONResponse({"data": {"message": "查询成功", "code": 200, "groups": groups}}, status_code=200)
 
@@ -2599,6 +2920,19 @@ def get_member_groups(unique_member_id: str = Query(..., description="成员唯�
             for key, value in row.items():
                 if isinstance(value, datetime.datetime):
                     row[key] = value.strftime("%Y-%m-%d %H:%M:%S")
+            # 确保新字段存在，如果不存在则使用默认值 0
+            if "receive_notification" not in row:
+                row["receive_notification"] = 0
+            if "link_today_schedule" not in row:
+                row["link_today_schedule"] = 0
+            if "enable_intercom" not in row:
+                row["enable_intercom"] = 0
+            if "link_homework" not in row:
+                row["link_homework"] = 0
+            if "link_pre_class_preparation" not in row:
+                row["link_pre_class_preparation"] = 0
+            if "link_duty_roster" not in row:
+                row["link_duty_roster"] = 0
 
         return JSONResponse({"data": {"message": "查询成功", "code": 200, "joingroups": groups}}, status_code=200)
 
@@ -2690,6 +3024,12 @@ def get_groups_by_teacher(teacher_unique_id: str = Query(..., description="教�
                 "classid": row.get("classid"),
                 "schoolid": row.get("schoolid"),
                 "is_class_group": row.get("is_class_group"),
+                "receive_notification": row.get("receive_notification", 0),
+                "link_today_schedule": row.get("link_today_schedule", 0),
+                "enable_intercom": row.get("enable_intercom", 0),
+                "link_homework": row.get("link_homework", 0),
+                "link_pre_class_preparation": row.get("link_pre_class_preparation", 0),
+                "link_duty_roster": row.get("link_duty_roster", 0),
                 "member_info": {
                     "user_id": row.get("user_id"),
                     "user_name": row.get("user_name"),
@@ -2820,7 +3160,7 @@ def get_groups_by_teacher(teacher_unique_id: str = Query(..., description="教�
 @router.get("/groups/search")
 def search_groups(
     schoolid: str = Query(None, description="学校ID，可选参数"),
-    group_id: str = Query(None, description="群组ID，与group_name二选一"),
+    group_id: str = Query(None, description="群组ID，与group_name二选一，支持模糊查询"),
     group_name: str = Query(None, description="群组名称，与group_id二选一，支持模糊查询"),
 ):
     """
@@ -2869,22 +3209,22 @@ def search_groups(
         cursor = connection.cursor(dictionary=True)
 
         if group_id:
-            print(f"[groups/search] 🔍 根据 group_id 精确查询: {group_id}")
-            app_logger.info(f"[groups/search] 根据 group_id 精确查询: {group_id}")
+            print(f"[groups/search] 🔍 根据 group_id 模糊查询: {group_id}")
+            app_logger.info(f"[groups/search] 根据 group_id 模糊查询: {group_id}")
             if schoolid:
                 sql = """
                     SELECT *
                     FROM `groups`
-                    WHERE schoolid = %s AND group_id = %s
+                    WHERE schoolid = %s AND group_id LIKE %s
                 """
-                params = (schoolid, group_id)
+                params = (schoolid, f"%{group_id}%")
             else:
                 sql = """
                     SELECT *
                     FROM `groups`
-                    WHERE group_id = %s
+                    WHERE group_id LIKE %s
                 """
-                params = (group_id,)
+                params = (f"%{group_id}%",)
         else:
             print(f"[groups/search] 🔍 根据 group_name 模糊查询: {group_name}")
             print(f"[groups/search]   - 原始 group_name: {repr(group_name)}")
@@ -3045,7 +3385,7 @@ async def join_group(request: Request):
 
             if not group_info:
                 print(f"[groups/join] 错误: 群组 {group_id} 不存在")
-                return JSONResponse({"code": 404, "message": "群组不存在"}, status_code=404)
+                return JSONResponse({"code": 200, "message": "没有找到数据：群组不存在"}, status_code=200)
 
             print(f"[groups/join] 群组信息: {group_info}")
             max_member_num = group_info.get("max_member_num") if group_info.get("max_member_num") else 0
@@ -3376,7 +3716,7 @@ async def leave_group(request: Request):
 
             if not group_info:
                 print(f"[groups/leave] 错误: 群组 {group_id} 不存在")
-                return JSONResponse({"code": 404, "message": "群组不存在"}, status_code=404)
+                return JSONResponse({"code": 200, "message": "没有找到数据：群组不存在"}, status_code=200)
 
             print(f"[groups/leave] 群组信息: {group_info}")
 
@@ -3536,7 +3876,7 @@ async def invite_group_members(request: Request):
 
             if not group_info:
                 print(f"[groups/invite] 错误: 群组 {group_id} 不存在")
-                return JSONResponse({"code": 404, "message": "群组不存在"}, status_code=404)
+                return JSONResponse({"code": 200, "message": "没有找到数据：群组不存在"}, status_code=200)
 
             print(f"[groups/invite] 群组信息: {group_info}")
             max_member_num = group_info.get("max_member_num") if group_info.get("max_member_num") else 0
