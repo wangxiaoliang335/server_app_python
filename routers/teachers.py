@@ -57,7 +57,7 @@ def generate_teacher_unique_id(school_id):
             SELECT teacher_unique_id
             FROM ta_teacher
             WHERE schoolId = %s
-            ORDER BY CAST(teacher_unique_id AS UNSIGNED) DESC
+            ORDER BY teacher_unique_id DESC
             LIMIT 1
             FOR UPDATE
         """,
@@ -65,8 +65,9 @@ def generate_teacher_unique_id(school_id):
         )
         result = cursor.fetchone()
         if result and result[0]:
+            # teacher_unique_id 是字符串，格式：前6位schoolId + 后4位流水号（都是10位固定长度）
             max_id_str = str(result[0]).zfill(10)
-            last_num = int(max_id_str[6:])
+            last_num = int(max_id_str[6:])  # 提取后4位流水号并转为整数用于计算
             new_num = last_num + 1
         else:
             new_num = 1
@@ -88,10 +89,8 @@ async def add_teacher(request: Request):
     if not data or "schoolId" not in data:
         return JSONResponse({"data": {"message": "缺少 schoolId", "code": 400}}, status_code=400)
 
+    # schoolId 可以是字符串或数字
     school_id = data["schoolId"]
-    teacher_unique_id = generate_teacher_unique_id(school_id)
-    if teacher_unique_id is None:
-        return JSONResponse({"data": {"message": "生成教师唯一编号失败", "code": 500}}, status_code=500)
 
     connection = get_db_connection()
     if connection is None:
@@ -110,7 +109,80 @@ async def add_teacher(request: Request):
     cursor = None
     try:
         cursor = connection.cursor(dictionary=True)
-        generated_teacher_id = str(uuid.uuid4())
+        
+        # 使用事务确保并发安全
+        connection.start_transaction()
+        
+        # 1. 生成 id 字段（VARCHAR(255) 类型的自增数字字符串）
+        cursor.execute("""
+            SELECT id FROM ta_teacher 
+            WHERE id REGEXP '^[0-9]+$'
+            ORDER BY CAST(id AS UNSIGNED) DESC 
+            LIMIT 1
+            FOR UPDATE
+        """)
+        max_id_result = cursor.fetchone()
+        
+        if max_id_result and max_id_result.get("id"):
+            try:
+                max_id_int = int(max_id_result["id"])
+                new_id = str(max_id_int + 1)
+            except (ValueError, TypeError):
+                new_id = "1"
+        else:
+            new_id = "1"
+        
+        teacher_id = new_id
+        
+        # 2. 生成 teacher_unique_id（确保唯一性）
+        # 格式：前6位为schoolId（左补零），后4位为流水号（左补零），总长度10位
+        max_retries = 100  # 最多重试100次（防止有大量重复）
+        teacher_unique_id = None
+        
+        # 第一次查询：获取当前 schoolId 下最大的 teacher_unique_id
+        cursor.execute("""
+            SELECT teacher_unique_id
+            FROM ta_teacher
+            WHERE schoolId = %s
+            ORDER BY teacher_unique_id DESC
+            LIMIT 1
+            FOR UPDATE
+        """, (school_id,))
+        result = cursor.fetchone()
+        
+        if result and result.get("teacher_unique_id"):
+            # teacher_unique_id 是字符串，格式：前6位schoolId + 后4位流水号（都是10位固定长度）
+            max_id_str = str(result["teacher_unique_id"]).zfill(10)
+            last_num = int(max_id_str[6:])  # 提取后4位流水号并转为整数用于计算
+            new_num = last_num + 1
+        else:
+            new_num = 1
+        
+        # 循环检查并生成唯一的 teacher_unique_id
+        for attempt in range(max_retries):
+            teacher_unique_id = f"{str(school_id).zfill(6)}{str(new_num).zfill(4)}"
+            
+            # 检查是否已存在
+            cursor.execute("""
+                SELECT teacher_unique_id FROM ta_teacher 
+                WHERE teacher_unique_id = %s 
+                LIMIT 1
+            """, (teacher_unique_id,))
+            exists = cursor.fetchone()
+            
+            if not exists:
+                # 不存在，可以使用
+                app_logger.info(f"[add_teacher] 生成唯一的 teacher_unique_id: {teacher_unique_id}")
+                break
+            else:
+                # 已存在，继续增加 new_num
+                app_logger.warning(f"[add_teacher] teacher_unique_id {teacher_unique_id} 已存在，尝试下一个 (尝试 {attempt + 1}/{max_retries})")
+                new_num += 1
+        
+        if teacher_unique_id is None:
+            connection.rollback()
+            return JSONResponse({"data": {"message": "生成教师唯一编号失败（重试次数过多）", "code": 500}}, status_code=500)
+        
         sql_insert = """
         INSERT INTO ta_teacher
         (id, name, icon, subject, gradeId, schoolId, is_Administarator, phone, id_card, sex,
@@ -125,7 +197,7 @@ async def add_teacher(request: Request):
         cursor.execute(
             sql_insert,
             (
-                generated_teacher_id,
+                teacher_id,
                 data.get("name"),
                 data.get("icon"),
                 data.get("subject"),
@@ -145,8 +217,6 @@ async def add_teacher(request: Request):
                 teacher_unique_id,
             ),
         )
-
-        teacher_id = generated_teacher_id
 
         cursor.execute("SELECT phone FROM ta_user_details WHERE phone = %s", (data.get("phone"),))
         user_exists = cursor.fetchone()
@@ -218,9 +288,18 @@ async def add_teacher(request: Request):
     except Error as e:
         if getattr(e, "errno", None) == 1062:
             connection.rollback()
-            return JSONResponse(
-                {"data": {"message": "任教记录重复（同一教师、学段/年级/科目/班级不能重复）", "code": 409}}, status_code=409
-            )
+            error_msg = str(e)
+            # 检查是否是 teacher_unique_id 重复
+            if "teacher_unique_id" in error_msg.lower():
+                app_logger.error(f"Database error: teacher_unique_id 重复 - {e}")
+                return JSONResponse(
+                    {"data": {"message": "教师唯一编号重复，请重试", "code": 409}}, status_code=409
+                )
+            else:
+                # 其他唯一约束错误（如任教记录重复等）
+                return JSONResponse(
+                    {"data": {"message": "数据重复（同一教师、学段/年级/科目/班级不能重复）", "code": 409}}, status_code=409
+                )
         connection.rollback()
         app_logger.error(f"Database error during adding teacher: {e}")
         return JSONResponse({"data": {"message": "新增教师失败", "code": 500}}, status_code=500)
@@ -494,6 +573,31 @@ def search_teachers(
 
         remove_icon_from_teacher_data(teachers)
 
+        # 补充教师头像（avatar）：来自 ta_user_details.avatar，通过 ta_teacher.id_card -> ta_user_details.id_number 关联
+        try:
+            id_numbers = [t.get("id_card") for t in teachers if isinstance(t, dict) and t.get("id_card")]
+            id_numbers = list(dict.fromkeys(id_numbers))  # 保持顺序去重
+            avatar_map: Dict[str, Optional[str]] = {}
+            if id_numbers:
+                placeholders = ",".join(["%s"] * len(id_numbers))
+                cursor.execute(
+                    f"SELECT id_number, avatar FROM ta_user_details WHERE id_number IN ({placeholders})",
+                    tuple(id_numbers),
+                )
+                rows = cursor.fetchall()
+                for row in rows:
+                    if row and row.get("id_number"):
+                        avatar_map[row["id_number"]] = row.get("avatar")
+
+            for t in teachers:
+                if not isinstance(t, dict):
+                    continue
+                id_number = t.get("id_card")
+                t["avatar"] = avatar_map.get(id_number)
+        except Exception as e:
+            # 头像补充失败不影响主流程
+            app_logger.warning(f"[teachers/search] 补充 avatar 失败: {e}", exc_info=True)
+
         for teacher in teachers:
             for key, value in list(teacher.items()):
                 if isinstance(value, datetime.datetime):
@@ -655,6 +759,100 @@ def get_friends(id_card: str = Query(..., description="教师身份证号")):
 
         return {"count": len(results), "friends": results}
     finally:
+        if connection and connection.is_connected():
+            connection.close()
+
+
+@router.post("/friends/remove")
+async def remove_friend(request: Request):
+    """
+    删除好友关系（双向删除）
+    
+    请求体:
+    - teacher_unique_id: 当前教师的唯一编号（必填）
+    - friend_teacher_unique_id: 要删除的好友的唯一编号（必填）
+    
+    说明：
+    - 会删除 ta_friend 表中的所有相关记录（双向关系）
+    - 包括：teacher_unique_id = A AND friendcode = B
+    - 以及：teacher_unique_id = B AND friendcode = A
+    """
+    data = await request.json()
+    if not data:
+        return JSONResponse({"data": {"message": "请求数据不能为空", "code": 400}}, status_code=400)
+
+    teacher_unique_id = data.get("teacher_unique_id")
+    friend_teacher_unique_id = data.get("friend_teacher_unique_id")
+
+    if not teacher_unique_id or not friend_teacher_unique_id:
+        return JSONResponse({"data": {"message": "teacher_unique_id 和 friend_teacher_unique_id 不能为空", "code": 400}}, status_code=400)
+
+    if teacher_unique_id == friend_teacher_unique_id:
+        return JSONResponse({"data": {"message": "不能删除自己为好友", "code": 400}}, status_code=400)
+
+    connection = get_db_connection()
+    if connection is None or not connection.is_connected():
+        return JSONResponse({"data": {"message": "数据库连接失败", "code": 500}}, status_code=500)
+
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        
+        # 删除双向好友关系：
+        # 1. 删除 A 添加 B 的记录（teacher_unique_id = A, friendcode = B）
+        # 2. 删除 B 添加 A 的记录（teacher_unique_id = B, friendcode = A）
+        deleted_count = 0
+        
+        # 删除第一条：A -> B
+        cursor.execute(
+            "DELETE FROM ta_friend WHERE teacher_unique_id = %s AND friendcode = %s",
+            (teacher_unique_id, friend_teacher_unique_id)
+        )
+        deleted_count += cursor.rowcount
+        
+        # 删除第二条：B -> A
+        cursor.execute(
+            "DELETE FROM ta_friend WHERE teacher_unique_id = %s AND friendcode = %s",
+            (friend_teacher_unique_id, teacher_unique_id)
+        )
+        deleted_count += cursor.rowcount
+        
+        connection.commit()
+        
+        print(f"[friends/remove] 删除好友关系 - teacher_unique_id={teacher_unique_id}, friend_teacher_unique_id={friend_teacher_unique_id}, 删除记录数={deleted_count}")
+        app_logger.info(f"[friends/remove] 删除好友关系 - teacher_unique_id={teacher_unique_id}, friend_teacher_unique_id={friend_teacher_unique_id}, 删除记录数={deleted_count}")
+
+        if deleted_count > 0:
+            return JSONResponse({
+                "data": {
+                    "message": "删除好友成功",
+                    "code": 200,
+                    "deleted_count": deleted_count
+                }
+            }, status_code=200)
+        else:
+            return JSONResponse({
+                "data": {
+                    "message": "好友关系不存在",
+                    "code": 404
+                }
+            }, status_code=404)
+            
+    except mysql.connector.Error as e:
+        if connection:
+            connection.rollback()
+        print(f"[friends/remove] 数据库错误 - teacher_unique_id={teacher_unique_id}, friend_teacher_unique_id={friend_teacher_unique_id}, error={e}")
+        app_logger.error(f"[friends/remove] 数据库错误: {e}")
+        return JSONResponse({"data": {"message": f"删除失败: {str(e)}", "code": 500}}, status_code=500)
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        print(f"[friends/remove] 未知错误 - teacher_unique_id={teacher_unique_id}, friend_teacher_unique_id={friend_teacher_unique_id}, error={e}")
+        app_logger.error(f"[friends/remove] 未知错误: {e}", exc_info=True)
+        return JSONResponse({"data": {"message": f"删除失败: {str(e)}", "code": 500}}, status_code=500)
+    finally:
+        if cursor:
+            cursor.close()
         if connection and connection.is_connected():
             connection.close()
 

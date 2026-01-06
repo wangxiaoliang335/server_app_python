@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import datetime
 import json
 import os
@@ -48,6 +49,7 @@ from ws.manager import (
 router = APIRouter()
 
 
+from services.avatars import upload_avatar_to_oss
 from services.tencent_groups import notify_tencent_group_sync
 
 
@@ -1975,6 +1977,45 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                 else:
                                     print(f"[创建群] 使用客户端传入的群ID: {unique_group_id}")
                                 
+                                # 处理头像：优先处理 avatar_base64，如果存在则上传到 OSS
+                                avatar_base64 = msg_data1.get('avatar_base64')
+                                if avatar_base64:
+                                    print(f"[创建群] 收到 avatar_base64 字段，开始处理 - group_id={unique_group_id}")
+                                    app_logger.info(f"[创建群] 收到 avatar_base64 字段，开始处理 - group_id={unique_group_id}")
+                                    
+                                    try:
+                                        # 解码 base64 字符串（可能包含 data:image/...;base64, 前缀）
+                                        if ',' in avatar_base64:
+                                            # 移除 data:image/...;base64, 前缀
+                                            avatar_base64 = avatar_base64.split(',', 1)[1]
+                                        
+                                        # 解码 base64 为二进制数据
+                                        avatar_bytes = base64.b64decode(avatar_base64)
+                                        print(f"[创建群] base64 解码成功，图片大小: {len(avatar_bytes)} bytes")
+                                        app_logger.info(f"[创建群] base64 解码成功，图片大小: {len(avatar_bytes)} bytes")
+                                        
+                                        # 生成 OSS 对象名称：group-avatars/{group_id}_{timestamp}.png
+                                        timestamp = int(time.time())
+                                        object_name = f"group-avatars/{unique_group_id}_{timestamp}.png"
+                                        
+                                        # 上传到 OSS
+                                        print(f"[创建群] 开始上传头像到 OSS - object_name={object_name}")
+                                        app_logger.info(f"[创建群] 开始上传头像到 OSS - object_name={object_name}")
+                                        uploaded_url = upload_avatar_to_oss(avatar_bytes, object_name)
+                                        
+                                        if uploaded_url:
+                                            face_url = uploaded_url
+                                            detail_face_url = uploaded_url
+                                            print(f"[创建群] ✅ 头像上传成功 - face_url={face_url}")
+                                            app_logger.info(f"[创建群] ✅ 头像上传成功 - face_url={face_url}")
+                                        else:
+                                            print(f"[创建群] ⚠️ 头像上传失败，使用原始 face_url 或空值")
+                                            app_logger.warning(f"[创建群] ⚠️ 头像上传失败，使用原始 face_url 或空值")
+                                    except Exception as e:
+                                        print(f"[创建群] ❌ 处理 avatar_base64 时出错: {e}")
+                                        app_logger.error(f"[创建群] ❌ 处理 avatar_base64 时出错: {e}", exc_info=True)
+                                        # 如果处理失败，继续使用原始的 face_url
+                                
                                 # 插入 groups 表
                                 insert_group_sql = """
                                     INSERT INTO `groups` (
@@ -2802,6 +2843,12 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                     "group_id": unique_group_id,
                                     "groupname": group_name_for_response
                                 }
+                                
+                                # 如果有 face_url（包括从 avatar_base64 上传后的 URL），添加到响应中
+                                if face_url:
+                                    response_data["face_url"] = face_url
+                                    print(f"[创建群] 添加 face_url 到响应 - face_url={face_url}")
+                                    app_logger.info(f"[创建群] 添加 face_url 到响应 - face_url={face_url}")
                                 
                                 # 如果有临时语音群信息，添加到响应中
                                 if temp_room_info:
