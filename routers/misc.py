@@ -1,14 +1,18 @@
+import base64
 import datetime
 import json
 import redis
+import time
 import mysql.connector
 from mysql.connector import Error
+from typing import Dict, Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from common import app_logger, safe_json_response
 from db import get_db_connection
+from services.avatars import upload_avatar_to_oss
 
 
 router = APIRouter()
@@ -273,6 +277,124 @@ async def get_class_wallpapers(group_id: str = None):
             app_logger.info(f"[GetClassWallpapers] 数据库连接已关闭 - group_id={group_id}")
 
 
+@router.post("/class-wallpapers/upload")
+async def upload_class_wallpaper(request: Request):
+    """
+    上传自定义壁纸到班级壁纸
+    请求体 JSON:
+    {
+        "group_id": "班级群组ID",
+        "image": "base64编码的图片数据（支持 data:image/... 前缀）",
+        "name": "壁纸名称（可选）"
+    }
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"data": {"message": "无效的 JSON 请求体", "code": 400}}, status_code=400)
+
+    group_id = data.get("group_id")
+    image = data.get("image")
+    wallpaper_name = data.get("name", "")
+
+    if not group_id:
+        app_logger.warning("[UploadClassWallpaper] 缺少 group_id")
+        return JSONResponse({"data": {"message": "群组ID必须提供", "code": 400}}, status_code=400)
+
+    if not image:
+        app_logger.warning("[UploadClassWallpaper] 缺少 image")
+        return JSONResponse({"data": {"message": "图片数据必须提供", "code": 400}}, status_code=400)
+
+    connection = get_db_connection()
+    if connection is None:
+        app_logger.error("[UploadClassWallpaper] 数据库连接失败")
+        return JSONResponse({"data": {"message": "数据库连接失败", "code": 500}}, status_code=500)
+
+    try:
+        # 解码 Base64 图片（支持 data:image/... 前缀）
+        if isinstance(image, str) and image.startswith("data:image/"):
+            # 移除 data:image/xxx;base64, 前缀
+            image = image.split(",", 1)[1] if "," in image else image
+        image_bytes = base64.b64decode(image)
+        app_logger.info(f"[UploadClassWallpaper] 图片解码成功 - group_id={group_id}, 图片大小={len(image_bytes)} bytes")
+    except Exception as e:
+        app_logger.error(f"[UploadClassWallpaper] Base64解码失败 - group_id={group_id}, error={e}")
+        return JSONResponse({"data": {"message": "图片数据解析失败", "code": 400}}, status_code=400)
+
+    # 上传图片到OSS
+    object_name = f"class-wallpapers/{group_id}_{int(time.time())}.jpg"
+    oss_url = upload_avatar_to_oss(image_bytes, object_name)
+    
+    if not oss_url:
+        app_logger.error(f"[UploadClassWallpaper] OSS上传失败 - group_id={group_id}")
+        return JSONResponse({"data": {"message": "图片上传到OSS失败，请检查OSS配置", "code": 500}}, status_code=500)
+
+    app_logger.info(f"[UploadClassWallpaper] OSS上传成功 - group_id={group_id}, oss_url={oss_url}")
+
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+
+        # 如果没有提供名称，使用默认名称
+        if not wallpaper_name or not wallpaper_name.strip():
+            wallpaper_name = f"自定义壁纸_{int(time.time())}"
+
+        # 检查是否已经存在相同的图片（根据 image_url 判断）
+        cursor.execute(
+            "SELECT id FROM class_wallpaper WHERE group_id = %s AND image_url = %s",
+            (group_id, oss_url)
+        )
+        existing = cursor.fetchone()
+
+        if existing:
+            app_logger.info(f"[UploadClassWallpaper] 壁纸已存在 - group_id={group_id}, wallpaper_id={existing['id']}")
+            return JSONResponse({
+                "data": {
+                    "message": "壁纸已存在",
+                    "code": 200,
+                    "wallpaper_id": existing["id"],
+                    "name": wallpaper_name,
+                    "image_url": oss_url
+                }
+            }, status_code=200)
+
+        # 插入到班级壁纸表（is_current=0，source='custom'）
+        cursor.execute(
+            """
+            INSERT INTO class_wallpaper (group_id, name, image_url, is_current, source)
+            VALUES (%s, %s, %s, 0, 'custom')
+            """,
+            (group_id, wallpaper_name, oss_url)
+        )
+        new_wallpaper_id = cursor.lastrowid
+        connection.commit()
+
+        app_logger.info(f"[UploadClassWallpaper] 上传成功 - group_id={group_id}, wallpaper_id={new_wallpaper_id}")
+        return JSONResponse({
+            "data": {
+                "message": "上传壁纸成功",
+                "code": 200,
+                "wallpaper_id": new_wallpaper_id,
+                "name": wallpaper_name,
+                "image_url": oss_url
+            }
+        }, status_code=200)
+    except Error as e:
+        connection.rollback()
+        app_logger.error(f"[UploadClassWallpaper] 数据库错误 - group_id={group_id}, error={e}")
+        return JSONResponse({"data": {"message": f"数据库操作失败: {str(e)}", "code": 500}}, status_code=500)
+    except Exception as e:
+        connection.rollback()
+        app_logger.error(f"[UploadClassWallpaper] 未知错误 - group_id={group_id}, error={e}", exc_info=True)
+        return JSONResponse({"data": {"message": f"操作失败: {str(e)}", "code": 500}}, status_code=500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+            app_logger.info(f"[UploadClassWallpaper] 数据库连接已关闭 - group_id={group_id}")
+
+
 @router.post("/class-wallpapers/download")
 async def download_wallpaper_to_class(request: Request):
     """
@@ -373,6 +495,109 @@ async def download_wallpaper_to_class(request: Request):
             app_logger.info(f"[DownloadWallpaperToClass] 数据库连接已关闭 - group_id={group_id}")
 
 
+async def set_class_wallpaper_current_internal(
+    group_id: str,
+    wallpaper_id: int,
+    connection: mysql.connector.MySQLConnection,
+    cursor: mysql.connector.cursor.MySQLCursor
+) -> Dict[str, Any]:
+    """
+    内部函数：设置班级壁纸为当前使用的壁纸
+    返回: {"success": bool, "message": str, "code": int, "wallpaper": dict}
+    """
+    try:
+        # 1. 验证壁纸是否存在且属于该群组
+        cursor.execute(
+            "SELECT id, name, image_url FROM class_wallpaper WHERE id = %s AND group_id = %s",
+            (wallpaper_id, group_id)
+        )
+        wallpaper = cursor.fetchone()
+
+        if not wallpaper:
+            app_logger.warning(f"[SetClassWallpaperCurrent] 壁纸不存在或不属于该群组 - group_id={group_id}, wallpaper_id={wallpaper_id}")
+            return {"success": False, "message": "壁纸不存在或不属于该群组", "code": 404}
+
+        # 2. 先将该群组的所有壁纸设置为非当前（is_current=0）
+        cursor.execute(
+            "UPDATE class_wallpaper SET is_current = 0 WHERE group_id = %s",
+            (group_id,)
+        )
+
+        # 3. 将指定的壁纸设置为当前（is_current=1）
+        cursor.execute(
+            "UPDATE class_wallpaper SET is_current = 1 WHERE id = %s AND group_id = %s",
+            (wallpaper_id, group_id)
+        )
+
+        connection.commit()
+
+        app_logger.info(f"[SetClassWallpaperCurrent] 设置成功 - group_id={group_id}, wallpaper_id={wallpaper_id}")
+        
+        # 4. 通过WebSocket推送壁纸更改通知到该班级的所有在线客户端
+        try:
+            from ws.manager import connections
+            
+            # 通过 group_id 查询对应的 classid（class_code）
+            cursor.execute(
+                "SELECT classid FROM `groups` WHERE group_id = %s AND is_class_group = 1 LIMIT 1",
+                (group_id,)
+            )
+            group_info = cursor.fetchone()
+            
+            if group_info and group_info.get("classid"):
+                class_code = str(group_info.get("classid")).strip()
+                app_logger.info(f"[SetClassWallpaperCurrent] 找到班级代码 - group_id={group_id}, class_code={class_code}")
+                
+                # 查找班级端的 WebSocket 连接
+                target_conn = connections.get(class_code)
+                if target_conn:
+                    # 构建壁纸更改通知消息
+                    wallpaper_notify = json.dumps({
+                        "type": "wallpaper_changed",
+                        "group_id": group_id,
+                        "wallpaper_id": wallpaper_id,
+                        "wallpaper": {
+                            "id": wallpaper["id"],
+                            "name": wallpaper["name"],
+                            "image_url": wallpaper["image_url"]
+                        }
+                    }, ensure_ascii=False)
+                    
+                    # 异步发送消息
+                    try:
+                        await target_conn["ws"].send_text(wallpaper_notify)
+                        app_logger.info(f"[SetClassWallpaperCurrent] 已推送壁纸更改通知 - group_id={group_id}, class_code={class_code}")
+                    except Exception as send_error:
+                        app_logger.warning(f"[SetClassWallpaperCurrent] 推送消息失败 - class_code={class_code}, error={send_error}")
+                else:
+                    app_logger.info(f"[SetClassWallpaperCurrent] 班级端不在线 - class_code={class_code}")
+            else:
+                app_logger.warning(f"[SetClassWallpaperCurrent] 未找到班级代码 - group_id={group_id}")
+        except Exception as e:
+            app_logger.warning(f"[SetClassWallpaperCurrent] 推送通知失败: {e}", exc_info=True)
+
+        return {
+            "success": True,
+            "message": "设置班级壁纸成功",
+            "code": 200,
+            "group_id": group_id,
+            "wallpaper_id": wallpaper_id,
+            "wallpaper": {
+                "id": wallpaper["id"],
+                "name": wallpaper["name"],
+                "image_url": wallpaper["image_url"]
+            }
+        }
+    except Error as e:
+        connection.rollback()
+        app_logger.error(f"[SetClassWallpaperCurrent] 数据库错误 - group_id={group_id}, wallpaper_id={wallpaper_id}, error={e}")
+        return {"success": False, "message": f"数据库操作失败: {str(e)}", "code": 500}
+    except Exception as e:
+        connection.rollback()
+        app_logger.error(f"[SetClassWallpaperCurrent] 未知错误 - group_id={group_id}, wallpaper_id={wallpaper_id}, error={e}", exc_info=True)
+        return {"success": False, "message": f"操作失败: {str(e)}", "code": 500}
+
+
 @router.post("/class-wallpapers/set-current")
 async def set_class_wallpaper_current(request: Request):
     """
@@ -407,66 +632,13 @@ async def set_class_wallpaper_current(request: Request):
     cursor = None
     try:
         cursor = connection.cursor(dictionary=True)
-
-        # 1. 验证壁纸是否存在且属于该群组
-        cursor.execute(
-            "SELECT id, name, image_url FROM class_wallpaper WHERE id = %s AND group_id = %s",
-            (wallpaper_id, group_id)
-        )
-        wallpaper = cursor.fetchone()
-
-        if not wallpaper:
-            app_logger.warning(f"[SetClassWallpaperCurrent] 壁纸不存在或不属于该群组 - group_id={group_id}, wallpaper_id={wallpaper_id}")
-            return JSONResponse({"data": {"message": "壁纸不存在或不属于该群组", "code": 404}}, status_code=404)
-
-        # 2. 先将该群组的所有壁纸设置为非当前（is_current=0）
-        cursor.execute(
-            "UPDATE class_wallpaper SET is_current = 0 WHERE group_id = %s",
-            (group_id,)
-        )
-
-        # 3. 将指定的壁纸设置为当前（is_current=1）
-        cursor.execute(
-            "UPDATE class_wallpaper SET is_current = 1 WHERE id = %s AND group_id = %s",
-            (wallpaper_id, group_id)
-        )
-
-        connection.commit()
-
-        app_logger.info(f"[SetClassWallpaperCurrent] 设置成功 - group_id={group_id}, wallpaper_id={wallpaper_id}")
+        result = await set_class_wallpaper_current_internal(group_id, wallpaper_id, connection, cursor)
         
-        # 4. 通过WebSocket推送壁纸更改通知到该班级的所有在线客户端
-        # 这里需要导入相关的WebSocket管理模块
-        try:
-            from ws.manager import connections
-            # 获取群组的所有成员（这里简化处理，实际可能需要查询群组成员）
-            # 可以通过 group_id 找到对应的 class_code，然后推送
-            # 暂时先记录日志，后续可以完善推送逻辑
-            app_logger.info(f"[SetClassWallpaperCurrent] 需要推送壁纸更改通知 - group_id={group_id}")
-        except Exception as e:
-            app_logger.warning(f"[SetClassWallpaperCurrent] 推送通知失败: {e}")
-
-        return JSONResponse({
-            "data": {
-                "message": "设置班级壁纸成功",
-                "code": 200,
-                "group_id": group_id,
-                "wallpaper_id": wallpaper_id,
-                "wallpaper": {
-                    "id": wallpaper["id"],
-                    "name": wallpaper["name"],
-                    "image_url": wallpaper["image_url"]
-                }
-            }
-        }, status_code=200)
-    except Error as e:
-        connection.rollback()
-        app_logger.error(f"[SetClassWallpaperCurrent] 数据库错误 - group_id={group_id}, wallpaper_id={wallpaper_id}, error={e}")
-        return JSONResponse({"data": {"message": f"数据库操作失败: {str(e)}", "code": 500}}, status_code=500)
-    except Exception as e:
-        connection.rollback()
-        app_logger.error(f"[SetClassWallpaperCurrent] 未知错误 - group_id={group_id}, wallpaper_id={wallpaper_id}, error={e}", exc_info=True)
-        return JSONResponse({"data": {"message": f"操作失败: {str(e)}", "code": 500}}, status_code=500)
+        if result.get("success"):
+            return JSONResponse({"data": result}, status_code=200)
+        else:
+            status_code = 500 if result.get("code") == 500 else (404 if result.get("code") == 404 else 400)
+            return JSONResponse({"data": result}, status_code=status_code)
     finally:
         if cursor:
             cursor.close()

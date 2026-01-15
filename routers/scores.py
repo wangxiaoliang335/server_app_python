@@ -100,6 +100,29 @@ async def api_save_student_scores(request: Request):
       ]
     }
     """
+    # ========== 打印客户端发送的原始消息 ==========
+    print("=" * 80)
+    print("[student-scores/save] ========== 收到客户端请求 ==========")
+    print(f"[student-scores/save] 请求方法: {request.method}")
+    print(f"[student-scores/save] 请求URL: {request.url}")
+    print(f"[student-scores/save] 请求路径: {request.url.path}")
+    print(f"[student-scores/save] 查询参数: {request.url.query}")
+    
+    # 打印请求头
+    print(f"[student-scores/save] 请求头:")
+    for header_name, header_value in request.headers.items():
+        # 对于敏感信息（如 Authorization），只显示部分内容
+        if header_name.lower() in ['authorization', 'cookie']:
+            if header_value:
+                masked_value = header_value[:20] + "..." if len(header_value) > 20 else header_value[:20]
+                print(f"  {header_name}: {masked_value}")
+            else:
+                print(f"  {header_name}: (空)")
+        else:
+            print(f"  {header_name}: {header_value}")
+    
+    app_logger.info(f"[student-scores/save] 收到请求: {request.method} {request.url.path}")
+    
     data = None
     excel_file = None
     excel_file_name = None
@@ -108,16 +131,62 @@ async def api_save_student_scores(request: Request):
     
     # 检查Content-Type
     content_type = request.headers.get("content-type", "").lower()
+    print(f"[student-scores/save] Content-Type: {content_type}")
+    app_logger.info(f"[student-scores/save] Content-Type: {content_type}")
     
     if "multipart/form-data" in content_type:
         # 处理multipart/form-data格式
+        print(f"[student-scores/save] ========== 处理 multipart/form-data 格式 ==========")
+        app_logger.info(f"[student-scores/save] 处理 multipart/form-data 格式")
         try:
             form_data = await request.form()
+            
+            # 打印表单字段
+            print(f"[student-scores/save] 表单字段列表:")
+            for field_name in form_data:
+                field_value = form_data.get(field_name)
+                if field_name == "excel_file":
+                    # 对于文件字段，只打印文件信息，不打印二进制内容
+                    if hasattr(field_value, 'filename'):
+                        filename = getattr(field_value, 'filename', None)
+                        file_size = None
+                        if hasattr(field_value, 'size'):
+                            file_size = getattr(field_value, 'size', None)
+                        print(f"  {field_name}: [文件] filename={filename}, size={file_size}, type={type(field_value).__name__}")
+                        app_logger.info(f"[student-scores/save] 表单字段 {field_name}: 文件 {filename}, size={file_size}")
+                    else:
+                        print(f"  {field_name}: [文件] type={type(field_value).__name__}")
+                        app_logger.info(f"[student-scores/save] 表单字段 {field_name}: 文件对象 {type(field_value).__name__}")
+                else:
+                    # 对于非文件字段，打印完整内容（但限制长度）
+                    value_str = str(field_value)
+                    if len(value_str) > 1000:
+                        value_preview = value_str[:1000] + "...(截断)"
+                        print(f"  {field_name}: {value_preview} [长度: {len(value_str)}]")
+                        app_logger.info(f"[student-scores/save] 表单字段 {field_name}: 长度 {len(value_str)} 字符")
+                    else:
+                        print(f"  {field_name}: {value_str}")
+                        app_logger.info(f"[student-scores/save] 表单字段 {field_name}: {value_str}")
             
             # 获取JSON数据（从data字段）
             data_str = form_data.get("data")
             if not data_str:
                 return safe_json_response({'message': 'multipart请求中缺少data字段', 'code': 400}, status_code=400)
+            
+            # 打印原始 data 字段（JSON字符串）
+            print(f"[student-scores/save] 原始 data 字段（JSON字符串）:")
+            if data_str:
+                if isinstance(data_str, str):
+                    print(f"{data_str}")
+                    print(f"[student-scores/save] data 字段长度: {len(data_str)} 字符")
+                    app_logger.info(f"[student-scores/save] data 字段长度: {len(data_str)} 字符")
+                    app_logger.info(f"[student-scores/save] data 字段内容: {data_str}")
+                else:
+                    print(f"{str(data_str)}")
+                    app_logger.info(f"[student-scores/save] data 字段类型: {type(data_str)}")
+                    app_logger.info(f"[student-scores/save] data 字段内容: {str(data_str)}")
+            else:
+                print("  (空)")
             
             # 解析JSON字符串（form_data.get返回的可能是字符串）
             if isinstance(data_str, str):
@@ -125,6 +194,18 @@ async def api_save_student_scores(request: Request):
             else:
                 # 如果不是字符串，尝试转换为字符串再解析
                 data = json.loads(str(data_str))
+            
+            # 打印解析后的JSON数据
+            print(f"[student-scores/save] 解析后的 JSON 数据:")
+            try:
+                data_json_str = json.dumps(data, ensure_ascii=False, indent=2)
+                print(f"{data_json_str}")
+                print(f"[student-scores/save] JSON 数据长度: {len(data_json_str)} 字符")
+                app_logger.info(f"[student-scores/save] 解析后的 JSON 数据: {data_json_str}")
+            except Exception as e:
+                print(f"[student-scores/save] 无法格式化JSON数据: {e}")
+                print(f"[student-scores/save] 原始数据: {str(data)}")
+                app_logger.error(f"[student-scores/save] 无法格式化JSON数据: {e}, 原始数据: {str(data)}")
             
             # 获取Excel文件（可选）
             excel_file = form_data.get("excel_file")
@@ -303,8 +384,51 @@ async def api_save_student_scores(request: Request):
             return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
     else:
         # 处理application/json格式
+        print(f"[student-scores/save] ========== 处理 application/json 格式 ==========")
+        app_logger.info(f"[student-scores/save] 处理 application/json 格式")
         try:
-            data = await request.json()
+            # 先读取原始请求体
+            body_bytes = await request.body()
+            body_str = body_bytes.decode('utf-8') if body_bytes else ""
+            
+            # 打印原始JSON字符串
+            print(f"[student-scores/save] 原始 JSON 请求体:")
+            if body_str:
+                print(f"{body_str}")
+                print(f"[student-scores/save] JSON 请求体长度: {len(body_str)} 字符")
+                app_logger.info(f"[student-scores/save] JSON 请求体长度: {len(body_str)} 字符")
+                app_logger.info(f"[student-scores/save] 原始 JSON 请求体: {body_str}")
+            else:
+                print("  (空)")
+                app_logger.warning(f"[student-scores/save] JSON 请求体为空")
+            
+            # 解析JSON
+            if body_str:
+                try:
+                    data = json.loads(body_str)
+                except json.JSONDecodeError as json_err:
+                    error_msg = f'JSON 解析失败: {str(json_err)}'
+                    print(f"[student-scores/save] 错误: {error_msg}")
+                    app_logger.warning(f"[student-scores/save] {error_msg}")
+                    return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
+            else:
+                error_msg = 'JSON 请求体为空'
+                print(f"[student-scores/save] 错误: {error_msg}")
+                app_logger.warning(f"[student-scores/save] {error_msg}")
+                return safe_json_response({'message': error_msg, 'code': 400}, status_code=400)
+            
+            # 打印解析后的JSON数据
+            print(f"[student-scores/save] 解析后的 JSON 数据:")
+            try:
+                data_json_str = json.dumps(data, ensure_ascii=False, indent=2)
+                print(f"{data_json_str}")
+                print(f"[student-scores/save] JSON 数据长度: {len(data_json_str)} 字符")
+                app_logger.info(f"[student-scores/save] 解析后的 JSON 数据: {data_json_str}")
+            except Exception as e:
+                print(f"[student-scores/save] 无法格式化JSON数据: {e}")
+                print(f"[student-scores/save] 原始数据: {str(data)}")
+                app_logger.error(f"[student-scores/save] 无法格式化JSON数据: {e}, 原始数据: {str(data)}")
+                
         except Exception as e:
             error_msg = f'无效的 JSON 请求体: {str(e)}'
             print(f"[student-scores/save] 错误: {error_msg}")
@@ -314,9 +438,18 @@ async def api_save_student_scores(request: Request):
     if not data:
         return safe_json_response({'message': '无法解析请求数据', 'code': 400}, status_code=400)
     
-    # 打印接收到的数据
-    print(f"[student-scores/save] 收到请求数据:")
-    print(json.dumps(data, ensure_ascii=False, indent=2))
+    # 打印接收到的数据（完整JSON）
+    print(f"[student-scores/save] ========== 最终接收到的完整 JSON 数据 ==========")
+    try:
+        full_data_json = json.dumps(data, ensure_ascii=False, indent=2)
+        print(full_data_json)
+        print(f"[student-scores/save] JSON 数据总长度: {len(full_data_json)} 字符")
+        app_logger.info(f"[student-scores/save] 最终接收到的完整 JSON 数据: {full_data_json}")
+    except Exception as e:
+        print(f"[student-scores/save] 无法格式化完整JSON数据: {e}")
+        print(f"[student-scores/save] 原始数据: {str(data)}")
+        app_logger.error(f"[student-scores/save] 无法格式化完整JSON数据: {e}, 原始数据: {str(data)}")
+    print(f"[student-scores/save] ========== 完整 JSON 数据打印结束 ==========")
     if excel_file_name:
         print(f"[student-scores/save] Excel文件名: {excel_file_name}")
     
@@ -484,17 +617,28 @@ async def api_get_student_scores(
     group_id = str(group_id).strip() if group_id is not None else None
 
     if not class_id and not group_id:
-        return safe_json_response({"message": "缺少必要参数：class_id 或 group_id", "code": 400}, status_code=400)
+        error_response = {"message": "缺少必要参数：class_id 或 group_id", "code": 400}
+        try:
+            error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+            print(f"[student-scores] ========== 返回的 JSON 结果（缺少参数）==========")
+            print(error_json)
+            print(f"[student-scores] ========== JSON 结果打印结束 ==========")
+            app_logger.warning(f"[student-scores] 返回的 JSON 结果（缺少参数）: {json.dumps(error_response, ensure_ascii=False)}")
+        except Exception as json_error:
+            print(f"[student-scores] 打印 JSON 时出错: {json_error}")
+        return safe_json_response(error_response, status_code=400)
 
     connection = get_db_connection()
     if connection is None:
         error_response = {'message': '数据库连接失败', 'code': 500}
-        # try:
-        #     error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
-        #     print(f"[student-scores] 返回的 JSON 结果（数据库连接失败）:\n{error_json}")
-        #     app_logger.error(f"[student-scores] 返回的 JSON 结果（数据库连接失败）: {json.dumps(error_response, ensure_ascii=False)}")
-        # except Exception as json_error:
-        #     print(f"[student-scores] 打印 JSON 时出错: {json_error}")
+        try:
+            error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+            print(f"[student-scores] ========== 返回的 JSON 结果（数据库连接失败）==========")
+            print(error_json)
+            print(f"[student-scores] ========== JSON 结果打印结束 ==========")
+            app_logger.error(f"[student-scores] 返回的 JSON 结果（数据库连接失败）: {json.dumps(error_response, ensure_ascii=False)}")
+        except Exception as json_error:
+            print(f"[student-scores] 打印 JSON 时出错: {json_error}")
         return safe_json_response(error_response, status_code=500)
 
     try:
@@ -517,22 +661,43 @@ async def api_get_student_scores(
 
             if group_classid:
                 if resolved_class_id and resolved_class_id != group_classid:
-                    return safe_json_response(
-                        {"message": "参数不一致：class_id 与 group_id 对应的 classid 不一致", "code": 400},
-                        status_code=400,
-                    )
+                    error_response = {"message": "参数不一致：class_id 与 group_id 对应的 classid 不一致", "code": 400}
+                    try:
+                        error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+                        print(f"[student-scores] ========== 返回的 JSON 结果（参数不一致）==========")
+                        print(error_json)
+                        print(f"[student-scores] ========== JSON 结果打印结束 ==========")
+                        app_logger.warning(f"[student-scores] 返回的 JSON 结果（参数不一致）: {json.dumps(error_response, ensure_ascii=False)}")
+                    except Exception as json_error:
+                        print(f"[student-scores] 打印 JSON 时出错: {json_error}")
+                    return safe_json_response(error_response, status_code=400)
                 resolved_class_id = group_classid
             else:
                 # 无法解析 classid：如果同时传了 class_id，则无法校验一致性，除非两者相同
                 if resolved_class_id and resolved_class_id != group_id:
-                    return safe_json_response(
-                        {"message": "无法从 group_id 解析班级ID(classid)，请只传 class_id，或先在 groups 表补齐 classid", "code": 400},
-                        status_code=400,
-                    )
+                    error_response = {"message": "无法从 group_id 解析班级ID(classid)，请只传 class_id，或先在 groups 表补齐 classid", "code": 400}
+                    try:
+                        error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+                        print(f"[student-scores] ========== 返回的 JSON 结果（无法解析classid）==========")
+                        print(error_json)
+                        print(f"[student-scores] ========== JSON 结果打印结束 ==========")
+                        app_logger.warning(f"[student-scores] 返回的 JSON 结果（无法解析classid）: {json.dumps(error_response, ensure_ascii=False)}")
+                    except Exception as json_error:
+                        print(f"[student-scores] 打印 JSON 时出错: {json_error}")
+                    return safe_json_response(error_response, status_code=400)
                 resolved_class_id = resolved_class_id or group_id
 
         if not resolved_class_id:
-            return safe_json_response({"message": "无法确定班级ID（class_id）", "code": 400}, status_code=400)
+            error_response = {"message": "无法确定班级ID（class_id）", "code": 400}
+            try:
+                error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+                print(f"[student-scores] ========== 返回的 JSON 结果（无法确定班级ID）==========")
+                print(error_json)
+                print(f"[student-scores] ========== JSON 结果打印结束 ==========")
+                app_logger.warning(f"[student-scores] 返回的 JSON 结果（无法确定班级ID）: {json.dumps(error_response, ensure_ascii=False)}")
+            except Exception as json_error:
+                print(f"[student-scores] 打印 JSON 时出错: {json_error}")
+            return safe_json_response(error_response, status_code=400)
 
         # 统一用 resolved_class_id 走原有逻辑
         class_id = resolved_class_id
@@ -720,34 +885,40 @@ async def api_get_student_scores(
         }
         
         # 打印返回的 JSON 结果
-        # try:
-        #     response_json = json.dumps(response_data, ensure_ascii=False, indent=2)
-        #     print(f"[student-scores] 返回的 JSON 结果:\n{response_json}")
-        #     app_logger.info(f"[student-scores] 返回的 JSON 结果: {json.dumps(response_data, ensure_ascii=False)}")
-        # except Exception as json_error:
-        #     print(f"[student-scores] 打印 JSON 时出错: {json_error}")
-        #     app_logger.warning(f"[student-scores] 打印 JSON 时出错: {json_error}")
+        try:
+            response_json = json.dumps(response_data, ensure_ascii=False, indent=2)
+            print(f"[student-scores] ========== 返回的 JSON 结果 ==========")
+            print(response_json)
+            print(f"[student-scores] ========== JSON 结果打印结束 ==========")
+            #app_logger.info(f"[student-scores] 返回的 JSON 结果: {json.dumps(response_data, ensure_ascii=False)}")
+        except Exception as json_error:
+            print(f"[student-scores] 打印 JSON 时出错: {json_error}")
+            app_logger.warning(f"[student-scores] 打印 JSON 时出错: {json_error}")
         
         return safe_json_response(response_data)
     except mysql.connector.Error as e:
         error_response = {'message': '数据库错误', 'code': 500}
         app_logger.error(f"Database error during api_get_student_scores: {e}")
-        # try:
-        #     error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
-        #     print(f"[student-scores] 返回的 JSON 结果（数据库错误）:\n{error_json}")
-        #     app_logger.error(f"[student-scores] 返回的 JSON 结果（数据库错误）: {json.dumps(error_response, ensure_ascii=False)}")
-        # except Exception as json_error:
-        #     print(f"[student-scores] 打印 JSON 时出错: {json_error}")
+        try:
+            error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+            print(f"[student-scores] ========== 返回的 JSON 结果（数据库错误）==========")
+            print(error_json)
+            print(f"[student-scores] ========== JSON 结果打印结束 ==========")
+            app_logger.error(f"[student-scores] 返回的 JSON 结果（数据库错误）: {json.dumps(error_response, ensure_ascii=False)}")
+        except Exception as json_error:
+            print(f"[student-scores] 打印 JSON 时出错: {json_error}")
         return safe_json_response(error_response, status_code=500)
     except Exception as e:
         error_response = {'message': '未知错误', 'code': 500}
         app_logger.error(f"Unexpected error during api_get_student_scores: {e}")
-        # try:
-        #     error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
-        #     print(f"[student-scores] 返回的 JSON 结果（未知错误）:\n{error_json}")
-        #     app_logger.error(f"[student-scores] 返回的 JSON 结果（未知错误）: {json.dumps(error_response, ensure_ascii=False)}")
-        # except Exception as json_error:
-        #     print(f"[student-scores] 打印 JSON 时出错: {json_error}")
+        try:
+            error_json = json.dumps(error_response, ensure_ascii=False, indent=2)
+            print(f"[student-scores] ========== 返回的 JSON 结果（未知错误）==========")
+            print(error_json)
+            print(f"[student-scores] ========== JSON 结果打印结束 ==========")
+            app_logger.error(f"[student-scores] 返回的 JSON 结果（未知错误）: {json.dumps(error_response, ensure_ascii=False)}")
+        except Exception as json_error:
+            print(f"[student-scores] 打印 JSON 时出错: {json_error}")
         return safe_json_response(error_response, status_code=500)
     finally:
         if connection and connection.is_connected():
@@ -1104,6 +1275,7 @@ async def api_set_student_score_comment(request: Request):
     
     try:
         body = await request.json()
+        print(f"[student-scores/set-comment] 客户端发送的消息: {body}")
         score_header_id = body.get('score_header_id')
         class_id = body.get('class_id')
         term = body.get('term')
@@ -1487,6 +1659,19 @@ async def api_set_student_score_value(request: Request):
 
     try:
         body = await request.json()
+        # 打印客户端发送的完整JSON消息
+        print(f"[student-scores/set-score] ========== 收到客户端请求 ==========")
+        print(f"[student-scores/set-score] 客户端发送的原始数据: {body}")
+        try:
+            json_str = json.dumps(body, ensure_ascii=False, indent=2)
+            print(f"[student-scores/set-score] ========== 客户端发送的完整JSON消息（格式化）==========")
+            print(json_str)
+            print(f"[student-scores/set-score] ========== JSON消息打印结束 ==========")
+            app_logger.info(f"[student-scores/set-score] ========== 客户端发送的完整JSON消息 ==========\n{json_str}")
+        except Exception as print_e:
+            print(f"[student-scores/set-score] 打印JSON消息失败: {print_e}")
+            app_logger.warning(f"[student-scores/set-score] 打印JSON消息失败: {print_e}")
+        
         score_header_id = body.get('score_header_id')
         class_id = body.get('class_id')
         term = body.get('term')
@@ -1768,6 +1953,16 @@ async def api_save_group_scores(request: Request):
                     data = json.loads(str(data_str))
                 print(f"[group-scores/save] ✅ JSON解析成功")
                 app_logger.info(f"[group-scores/save] ✅ JSON解析成功")
+                # 打印完整的客户端上传的JSON消息
+                try:
+                    json_str = json.dumps(data, ensure_ascii=False, indent=2)
+                    print(f"[group-scores/save] ========== 客户端上传的完整JSON消息 ==========")
+                    print(json_str)
+                    print(f"[group-scores/save] ========== JSON消息打印结束 ==========")
+                    app_logger.info(f"[group-scores/save] ========== 客户端上传的完整JSON消息 ==========\n{json_str}")
+                except Exception as print_e:
+                    print(f"[group-scores/save] 打印JSON消息失败: {print_e}")
+                    app_logger.warning(f"[group-scores/save] 打印JSON消息失败: {print_e}")
             except json.JSONDecodeError as e:
                 error_msg = f'data字段中的JSON解析失败: {str(e)}'
                 print(f"[group-scores/save] ❌ {error_msg}")
@@ -1869,6 +2064,16 @@ async def api_save_group_scores(request: Request):
             data = await request.json()
             print(f"[group-scores/save] ✅ JSON解析成功")
             app_logger.info(f"[group-scores/save] ✅ JSON解析成功")
+            # 打印完整的客户端上传的JSON消息
+            try:
+                json_str = json.dumps(data, ensure_ascii=False, indent=2)
+                print(f"[group-scores/save] ========== 客户端上传的完整JSON消息 ==========")
+                print(json_str)
+                print(f"[group-scores/save] ========== JSON消息打印结束 ==========")
+                app_logger.info(f"[group-scores/save] ========== 客户端上传的完整JSON消息 ==========\n{json_str}")
+            except Exception as print_e:
+                print(f"[group-scores/save] 打印JSON消息失败: {print_e}")
+                app_logger.warning(f"[group-scores/save] 打印JSON消息失败: {print_e}")
         except json.JSONDecodeError as e:
             error_msg = f'无效的 JSON 请求体: {str(e)}'
             print(f"[group-scores/save] ❌ {error_msg}")
@@ -3029,6 +3234,9 @@ async def api_set_group_score_comment(request: Request):
 
     try:
         data = await request.json()
+        json_str = json.dumps(data, ensure_ascii=False, indent=2)
+        print(f"[group-scores/set-comment] 客户端发送的消息: {data}")
+        app_logger.info(f"[group-scores/set-comment] 客户端发送的消息:\n{json_str}")
     except Exception:
         return _return_with_log({"message": "请求体JSON格式错误", "code": 400}, status_code=400)
 

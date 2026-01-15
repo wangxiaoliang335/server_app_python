@@ -53,6 +53,274 @@ from services.avatars import upload_avatar_to_oss
 from services.tencent_groups import notify_tencent_group_sync
 
 
+async def handle_camera_stream_start_pull(
+    *,
+    websocket: WebSocket,
+    user_id: str,
+    connection: mysql.connector.MySQLConnection,
+    group_id: Optional[str],
+    raw_json: str,
+    msg_data: Dict[str, Any],
+) -> None:
+    """
+    摄像头开播通知（只做实时转发，不做离线保存）：
+    - 文本帧格式：to:<group_id>:<json>
+    - 只允许“班级群（is_class_group=1）”的群成员发送
+    - sender_id 必须等于当前 websocket 登录用户 user_id（防止冒充）
+    - 将 JSON 原样转发给群内其他在线成员（离线不保存、不补发）
+    """
+    group_id = (str(group_id).strip() if group_id is not None else "") or None
+    if not group_id:
+        await websocket.send_text(json.dumps({"type": "error", "message": "camera_stream 缺少 group_id"}, ensure_ascii=False))
+        return
+
+    if not isinstance(msg_data, dict):
+        await websocket.send_text(json.dumps({"type": "error", "message": "camera_stream 消息体必须是 JSON Object"}, ensure_ascii=False))
+        return
+
+    if msg_data.get("type") != "camera_stream" or msg_data.get("action") != "start_pull":
+        # 非本处理器关心的消息，直接返回
+        return
+
+    json_group_id = (str(msg_data.get("group_id") or "").strip() or None)
+    if json_group_id and json_group_id != group_id:
+        await websocket.send_text(
+            json.dumps(
+                {"type": "error", "message": "camera_stream group_id 与 to: 前缀不一致"},
+                ensure_ascii=False,
+            )
+        )
+        return
+
+    sender_id = (str(msg_data.get("sender_id") or "").strip() or user_id)
+    if sender_id != user_id:
+        await websocket.send_text(
+            json.dumps(
+                {"type": "error", "message": "camera_stream sender_id 与当前连接用户不一致"},
+                ensure_ascii=False,
+            )
+        )
+        return
+
+    cursor = connection.cursor(dictionary=True)
+    try:
+        # 仅允许班级群成员发送
+        cursor.execute(
+            """
+            SELECT g.group_id
+            FROM `groups` g
+            INNER JOIN `group_members` gm ON g.group_id = gm.group_id
+            WHERE g.group_id = %s AND g.is_class_group = 1 AND gm.user_id = %s
+            LIMIT 1
+            """,
+            (group_id, user_id),
+        )
+        allowed = cursor.fetchone()
+        if not allowed:
+            await websocket.send_text(
+                json.dumps(
+                    {"type": "error", "message": "无权限：仅班级群成员可发送 camera_stream"},
+                    ensure_ascii=False,
+                )
+            )
+            return
+
+        # 获取群内其他成员（不含发送者）
+        cursor.execute(
+            """
+            SELECT user_id
+            FROM `group_members`
+            WHERE group_id = %s AND user_id != %s
+            """,
+            (group_id, user_id),
+        )
+        members = cursor.fetchall() or []
+
+        payload = (raw_json or "").strip() or json.dumps(msg_data, ensure_ascii=False, separators=(",", ":"))
+
+        online_count = 0
+        for m in members:
+            member_id = m.get("user_id")
+            if not member_id:
+                continue
+            target_conn = connections.get(str(member_id))
+            if not target_conn:
+                continue  # 离线不保存、不补发
+            try:
+                await target_conn["ws"].send_text(payload)
+                online_count += 1
+            except Exception as e:
+                app_logger.warning(
+                    f"[camera_stream] 转发失败 - group_id={group_id}, sender_id={user_id}, member_id={member_id}, error={e}"
+                )
+
+        app_logger.info(
+            f"[camera_stream] start_pull 已转发 - group_id={group_id}, sender_id={user_id}, online_receivers={online_count}"
+        )
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+
+
+async def handle_remote_shutdown(
+    *,
+    websocket: WebSocket,
+    user_id: str,
+    is_class_client: bool,
+    connection: mysql.connector.MySQLConnection,
+    group_id: Optional[str],
+    raw_json: str,
+    msg_data: Dict[str, Any],
+) -> None:
+    """
+    远程关机（教师端 -> 班级端成员端）：
+    - 文本帧格式：to:<group_id>:<json>
+    - 仅允许教师端发送（班级端不可发送）
+    - sender_id 必须等于当前 websocket 登录用户 user_id（防止冒充）
+    - 仅允许“班级群（is_class_group=1）”的群成员教师发送
+    - 将 JSON 原样转发给“班级端成员（ta_classes.class_code）”在线连接（离线不保存、不补发）
+    - 不转发给群内其他教师成员
+    """
+    group_id = (str(group_id).strip() if group_id is not None else "") or None
+    if not group_id:
+        await websocket.send_text(
+            json.dumps({"type": "error", "message": "remote_shutdown 缺少 group_id"}, ensure_ascii=False)
+        )
+        return
+
+    if not isinstance(msg_data, dict):
+        await websocket.send_text(
+            json.dumps({"type": "error", "message": "remote_shutdown 消息体必须是 JSON Object"}, ensure_ascii=False)
+        )
+        return
+
+    if msg_data.get("type") != "remote_shutdown":
+        return
+
+    if is_class_client:
+        await websocket.send_text(
+            json.dumps({"type": "error", "message": "无权限：班级端不能发送 remote_shutdown"}, ensure_ascii=False)
+        )
+        return
+
+    json_group_id = (str(msg_data.get("group_id") or "").strip() or None)
+    if json_group_id and json_group_id != group_id:
+        await websocket.send_text(
+            json.dumps({"type": "error", "message": "remote_shutdown group_id 与 to: 前缀不一致"}, ensure_ascii=False)
+        )
+        return
+
+    sender_id = (str(msg_data.get("sender_id") or "").strip() or user_id)
+    if sender_id != user_id:
+        await websocket.send_text(
+            json.dumps({"type": "error", "message": "remote_shutdown sender_id 与当前连接用户不一致"}, ensure_ascii=False)
+        )
+        return
+
+    cursor = connection.cursor(dictionary=True)
+    try:
+        # 校验群组为班级群，并取出群绑定班级ID（class_code）
+        cursor.execute(
+            """
+            SELECT group_id, is_class_group, classid
+            FROM `groups`
+            WHERE group_id = %s
+            LIMIT 1
+            """,
+            (group_id,),
+        )
+        group_info = cursor.fetchone()
+        if not group_info:
+            await websocket.send_text(
+                json.dumps({"type": "error", "message": f"群组不存在: {group_id}"}, ensure_ascii=False)
+            )
+            return
+
+        if int(group_info.get("is_class_group") or 0) != 1:
+            await websocket.send_text(
+                json.dumps({"type": "error", "message": "无权限：仅班级群可发送 remote_shutdown"}, ensure_ascii=False)
+            )
+            return
+
+        # 校验发送者是该群成员（教师可能在多个班级群里）
+        cursor.execute(
+            """
+            SELECT 1
+            FROM `group_members`
+            WHERE group_id = %s AND user_id = %s
+            LIMIT 1
+            """,
+            (group_id, user_id),
+        )
+        is_member = cursor.fetchone()
+        if not is_member:
+            await websocket.send_text(
+                json.dumps({"type": "error", "message": "无权限：非该班级群成员不可发送 remote_shutdown"}, ensure_ascii=False)
+            )
+            return
+
+        msg_class_id = (str(msg_data.get("class_id") or "").strip() or None)
+        group_class_id = (str(group_info.get("classid") or "").strip() or None)
+        if msg_class_id and group_class_id and msg_class_id != group_class_id:
+            await websocket.send_text(
+                json.dumps({"type": "error", "message": "remote_shutdown class_id 与群绑定班级不一致"}, ensure_ascii=False)
+            )
+            return
+
+        # 只转发给“班级端成员”：其 user_id 必须能在 ta_classes.class_code 命中
+        cursor.execute(
+            """
+            SELECT gm.user_id
+            FROM `group_members` gm
+            INNER JOIN ta_classes c ON c.class_code = gm.user_id
+            WHERE gm.group_id = %s
+            """,
+            (group_id,),
+        )
+        class_members = cursor.fetchall() or []
+
+        payload = (raw_json or "").strip() or json.dumps(msg_data, ensure_ascii=False, separators=(",", ":"))
+
+        online_count = 0
+        for row in class_members:
+            class_code = row.get("user_id")
+            if not class_code:
+                continue
+            target_conn = connections.get(str(class_code))
+            if not target_conn:
+                continue  # 离线不保存、不补发
+            try:
+                await target_conn["ws"].send_text(payload)
+                online_count += 1
+            except Exception as e:
+                app_logger.warning(
+                    f"[remote_shutdown] 转发失败 - group_id={group_id}, sender_id={user_id}, class_code={class_code}, error={e}"
+                )
+
+        # 极端情况下：群成员表没存班级端账号，则回退到 groups.classid 对应的班级端
+        if online_count == 0 and group_class_id:
+            fallback_conn = connections.get(group_class_id)
+            if fallback_conn:
+                try:
+                    await fallback_conn["ws"].send_text(payload)
+                    online_count = 1
+                except Exception as e:
+                    app_logger.warning(
+                        f"[remote_shutdown] fallback 转发失败 - group_id={group_id}, sender_id={user_id}, class_code={group_class_id}, error={e}"
+                    )
+
+        app_logger.info(
+            f"[remote_shutdown] 已转发 - group_id={group_id}, sender_id={user_id}, online_receivers={online_count}"
+        )
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+
+
 async def handle_homework_publish(
     *,
     websocket: WebSocket,
@@ -1809,6 +2077,29 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         )
                         print(msg)
                         print(msg_type)
+                        # 摄像头开播通知：to:<group_id>:<json>
+                        if msg_type == "camera_stream" and isinstance(msg_data1, dict) and msg_data1.get("action") == "start_pull":
+                            await handle_camera_stream_start_pull(
+                                websocket=websocket,
+                                user_id=user_id,
+                                connection=connection,
+                                group_id=target_id,
+                                raw_json=msg,
+                                msg_data=msg_data1,
+                            )
+                            continue
+                        # 远程关机：to:<group_id>:<compact_json>
+                        if msg_type == "remote_shutdown" and isinstance(msg_data1, dict):
+                            await handle_remote_shutdown(
+                                websocket=websocket,
+                                user_id=user_id,
+                                is_class_client=is_class_client,
+                                connection=connection,
+                                group_id=target_id,
+                                raw_json=msg,
+                                msg_data=msg_data1,
+                            )
+                            continue
                         if msg_data1['type'] == "1":
                             print(" 加好友消息")
                             app_logger.info(f"[websocket][加好友] 收到加好友请求 - user_id={user_id}, target_id={target_id}")
@@ -2324,6 +2615,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                 app_logger.info(f"[创建群] 事务提交成功 - group_id={unique_group_id}, group_name={group_name}")
                                 
                                 # 同步到腾讯IM（同步等待结果，确保成员被正确添加）
+                                tencent_group_exists = False  # 标识腾讯IM中群组是否已存在
                                 try:
                                     # 构建腾讯IM需要的群组数据格式
                                     tencent_group_data = {
@@ -2442,12 +2734,19 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                     # 检查结果，无论成功与否，都需要单独添加成员
                                     # 因为 import_group API 可能不会自动添加 MemberList 中的成员
                                     error_info = result.get("error", "")
-                                    error_code = result.get("error_code")
+                                    # 从 results 数组中获取第一个结果的 error_code
+                                    error_code = None
+                                    results_list = result.get("results", [])
+                                    if results_list and len(results_list) > 0:
+                                        first_result = results_list[0]
+                                        error_code = first_result.get("error_code")
+                                        error_info = first_result.get("error_info", "") or first_result.get("error", "")
                                     need_add_members = False
                                     
                                     if result.get("status") != "success":
                                         # 如果是因为群组已存在（ErrorCode 10021），需要单独添加成员
                                         if error_code == 10021:
+                                            tencent_group_exists = True  # 标记腾讯IM中群组已存在
                                             need_add_members = True
                                             print(f"[创建群] 群组已存在（ErrorCode 10021），需要单独添加成员 - group_id={unique_group_id}")
                                             app_logger.info(f"[创建群] 群组已存在，需要单独添加成员 - group_id={unique_group_id}")
@@ -2668,6 +2967,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                 
                                 # 如果是班级群（有 classid 或 class_id），自动创建临时语音群
                                 temp_room_info = None
+                                temp_room_exists = False  # 标识临时语音群是否已存在
                                 class_id = classid  # 使用统一后的 classid 变量
                                 if class_id:
                                     # 检查是否已经有临时语音群（使用 unique_group_id 作为 group_id）
@@ -2792,6 +3092,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                             # 临时语音群创建失败不影响班级群创建
                                     else:
                                         # 如果已存在临时语音群，获取其信息
+                                        temp_room_exists = True  # 标记临时语音群已存在
                                         existing_room = active_temp_rooms[unique_group_id]
                                         temp_room_info = {
                                             "room_id": existing_room.get("room_id"),
@@ -2804,6 +3105,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                             "owner_icon": existing_room.get("owner_icon")
                                         }
                                         print(f"[创建班级群] 临时语音群已存在 - group_id={unique_group_id}, room_id={temp_room_info.get('room_id')}")
+                                        app_logger.info(f"[创建班级群] 临时语音群已存在 - group_id={unique_group_id}, room_id={temp_room_info.get('room_id')}")
                                 
                                 # 给在线成员推送
                                 # 兼容新旧字段名：user_id 或 unique_member_id
@@ -2837,12 +3139,25 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                 print(f"[创建群] 准备构建返回给客户端的响应 - group_id={unique_group_id}")
                                 # 兼容新旧字段名：group_name 或 nickname
                                 group_name_for_response = msg_data1.get('group_name') or msg_data1.get('nickname', '')
+                                
+                                # 根据临时语音群和腾讯IM群组是否存在，构建不同的消息
+                                message_parts = [f"你创建了群: {group_name_for_response}"]
+                                if tencent_group_exists:
+                                    message_parts.append("（腾讯IM群组已存在）")
+                                if temp_room_exists:
+                                    message_parts.append("（临时语音群已存在）")
+                                message_text = "".join(message_parts)
+                                
                                 response_data = {
                                     "type":"3",
-                                    "message":f"你创建了群: {group_name_for_response}",
+                                    "message": message_text,
                                     "group_id": unique_group_id,
                                     "groupname": group_name_for_response
                                 }
+                                
+                                # 添加腾讯IM群组状态标识，告知客户端腾讯IM中群组是否已存在
+                                if tencent_group_exists:
+                                    response_data["tencent_group_exists"] = True
                                 
                                 # 如果有 face_url（包括从 avatar_base64 上传后的 URL），添加到响应中
                                 if face_url:
@@ -2853,6 +3168,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                 # 如果有临时语音群信息，添加到响应中
                                 if temp_room_info:
                                     response_data["temp_room"] = temp_room_info
+                                    # 添加临时语音群状态标识，告知客户端临时语音群是否已存在
+                                    response_data["temp_room"]["exists"] = temp_room_exists
                                 
                                 # 打印返回给客户端的消息
                                 response_json = json.dumps(response_data, ensure_ascii=False)
@@ -3271,6 +3588,74 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         # 处理语音说话状态消息
                         elif msg_data1['type'] == "voice_speaking":
                             await handle_voice_speaking(msg_data1)
+                            continue
+                        # 设置班级壁纸
+                        elif msg_data1['type'] == "set_wallpaper":
+                            app_logger.info(
+                                f"[set_wallpaper] 收到设置壁纸消息（to:格式） - user_id={user_id}, target_id={target_id}, "
+                                f"wallpaper_id={msg_data1.get('wallpaper_id')}, "
+                                f"raw={json.dumps(msg_data1, ensure_ascii=False)[:500]}"
+                            )
+                            print(f"[set_wallpaper] 收到设置壁纸消息 - user_id={user_id}, target_id={target_id}, wallpaper_id={msg_data1.get('wallpaper_id')}")
+                            
+                            group_id = target_id  # 群组ID就是target_id
+                            wallpaper_id = msg_data1.get('wallpaper_id')
+                            
+                            if not group_id:
+                                await websocket.send_text(json.dumps({
+                                    "type": "set_wallpaper",
+                                    "status": "error",
+                                    "message": "缺少 group_id",
+                                    "code": 400
+                                }, ensure_ascii=False))
+                                continue
+                            
+                            if not wallpaper_id:
+                                await websocket.send_text(json.dumps({
+                                    "type": "set_wallpaper",
+                                    "status": "error",
+                                    "message": "缺少 wallpaper_id",
+                                    "code": 400
+                                }, ensure_ascii=False))
+                                continue
+                            
+                            try:
+                                from routers.misc import set_class_wallpaper_current_internal
+                                
+                                cursor = connection.cursor(dictionary=True)
+                                result = await set_class_wallpaper_current_internal(
+                                    group_id=str(group_id),
+                                    wallpaper_id=int(wallpaper_id),
+                                    connection=connection,
+                                    cursor=cursor
+                                )
+                                
+                                # 通过 WebSocket 返回结果
+                                if result.get("success"):
+                                    await websocket.send_text(json.dumps({
+                                        "type": "set_wallpaper",
+                                        "status": "success",
+                                        "message": result.get("message"),
+                                        "code": result.get("code"),
+                                        "group_id": result.get("group_id"),
+                                        "wallpaper_id": result.get("wallpaper_id"),
+                                        "wallpaper": result.get("wallpaper")
+                                    }, ensure_ascii=False))
+                                else:
+                                    await websocket.send_text(json.dumps({
+                                        "type": "set_wallpaper",
+                                        "status": "error",
+                                        "message": result.get("message"),
+                                        "code": result.get("code")
+                                    }, ensure_ascii=False))
+                            except Exception as e:
+                                app_logger.error(f"[set_wallpaper] 处理失败 - user_id={user_id}, group_id={group_id}, wallpaper_id={wallpaper_id}, error={e}", exc_info=True)
+                                await websocket.send_text(json.dumps({
+                                    "type": "set_wallpaper",
+                                    "status": "error",
+                                    "message": f"设置壁纸失败: {str(e)}",
+                                    "code": 500
+                                }, ensure_ascii=False))
                             continue
         
                     else:

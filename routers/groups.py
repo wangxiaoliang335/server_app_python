@@ -1437,6 +1437,40 @@ def get_group_members_by_group_id(group_id: str = Query(..., description="群组
         group_info = cursor.fetchone()
         group_classid = group_info.get("classid") if group_info else None
 
+        # 批量查询用户头像（优化性能）
+        # 先收集所有非班级成员的 user_id
+        non_class_user_ids = []
+        for member in members:
+            user_id = member.get("user_id")
+            # 判断成员是否为班级（通过 user_id 是否等于 classid）
+            is_class_member = False
+            if group_classid and str(user_id) == str(group_classid):
+                is_class_member = True
+            if not is_class_member:
+                non_class_user_ids.append(str(user_id))
+        
+        # 批量查询非班级成员的头像：通过 teacher_unique_id -> id_card -> avatar
+        avatar_map = {}
+        if non_class_user_ids:
+            try:
+                placeholders = ",".join(["%s"] * len(non_class_user_ids))
+                # 通过 teacher_unique_id 查询 id_card，再通过 id_card 查询 avatar
+                avatar_query = f"""
+                    SELECT t.teacher_unique_id, u.avatar
+                    FROM ta_teacher t
+                    LEFT JOIN ta_user_details u ON t.id_card = u.id_number
+                    WHERE t.teacher_unique_id IN ({placeholders})
+                """
+                cursor.execute(avatar_query, tuple(non_class_user_ids))
+                avatar_rows = cursor.fetchall()
+                for row in avatar_rows:
+                    if row and row.get("teacher_unique_id"):
+                        avatar_map[str(row["teacher_unique_id"])] = row.get("avatar")
+                print(f"[groups/members] 批量查询用户头像: 查询了 {len(non_class_user_ids)} 个用户，找到 {len(avatar_map)} 个头像")
+            except Exception as e:
+                print(f"[groups/members] 批量查询用户头像失败: {e}")
+                app_logger.warning(f"[groups/members] 批量查询用户头像失败: {e}", exc_info=True)
+
         for idx, member in enumerate(members):
             user_id = member.get("user_id")
             user_name = member.get("user_name")
@@ -1462,6 +1496,13 @@ def get_group_members_by_group_id(group_id: str = Query(..., description="群组
                 else:
                     member["face_url"] = None
                     print(f"[groups/members]   班级成员，但未找到班级记录: class_code={class_code}")
+            else:
+                # 普通成员（教师等），从批量查询结果中获取头像
+                member["face_url"] = avatar_map.get(str(user_id))
+                if member["face_url"]:
+                    print(f"[groups/members]   普通成员，添加头像: user_id={user_id}, face_url={member.get('face_url')}")
+                else:
+                    print(f"[groups/members]   普通成员，未找到头像: user_id={user_id}")
 
             if has_teach_subjects:
                 member["teach_subjects"] = _normalize_teach_subjects(member.get("teach_subjects"))
@@ -3345,7 +3386,9 @@ async def join_group(request: Request):
 
     try:
         data = await request.json()
-        print(f"[groups/join] 原始数据: {json.dumps(data, ensure_ascii=False, indent=2)}")
+        json_str = json.dumps(data, ensure_ascii=False, indent=2)
+        print(f"[groups/join] 原始数据: {json_str}")
+        app_logger.info(f"[groups/join] 客户端发送的消息:\n{json_str}")
 
         group_id = data.get("group_id")
         user_id = data.get("user_id")
@@ -3357,18 +3400,24 @@ async def join_group(request: Request):
         # 参数验证
         if not group_id:
             print("[groups/join] 错误: 缺少 group_id")
-            return JSONResponse({"code": 400, "message": "缺少必需参数 group_id"}, status_code=400)
+            response_data = {"code": 400, "message": "缺少必需参数 group_id"}
+            print(f"[groups/join] 返回给客户端: {json.dumps(response_data, ensure_ascii=False, indent=2)}")
+            return JSONResponse(response_data, status_code=400)
 
         if not user_id:
             print("[groups/join] 错误: 缺少 user_id")
-            return JSONResponse({"code": 400, "message": "缺少必需参数 user_id"}, status_code=400)
+            response_data = {"code": 400, "message": "缺少必需参数 user_id"}
+            print(f"[groups/join] 返回给客户端: {json.dumps(response_data, ensure_ascii=False, indent=2)}")
+            return JSONResponse(response_data, status_code=400)
 
         print("[groups/join] 开始连接数据库...")
         connection = get_db_connection()
         if connection is None or not connection.is_connected():
             print("[groups/join] 错误: 数据库连接失败")
             app_logger.error("[groups/join] 数据库连接失败")
-            return JSONResponse({"code": 500, "message": "数据库连接失败"}, status_code=500)
+            response_data = {"code": 500, "message": "数据库连接失败"}
+            print(f"[groups/join] 返回给客户端: {json.dumps(response_data, ensure_ascii=False, indent=2)}")
+            return JSONResponse(response_data, status_code=500)
         print("[groups/join] 数据库连接成功")
 
         cursor = None
@@ -3385,7 +3434,9 @@ async def join_group(request: Request):
 
             if not group_info:
                 print(f"[groups/join] 错误: 群组 {group_id} 不存在")
-                return JSONResponse({"code": 200, "message": "没有找到数据：群组不存在"}, status_code=200)
+                response_data = {"code": 200, "message": "没有找到数据：群组不存在"}
+                print(f"[groups/join] 返回给客户端: {json.dumps(response_data, ensure_ascii=False, indent=2)}")
+                return JSONResponse(response_data, status_code=200)
 
             print(f"[groups/join] 群组信息: {group_info}")
             max_member_num = group_info.get("max_member_num") if group_info.get("max_member_num") else 0
@@ -3394,7 +3445,9 @@ async def join_group(request: Request):
             # 检查群组是否已满
             if max_member_num > 0 and member_num >= max_member_num:
                 print(f"[groups/join] 错误: 群组已满 (当前: {member_num}/{max_member_num})")
-                return JSONResponse({"code": 400, "message": "群组已满，无法加入"}, status_code=400)
+                response_data = {"code": 400, "message": "群组已满，无法加入"}
+                print(f"[groups/join] 返回给客户端: {json.dumps(response_data, ensure_ascii=False, indent=2)}")
+                return JSONResponse(response_data, status_code=400)
 
             # 2. 检查用户是否已经在群组中
             print(f"[groups/join] 检查用户 {user_id} 是否已在群组 {group_id} 中...")
@@ -3406,7 +3459,9 @@ async def join_group(request: Request):
 
             if member_exists:
                 print(f"[groups/join] 用户 {user_id} 已在群组 {group_id} 中")
-                return JSONResponse({"code": 400, "message": "您已经在该群组中"}, status_code=400)
+                response_data = {"code": 400, "message": "您已经在该群组中"}
+                print(f"[groups/join] 返回给客户端: {json.dumps(response_data, ensure_ascii=False, indent=2)}")
+                return JSONResponse(response_data, status_code=400)
 
             # 3. 先调用腾讯IM API添加成员
             tencent_sync_success = False
@@ -3603,7 +3658,9 @@ async def join_group(request: Request):
             traceback_str = traceback.format_exc()
             print(f"[groups/join] 错误堆栈: {traceback_str}")
             app_logger.error(f"[groups/join] {error_msg}\n{traceback_str}")
-            return JSONResponse({"code": 500, "message": f"数据库操作失败: {str(e)}"}, status_code=500)
+            response_data = {"code": 500, "message": f"数据库操作失败: {str(e)}"}
+            print(f"[groups/join] 返回给客户端: {json.dumps(response_data, ensure_ascii=False, indent=2)}")
+            return JSONResponse(response_data, status_code=500)
         except Exception as e:
             connection.rollback()
             error_msg = f"加入群组时发生异常: {e}"
@@ -3613,7 +3670,9 @@ async def join_group(request: Request):
             traceback_str = traceback.format_exc()
             print(f"[groups/join] 错误堆栈: {traceback_str}")
             app_logger.error(f"[groups/join] {error_msg}\n{traceback_str}")
-            return JSONResponse({"code": 500, "message": f"操作失败: {str(e)}"}, status_code=500)
+            response_data = {"code": 500, "message": f"操作失败: {str(e)}"}
+            print(f"[groups/join] 返回给客户端: {json.dumps(response_data, ensure_ascii=False, indent=2)}")
+            return JSONResponse(response_data, status_code=500)
         finally:
             if cursor:
                 cursor.close()
@@ -3631,7 +3690,9 @@ async def join_group(request: Request):
         traceback_str = traceback.format_exc()
         print(f"[groups/join] 错误堆栈: {traceback_str}")
         app_logger.error(f"[groups/join] {error_msg}\n{traceback_str}")
-        return JSONResponse({"code": 400, "message": "请求数据格式错误"}, status_code=400)
+        response_data = {"code": 400, "message": "请求数据格式错误"}
+        print(f"[groups/join] 返回给客户端: {json.dumps(response_data, ensure_ascii=False, indent=2)}")
+        return JSONResponse(response_data, status_code=400)
     finally:
         print("=" * 80)
 
